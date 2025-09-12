@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-A powerful Python library for crystal structure generation, mutation, and evolutionary optimization. Built on top of PyXtal, PyMatGen, and ASE, GGen provides an intuitive interface for generating, modifying, and analyzing crystal structures with built-in energy evaluation using ORB models.
+A powerful Python library for crystal structure generation, mutation, and evolutionary optimization. Built on top of PyXtal, pymatgen, and ASE, GGen provides an intuitive interface for generating, modifying, and analyzing crystal structures with built-in energy evaluation using ORB models.
 
 ## Features
 
@@ -246,42 +246,6 @@ print(f"Structure 2: {summary2['formula']} - {summary2['space_group']['symbol']}
 
 Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
-
-## Development
-
-### Setting up development environment
-
-```bash
-git clone https://github.com/yourusername/ggen.git
-cd ggen
-pip install -e ".[dev,docs,jupyter]"
-pre-commit install
-```
-
-### Running tests
-
-```bash
-pytest
-```
-
-### Code formatting
-
-```bash
-black ggen/
-isort ggen/
-```
-
-### Type checking
-
-```bash
-mypy ggen/
-```
-
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
@@ -291,20 +255,20 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 If you use GGen in your research, please cite:
 
 ```bibtex
-@software{ggen2024,
+@software{ggen2025,
   title={GGen: Crystal Generation and Mutation Library},
-  author={Your Name},
-  year={2024},
-  url={https://github.com/yourusername/ggen}
+  author={Matt Moderwell},
+  year={2025},
+  url={https://github.com/ourofoundation/ggen}
 }
 ```
 
 ## Acknowledgments
 
 - [PyXtal](https://github.com/qzhu2017/PyXtal) for crystal structure generation
-- [PyMatGen](https://github.com/materialsproject/pymatgen) for materials analysis
+- [pymatgen](https://github.com/materialsproject/pymatgen) for materials analysis
 - [ASE](https://wiki.fysik.dtu.dk/ase/) for atomic simulation environment
-- [ORB Models](https://github.com/Open-Catalyst-Project/Open-Catalyst-Project) for force field models
+- [ORB Models](https://github.com/orbital-materials/orb-models) for force field models
 
 ## Changelog
 
