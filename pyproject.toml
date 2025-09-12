@@ -1,0 +1,162 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ggen"
+version = "0.1.0"
+description = "Crystal generation and mutation library for evolutionary structure optimization"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Your Name", email = "your.email@example.com" }]
+maintainers = [{ name = "Your Name", email = "your.email@example.com" }]
+keywords = [
+    "crystal",
+    "structure",
+    "generation",
+    "mutation",
+    "materials",
+    "science",
+    "pymatgen",
+    "pyxtal",
+    "evolutionary",
+    "optimization",
+    "crystallography",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+    "pymatgen>=2023.0.0",
+    "pyxtal>=0.5.0",
+    "ase>=3.22.0",
+    "requests>=2.25.0",
+    "orb-models>=0.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov>=2.0",
+    "black>=21.0",
+    "isort>=5.0",
+    "flake8>=3.8",
+    "mypy>=0.800",
+    "pre-commit>=2.0",
+]
+docs = ["sphinx>=4.0", "sphinx-rtd-theme>=1.0", "myst-parser>=0.15"]
+jupyter = ["jupyter>=1.0", "ipywidgets>=7.0", "matplotlib>=3.0", "plotly>=5.0"]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/ggen"
+Documentation = "https://ggen.readthedocs.io"
+Repository = "https://github.com/yourusername/ggen.git"
+"Bug Tracker" = "https://github.com/yourusername/ggen/issues"
+Changelog = "https://github.com/yourusername/ggen/blob/main/CHANGELOG.md"
+
+[project.scripts]
+ggen = "ggen.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ggen*"]
+exclude = ["tests*", "docs*", "examples*"]
+
+[tool.setuptools.package-data]
+ggen = ["*.json", "*.yaml", "*.yml", "*.txt"]
+
+[tool.black]
+line-length = 88
+target-version = ['py38', 'py39', 'py310', 'py311', 'py312']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 88
+known_first_party = ["ggen"]
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = ["pymatgen.*", "pyxtal.*", "ase.*", "orb_models.*", "scipy.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "--verbose",
+    "--cov=ggen",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+    "--cov-report=xml",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests",
+]
+
+[tool.coverage.run]
+source = ["ggen"]
+omit = ["*/tests/*", "*/test_*", "*/__pycache__/*", "*/venv/*", "*/env/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if settings.DEBUG",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if __name__ == .__main__.:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]
