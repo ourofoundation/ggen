@@ -89,10 +89,10 @@ class Operations:
         if a_s <= 0 or b_s <= 0 or c_s <= 0:
             raise ValueError("Anisotropic scale factors must be > 0")
 
-        new_lattice = Lattice.from_lengths_and_angles(
+        new_lattice = Lattice.from_parameters(
             lat.a * a_s, lat.b * b_s, lat.c * c_s, *lat.angles
         )
-        new_structure.modify_lattice(new_lattice)
+        new_structure = self._rebuild_with_lattice(new_structure, new_lattice)
         return new_structure
 
     def shear_lattice(
@@ -122,10 +122,10 @@ class Operations:
         new_beta = float(np.clip(beta + d_beta, 60.0, 120.0))
         new_gamma = float(np.clip(gamma + d_gamma, 60.0, 120.0))
 
-        new_lattice = Lattice.from_lengths_and_angles(
+        new_lattice = Lattice.from_parameters(
             a0, b0, c0, new_alpha, new_beta, new_gamma
         )
-        new_structure.modify_lattice(new_lattice)
+        new_structure = self._rebuild_with_lattice(new_structure, new_lattice)
         return new_structure
 
     # ==================== SYMMETRY OPERATIONS ====================
@@ -217,10 +217,10 @@ class Operations:
         new_beta = float(np.clip(beta + d_beta, 60.0, 120.0))
         new_gamma = float(np.clip(gamma + d_gamma, 60.0, 120.0))
 
-        new_lattice = Lattice.from_lengths_and_angles(
+        new_lattice = Lattice.from_parameters(
             lat.a, lat.b, lat.c, new_alpha, new_beta, new_gamma
         )
-        new_structure.modify_lattice(new_lattice)
+        new_structure = self._rebuild_with_lattice(new_structure, new_lattice)
 
         return new_structure
 
@@ -536,6 +536,20 @@ class Operations:
             repaired.replace(i, site.specie, site.frac_coords % 1.0)
 
         return repaired
+
+    def _rebuild_with_lattice(
+        self, structure: Structure, lattice: Lattice
+    ) -> Structure:
+        """Recreate Structure with a new lattice, preserving species and fractional coords."""
+        species = [s.specie for s in structure.sites]
+        fracs = [s.frac_coords for s in structure.sites]
+        try:
+            site_properties = (
+                structure.site_properties if structure.site_properties else None
+            )
+            return Structure(lattice, species, fracs, site_properties=site_properties)
+        except Exception:
+            return Structure(lattice, species, fracs)
 
 
 # ==================== CONVENIENCE FUNCTIONS ====================

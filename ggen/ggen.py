@@ -16,8 +16,6 @@ from ase.filters import FrechetCellFilter
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 from ase.optimize import LBFGS
-from calculator import get_orb_calculator
-from operations import Operations
 from pymatgen.analysis.local_env import CrystalNN
 from pymatgen.core import Lattice, Structure
 from pymatgen.core.periodic_table import Element
@@ -28,7 +26,10 @@ from pymatgen.symmetry.groups import SpaceGroup
 from pyxtal import pyxtal
 from pyxtal.symmetry import Group
 from scipy.spatial.distance import cosine
-from utils import parse_chemical_formula
+
+from .calculator import get_orb_calculator
+from .operations import Operations
+from .utils import parse_chemical_formula
 
 # ===================== Constants & Logging =====================
 
@@ -405,70 +406,67 @@ class GGen:
         self._trajectory_metadata.clear()
         self._trajectory_info["total_frames"] = 0
 
-    def export_trajectory_xyz(self, filename: Optional[str] = None) -> str:
-        """Export trajectory as an (EXT)XYZ; prefers extxyz to preserve cell information."""
+    def export_trajectory(self, filename: Optional[str] = None) -> str:
+        """Export trajectory as a standard ASE .traj file for use in other tools.
+
+        The .traj format is widely supported by ASE and other computational chemistry tools.
+        Each frame includes atomic positions, cell vectors, and metadata.
+
+        Args:
+            filename: Output filename. If None, auto-generates with timestamp.
+
+        Returns:
+            The filename of the created .traj file.
+
+        Raises:
+            ValueError: If no trajectory data is available to export.
+        """
+        from ase.io import write
+
         if not self._trajectory_structures:
             raise ValueError("No trajectory data available to export")
 
         if filename is None:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"crystal_trajectory_{ts}.xyz"
+            filename = f"crystal_trajectory_{ts}.traj"
 
+        # Convert structures to ASE atoms objects
         atoms_list = _structures_to_atoms_list(self._trajectory_structures)
-        # Use extxyz regardless of extension to include cell; ASE will handle it.
-        ase_write(filename, atoms_list, format="extxyz")
-        return filename
 
-    def export_trajectory_cif(self, filename: Optional[str] = None) -> str:
-        """Export trajectory as a multi-block CIF (one data_ block per frame)."""
-        if not self._trajectory_structures:
-            raise ValueError("No trajectory data available to export")
-
-        if filename is None:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"crystal_trajectory_{ts}.cif"
-
-        with open(filename, "w") as f:
-            for i, structure in enumerate(self._trajectory_structures):
-                writer = CifWriter(structure, symprec=SYMPREC)
-                block = str(writer)
-                # Ensure different data_ headers for each frame block
-                block = block.replace("data_", f"data_frame_{i}_", 1)
-                if i > 0:
-                    f.write("\n")
-                f.write(block)
-        return filename
-
-    def export_trajectory_json(self, filename: Optional[str] = None) -> str:
-        """Export trajectory as JSON with atomic positions (fractional) and cell vectors."""
-        if not self._trajectory_structures:
-            raise ValueError("No trajectory data available to export")
-
-        if filename is None:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"crystal_trajectory_{ts}.json"
-
-        json_frames: List[Dict[str, Any]] = []
-        for structure, meta in zip(
-            self._trajectory_structures, self._trajectory_metadata
-        ):
-            json_frames.append(
+        # Add metadata to each atoms object
+        for i, (atoms, meta) in enumerate(zip(atoms_list, self._trajectory_metadata)):
+            # Add frame metadata as info
+            atoms.info.update(
                 {
-                    **meta,
-                    "atomic_positions": [
-                        {
-                            "symbol": str(site.specie),
-                            "position": list(map(float, site.frac_coords)),
-                        }
-                        for site in structure
-                    ],
-                    "cell_vectors": structure.lattice.matrix.tolist(),
+                    "frame_index": meta.get("frame_index", i),
+                    "frame_type": meta.get("frame_type", "unknown"),
+                    "operation": meta.get("operation", "unknown"),
+                    "timestamp": meta.get("timestamp", ""),
+                    "energy": meta.get("energy"),
+                    "composition": meta.get("composition", ""),
+                    "num_sites": meta.get("num_sites", len(atoms)),
                 }
             )
 
-        payload = {"metadata": dict(self._trajectory_info), "frames": json_frames}
-        with open(filename, "w") as f:
-            json.dump(payload, f, indent=2)
+            # Add space group info if available
+            if meta.get("space_group"):
+                atoms.info["space_group"] = meta["space_group"]
+
+            # Add lattice parameters if available
+            if meta.get("lattice"):
+                atoms.info["lattice"] = meta["lattice"]
+
+            # Add any additional metadata
+            if meta.get("metadata"):
+                atoms.info["metadata"] = meta["metadata"]
+
+        # Write to .traj file using ASE's Trajectory class
+        from ase.io.trajectory import Trajectory
+
+        with Trajectory(filename, "w") as traj:
+            for atoms in atoms_list:
+                traj.write(atoms)
+
         return filename
 
     # -------------------- Geometry optimization --------------------

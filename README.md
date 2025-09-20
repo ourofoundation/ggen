@@ -13,7 +13,7 @@ A powerful Python library for crystal structure generation, mutation, and evolut
 - **Structure Mutations**: Comprehensive set of mutation operations for evolutionary optimization
 - **Energy Evaluation**: Built-in energy calculation using ORB force field models
 - **Trajectory Tracking**: Track structure evolution through mutations and optimizations
-- **Multiple Export Formats**: Export structures as CIF, XYZ, or JSON
+- **Multiple Export Formats**: Export structures as CIF, XYZ, JSON, or standard ASE .traj files
 - **Structure Validation**: Built-in validation and repair mechanisms
 
 ## Installation
@@ -95,6 +95,7 @@ ggen.symmetry_break()
 ggen.export_trajectory_xyz("evolution.xyz")
 ggen.export_trajectory_cif("evolution.cif")
 ggen.export_trajectory_json("evolution.json")
+ggen.export_trajectory_traj("evolution.traj")  # Standard ASE trajectory format
 
 # Get trajectory data
 trajectory = ggen.get_trajectory()
@@ -130,6 +131,12 @@ Main class for crystal generation and mutation operations.
 - `summary()`: Get comprehensive structure summary
 - `describe_crystal_from_file(file_url, filename)`: Analyze structure from file
 - `calculate_similarity(other_structure, method="fingerprint")`: Compare structures
+
+**Trajectory Export Methods:**
+- `export_trajectory_xyz(filename=None)`: Export trajectory as XYZ format
+- `export_trajectory_cif(filename=None)`: Export trajectory as multi-block CIF
+- `export_trajectory_json(filename=None)`: Export trajectory as JSON with metadata
+- `export_trajectory_traj(filename=None)`: Export trajectory as standard ASE .traj format
 
 ## Examples
 

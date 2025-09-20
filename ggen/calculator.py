@@ -10,10 +10,8 @@ MODELS_PATH = Path(os.environ.get("ORB_MODELS_PATH", Path.home() / ".orb_models"
 
 
 def get_orb_calculator(
-    device: str = "cuda",
-    weights_path: str = str(
-        MODELS_PATH / "checkpoints" / "orb-v3-conservative-inf-mpa.ckpt"
-    ),
+    device: str = "cpu",
+    weights_path: str = None,
 ):
     """Return an instance of the ORB calculator."""
     try:
