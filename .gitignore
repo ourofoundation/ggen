@@ -209,3 +209,8 @@ __marimo__/
 
 # Special
 *.traj
+
+*.cif
+*.json
+*.db
+.DS_Store

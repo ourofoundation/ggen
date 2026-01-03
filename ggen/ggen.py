@@ -270,11 +270,24 @@ class GGen:
         return compatible_groups
 
     def select_random_space_group_with_symmetry_preference(
-        self, compatible_groups: List[Dict[str, Any]], random_seed: Optional[int] = None
+        self,
+        compatible_groups: List[Dict[str, Any]],
+        random_seed: Optional[int] = None,
+        symmetry_bias: float = 0.0,
     ) -> int:
-        """Select a random space group from compatible groups with preference for higher symmetry.
+        """Select a random space group from compatible groups with configurable symmetry preference.
 
-        Weighted by crystal system and modest bonuses (Wyckoff count, inversion, etc.).
+        Args:
+            compatible_groups: List of compatible space group dictionaries.
+            random_seed: Optional random seed for reproducibility.
+            symmetry_bias: Controls preference for higher-symmetry crystal systems.
+                0.0 = uniform distribution (equal weight for orthorhombic and above,
+                      reduced weight for triclinic/monoclinic)
+                1.0 = strong preference for cubic/hexagonal systems
+                Default: 0.0
+
+        Returns:
+            Selected space group number.
         """
         if not compatible_groups:
             raise ValueError("No compatible space groups provided")
@@ -283,7 +296,22 @@ class GGen:
             self.random_seed if random_seed is None else random_seed
         )
 
-        crystal_system_weights = {
+        # Clamp symmetry_bias to [0, 1]
+        symmetry_bias = max(0.0, min(1.0, symmetry_bias))
+
+        # Base weights: uniform above monoclinic, reduced for triclinic/monoclinic
+        uniform_weights = {
+            (1, 2): 0.5,  # triclinic - reduced
+            (3, 15): 0.5,  # monoclinic - reduced
+            (16, 74): 1.0,  # orthorhombic
+            (75, 142): 1.0,  # tetragonal
+            (143, 167): 1.0,  # trigonal
+            (168, 194): 1.0,  # hexagonal
+            (195, 230): 1.0,  # cubic
+        }
+
+        # Biased weights: strong preference for higher symmetry
+        biased_weights = {
             (1, 2): 1.0,  # triclinic
             (3, 15): 2.0,  # monoclinic
             (16, 74): 3.0,  # orthorhombic
@@ -294,28 +322,271 @@ class GGen:
         }
 
         def _sys_weight(sg: int) -> float:
-            for (a, b), w in crystal_system_weights.items():
+            for a, b in uniform_weights.keys():
                 if a <= sg <= b:
-                    return w
+                    uniform_w = uniform_weights[(a, b)]
+                    biased_w = biased_weights[(a, b)]
+                    # Interpolate between uniform and biased based on symmetry_bias
+                    return uniform_w + symmetry_bias * (biased_w - uniform_w)
             return 1.0
 
         weights = []
         for g in compatible_groups:
             sg = g["number"]
             base = _sys_weight(sg)
-            wyckoff_bonus = min(g.get("wyckoff_positions", 1) / 10.0, 1.0)
-            chiral_bonus = 0.1 if g.get("chiral", False) else 0.0
-            inversion_bonus = 0.2 if g.get("inversion", False) else 0.0
-            sgnum_bonus = (sg / 230.0) * 0.5
-            weights.append(
-                base + wyckoff_bonus + chiral_bonus + inversion_bonus + sgnum_bonus
+            # Small bonuses for structural features (reduced from original)
+            wyckoff_bonus = (
+                min(g.get("wyckoff_positions", 1) / 20.0, 0.5) * symmetry_bias
             )
+            chiral_bonus = 0.05 * symmetry_bias if g.get("chiral", False) else 0.0
+            inversion_bonus = 0.1 * symmetry_bias if g.get("inversion", False) else 0.0
+            # Remove sgnum_bonus entirely - it was adding extra cubic bias
+            weights.append(base + wyckoff_bonus + chiral_bonus + inversion_bonus)
 
         probs = np.array(weights, dtype=float)
         probs /= probs.sum()
 
         idx = rng.choice(len(compatible_groups), p=probs)
         return int(compatible_groups[idx]["number"])
+
+    # -------------------- Crystal quality & scoring utilities --------------------
+
+    def _get_crystal_system_name(self, sg_number: int) -> str:
+        """Get crystal system name from space group number."""
+        if 1 <= sg_number <= 2:
+            return "triclinic"
+        elif 3 <= sg_number <= 15:
+            return "monoclinic"
+        elif 16 <= sg_number <= 74:
+            return "orthorhombic"
+        elif 75 <= sg_number <= 142:
+            return "tetragonal"
+        elif 143 <= sg_number <= 167:
+            return "trigonal"
+        elif 168 <= sg_number <= 194:
+            return "hexagonal"
+        elif 195 <= sg_number <= 230:
+            return "cubic"
+        return "unknown"
+
+    def _is_structurally_valid(
+        self,
+        structure: Structure,
+        min_distance: float = 1.0,
+        min_volume_per_atom: float = 2.0,
+        max_volume_per_atom: float = 100.0,
+    ) -> Tuple[bool, str]:
+        """Quick validity check before expensive energy evaluation.
+
+        Args:
+            structure: Structure to validate
+            min_distance: Minimum allowed interatomic distance (Å)
+            min_volume_per_atom: Minimum volume per atom (Å³)
+            max_volume_per_atom: Maximum volume per atom (Å³)
+
+        Returns:
+            Tuple of (is_valid, reason_if_invalid)
+        """
+        if len(structure) == 0:
+            return False, "empty structure"
+
+        # Check volume per atom
+        vol_per_atom = structure.volume / len(structure)
+        if vol_per_atom < min_volume_per_atom:
+            return False, f"volume per atom too small: {vol_per_atom:.2f} Å³"
+        if vol_per_atom > max_volume_per_atom:
+            return False, f"volume per atom too large: {vol_per_atom:.2f} Å³"
+
+        # Check for overlapping atoms (computationally cheap for small structures)
+        for i in range(len(structure)):
+            for j in range(i + 1, len(structure)):
+                dist = structure.get_distance(i, j)
+                if dist < min_distance:
+                    return False, f"atoms {i} and {j} too close: {dist:.3f} Å"
+
+        return True, "valid"
+
+    def _score_crystal(
+        self,
+        crystal: pyxtal,
+        energy: float,
+        symmetry_weight: float = 0.1,
+        wyckoff_weight: float = 0.01,
+    ) -> Tuple[float, Dict[str, float]]:
+        """Score a crystal considering both energy and symmetry.
+
+        Lower scores are better.
+
+        Args:
+            crystal: PyXtal crystal object
+            energy: Calculated energy (eV)
+            symmetry_weight: Weight for symmetry bonus (higher SG = lower score)
+            wyckoff_weight: Penalty per unique Wyckoff site
+
+        Returns:
+            Tuple of (total_score, score_breakdown)
+        """
+        # Energy component (lower is better)
+        energy_score = energy
+
+        # Symmetry bonus: higher SG number generally means higher symmetry
+        sg_number = crystal.group.number
+        symmetry_bonus = -sg_number * symmetry_weight
+
+        # Wyckoff efficiency: fewer unique sites = more symmetric/simpler
+        num_wyckoff_sites = len(crystal.atom_sites)
+        wyckoff_penalty = num_wyckoff_sites * wyckoff_weight
+
+        total_score = energy_score + symmetry_bonus + wyckoff_penalty
+
+        breakdown = {
+            "energy": energy_score,
+            "symmetry_bonus": symmetry_bonus,
+            "wyckoff_penalty": wyckoff_penalty,
+            "total": total_score,
+            "space_group": sg_number,
+            "num_wyckoff_sites": num_wyckoff_sites,
+        }
+
+        return total_score, breakdown
+
+    def _refine_to_higher_symmetry(
+        self,
+        structure: Structure,
+        tolerance_steps: List[float] = None,
+    ) -> Tuple[Structure, int, str]:
+        """Attempt to find higher-symmetry description of structure.
+
+        Tries increasingly loose tolerances to detect hidden symmetry.
+
+        Args:
+            structure: Structure to refine
+            tolerance_steps: List of symprec values to try (default: [0.01, 0.05, 0.1, 0.2])
+
+        Returns:
+            Tuple of (refined_structure, detected_sg_number, detected_sg_symbol)
+        """
+        if tolerance_steps is None:
+            tolerance_steps = [0.01, 0.05, 0.1, 0.2]
+
+        best_structure = structure
+        best_sg_number = 1
+        best_sg_symbol = "P1"
+
+        for symprec in tolerance_steps:
+            try:
+                spg = SpacegroupAnalyzer(structure, symprec=symprec)
+                sg_number = spg.get_space_group_number()
+
+                if sg_number > best_sg_number:
+                    refined = spg.get_refined_structure()
+                    best_structure = refined
+                    best_sg_number = sg_number
+                    best_sg_symbol = spg.get_space_group_symbol()
+                    logger.debug(
+                        "Found higher symmetry at symprec=%.3f: %s (#%d)",
+                        symprec,
+                        best_sg_symbol,
+                        best_sg_number,
+                    )
+            except Exception as e:
+                logger.debug(
+                    "Symmetry refinement failed at symprec=%.3f: %s", symprec, e
+                )
+                continue
+
+        return best_structure, best_sg_number, best_sg_symbol
+
+    def _select_top_space_groups(
+        self,
+        compatible_groups: List[Dict[str, Any]],
+        top_k: int = 5,
+        symmetry_bias: float = 0.0,
+    ) -> List[int]:
+        """Select top K space groups with configurable symmetry preference.
+
+        Args:
+            compatible_groups: List of compatible space group dicts
+            top_k: Number of space groups to return
+            symmetry_bias: Controls selection strategy.
+                0.0 = sample uniformly across crystal systems (above monoclinic)
+                1.0 = prioritize highest-symmetry space groups
+                Default: 0.0
+
+        Returns:
+            List of space group numbers
+        """
+        if not compatible_groups:
+            return []
+
+        symmetry_bias = max(0.0, min(1.0, symmetry_bias))
+
+        if symmetry_bias >= 0.8:
+            # High bias: just take highest space group numbers
+            sorted_groups = sorted(
+                compatible_groups, key=lambda x: x["number"], reverse=True
+            )
+            return [g["number"] for g in sorted_groups[:top_k]]
+
+        # Lower bias: sample to get diversity across crystal systems
+        # Group by crystal system
+        crystal_systems = {
+            "triclinic": [],
+            "monoclinic": [],
+            "orthorhombic": [],
+            "tetragonal": [],
+            "trigonal": [],
+            "hexagonal": [],
+            "cubic": [],
+        }
+
+        for g in compatible_groups:
+            sg = g["number"]
+            system = self._get_crystal_system_name(sg)
+            if system in crystal_systems:
+                crystal_systems[system].append(g)
+
+        # Build selection with representation from each non-empty system
+        # Prioritize systems above monoclinic
+        priority_systems = [
+            "orthorhombic",
+            "tetragonal",
+            "trigonal",
+            "hexagonal",
+            "cubic",
+        ]
+        low_priority_systems = ["triclinic", "monoclinic"]
+
+        selected = []
+        rng = np.random.default_rng(self.random_seed)
+
+        # First pass: one from each priority system that has compatible groups
+        for system in priority_systems:
+            if crystal_systems[system] and len(selected) < top_k:
+                # Pick one randomly from this system
+                group = rng.choice(crystal_systems[system])
+                selected.append(group["number"])
+
+        # Second pass: fill remaining slots, allowing duplicates from systems
+        all_priority = []
+        for system in priority_systems:
+            all_priority.extend(crystal_systems[system])
+
+        while len(selected) < top_k and all_priority:
+            group = rng.choice(all_priority)
+            if group["number"] not in selected:
+                selected.append(group["number"])
+            # Remove to avoid infinite loop if we run out
+            all_priority = [g for g in all_priority if g["number"] not in selected]
+
+        # If still not enough, add from low priority systems
+        if len(selected) < top_k:
+            for system in low_priority_systems:
+                for g in crystal_systems[system]:
+                    if g["number"] not in selected and len(selected) < top_k:
+                        selected.append(g["number"])
+
+        return selected
 
     # -------------------- Trajectory management --------------------
 
@@ -536,10 +807,10 @@ class GGen:
                     return result
 
             optimizer = TrajectoryLBFGS(
-                dyn_target, self, trajectory_interval, maxstep=0.2
+                dyn_target, self, trajectory_interval, maxstep=0.2, logfile=None
             )
         else:
-            optimizer = LBFGS(dyn_target, maxstep=0.2)
+            optimizer = LBFGS(dyn_target, maxstep=0.2, logfile=None)
 
         try:
             optimizer.run(fmax=fmax, steps=max_steps)
@@ -595,96 +866,348 @@ class GGen:
         space_group: Optional[int] = None,
         num_trials: int = 10,
         optimize_geometry: bool = False,
+        # Enhanced generation parameters
+        multi_spacegroup: bool = True,
+        top_k_spacegroups: int = 5,
+        symmetry_weight: float = 0.1,
+        symmetry_bias: float = 0.0,
+        crystal_systems: Optional[List[str]] = None,
+        refine_symmetry: bool = True,
+        min_distance_filter: float = 1.0,
+        volume_bounds: Tuple[float, float] = (2.0, 100.0),
     ) -> Dict[str, Any]:
-        """Generate a crystal structure using PyXtal, evaluate energies, and return the best.
+        """Generate a crystal structure using PyXtal with enhanced stability and symmetry.
 
-        Returns metadata + CIF content (text and base64).
+        This method implements an improved generation workflow:
+        1. Multi-space-group exploration (tries multiple compatible space groups)
+        2. Pre-filtering of invalid structures before expensive energy evaluation
+        3. Combined scoring considering both energy and symmetry
+        4. Optional post-relaxation symmetry refinement
+
+        Args:
+            formula: Chemical formula (e.g., "NaCl", "TiO2")
+            space_group: Specific space group number to use. If None, auto-selects.
+            num_trials: Number of random structures to generate per space group.
+            optimize_geometry: Whether to relax the structure after generation.
+            multi_spacegroup: If True and space_group is None, tries multiple space groups.
+            top_k_spacegroups: Number of top space groups to try when multi_spacegroup=True.
+            symmetry_weight: Weight for symmetry in combined scoring (higher = prefer symmetry).
+            symmetry_bias: Controls preference for higher-symmetry crystal systems when
+                auto-selecting space groups. 0.0 = uniform distribution across orthorhombic
+                and above (reduced weight for triclinic/monoclinic). 1.0 = strong preference
+                for cubic/hexagonal. Default: 0.0
+            crystal_systems: Optional list of crystal systems to restrict generation to.
+                Valid values: "triclinic", "monoclinic", "orthorhombic", "tetragonal",
+                "trigonal", "hexagonal", "cubic". If None, all systems are considered.
+                Example: ["tetragonal", "hexagonal"] to only generate in those systems.
+            refine_symmetry: Whether to attempt symmetry refinement after relaxation.
+            min_distance_filter: Minimum interatomic distance for pre-filtering (Å).
+            volume_bounds: (min, max) volume per atom bounds for pre-filtering (Å³).
+
+        Returns:
+            Dictionary with structure metadata, CIF content, and generation statistics.
         """
         if num_trials < 1:
             raise ValueError("num_trials must be >= 1")
         num_trials = int(min(num_trials, 100))
 
         elements, counts = parse_chemical_formula(formula)
+        logger.info(
+            "Starting crystal generation for %s (elements=%s, counts=%s)",
+            formula,
+            elements,
+            counts,
+        )
 
-        selected_space_group = space_group
-        was_randomly_selected = False
+        # Get compatible space groups
+        compatible = self.get_compatible_space_groups(elements, counts)
+        if not compatible:
+            raise ValueError(
+                f"No compatible space groups found for composition {formula}"
+            )
+        logger.info("Found %d compatible space groups", len(compatible))
 
-        if selected_space_group is None:
-            compatible = self.get_compatible_space_groups(elements, counts)
+        # Filter by crystal system if specified
+        if crystal_systems is not None:
+            valid_systems = {
+                "triclinic",
+                "monoclinic",
+                "orthorhombic",
+                "tetragonal",
+                "trigonal",
+                "hexagonal",
+                "cubic",
+            }
+            # Normalize to lowercase
+            crystal_systems_lower = [s.lower() for s in crystal_systems]
+            invalid = set(crystal_systems_lower) - valid_systems
+            if invalid:
+                raise ValueError(
+                    f"Invalid crystal system(s): {invalid}. "
+                    f"Valid options: {sorted(valid_systems)}"
+                )
+
+            # Filter compatible groups to only those in specified systems
+            compatible = [
+                g
+                for g in compatible
+                if self._get_crystal_system_name(g["number"]) in crystal_systems_lower
+            ]
             if not compatible:
                 raise ValueError(
-                    f"No compatible space groups found for composition {formula}"
+                    f"No compatible space groups found for composition {formula} "
+                    f"in crystal system(s): {crystal_systems}"
                 )
-            selected_space_group = (
-                self.select_random_space_group_with_symmetry_preference(
-                    compatible, random_seed=self.random_seed
-                )
+            logger.info(
+                "Filtered to %d space groups in systems: %s",
+                len(compatible),
+                crystal_systems,
             )
-            was_randomly_selected = True
-        else:
+
+        # Determine which space groups to try
+        target_space_groups: List[int] = []
+        was_randomly_selected = False
+
+        if space_group is not None:
+            # User specified a space group - validate it
             try:
-                g = Group(int(selected_space_group), dim=3)
+                g = Group(int(space_group), dim=3)
                 ok, _msg = g.check_compatible(counts)
                 if not ok:
-                    compatible = self.get_compatible_space_groups(elements, counts)
                     raise ValueError(
-                        f"Composition {counts} not compatible with space group {selected_space_group}. "
+                        f"Composition {counts} not compatible with space group {space_group}. "
                         f"Compatible space groups: {[x['number'] for x in compatible]}"
                     )
+                target_space_groups = [space_group]
+                logger.info("Using user-specified space group: %d", space_group)
             except Exception as e:
-                compatible = self.get_compatible_space_groups(elements, counts)
                 raise ValueError(
                     f"Space group validation failed: {e}. "
                     f"Compatible space groups: {[x['number'] for x in compatible]}"
                 )
+        elif multi_spacegroup:
+            # Try multiple space groups with configurable symmetry preference
+            target_space_groups = self._select_top_space_groups(
+                compatible, top_k=top_k_spacegroups, symmetry_bias=symmetry_bias
+            )
+            was_randomly_selected = True
+            logger.info(
+                "Multi-spacegroup mode (symmetry_bias=%.2f): trying %d space groups: %s",
+                symmetry_bias,
+                len(target_space_groups),
+                target_space_groups,
+            )
+        else:
+            # Single auto-selected space group
+            selected = self.select_random_space_group_with_symmetry_preference(
+                compatible, random_seed=self.random_seed, symmetry_bias=symmetry_bias
+            )
+            target_space_groups = [selected]
+            was_randomly_selected = True
+            logger.info(
+                "Auto-selected space group (symmetry_bias=%.2f): %d",
+                symmetry_bias,
+                selected,
+            )
 
-        crystals: List[pyxtal] = []
-        for _ in range(num_trials):
-            c = pyxtal()
-            # Pass seed when available for reproducibility
-            try:
-                c.from_random(
-                    dim=3,
-                    group=selected_space_group,
-                    species=elements,
-                    numIons=counts,
-                    seed=self.random_seed,
-                )
-            except TypeError:
-                # Older pyxtal versions may not accept seed
-                c.from_random(
-                    dim=3, group=selected_space_group, species=elements, numIons=counts
-                )
-            if c.valid:
-                crystals.append(c)
+        # Generate crystals across all target space groups
+        all_candidates: List[Tuple[pyxtal, float, Dict[str, float], int]] = []
+        generation_stats = {
+            "total_attempts": 0,
+            "valid_pyxtal": 0,
+            "passed_prefilter": 0,
+            "energy_evaluated": 0,
+            "by_spacegroup": {},
+        }
 
-        if not crystals:
-            compatible = self.get_compatible_space_groups(elements, counts)
+        trials_per_sg = max(1, num_trials // len(target_space_groups))
+
+        for sg_number in target_space_groups:
+            sg_stats = {"attempts": 0, "valid": 0, "passed_filter": 0}
+            logger.info(
+                "Generating %d trials in space group %d (%s)",
+                trials_per_sg,
+                sg_number,
+                self._get_crystal_system_name(sg_number),
+            )
+
+            for trial_idx in range(trials_per_sg):
+                generation_stats["total_attempts"] += 1
+                sg_stats["attempts"] += 1
+
+                # Generate random crystal
+                c = pyxtal()
+                try:
+                    c.from_random(
+                        dim=3,
+                        group=sg_number,
+                        species=elements,
+                        numIons=counts,
+                        seed=self.random_seed,
+                    )
+                except TypeError:
+                    # Older pyxtal versions may not accept seed
+                    c.from_random(
+                        dim=3, group=sg_number, species=elements, numIons=counts
+                    )
+
+                if not c.valid:
+                    logger.debug(
+                        "SG %d trial %d: PyXtal generation failed (invalid)",
+                        sg_number,
+                        trial_idx + 1,
+                    )
+                    continue
+
+                generation_stats["valid_pyxtal"] += 1
+                sg_stats["valid"] += 1
+
+                # Pre-filter: check structural validity before energy evaluation
+                structure = c.to_pymatgen()
+                is_valid, reason = self._is_structurally_valid(
+                    structure,
+                    min_distance=min_distance_filter,
+                    min_volume_per_atom=volume_bounds[0],
+                    max_volume_per_atom=volume_bounds[1],
+                )
+
+                if not is_valid:
+                    logger.debug(
+                        "SG %d trial %d: Pre-filter rejected (%s)",
+                        sg_number,
+                        trial_idx + 1,
+                        reason,
+                    )
+                    continue
+
+                generation_stats["passed_prefilter"] += 1
+                sg_stats["passed_filter"] += 1
+
+                # Energy evaluation
+                try:
+                    atoms = c.to_ase()
+                    atoms.calc = self.calculator
+                    energy = float(atoms.get_potential_energy())
+                    generation_stats["energy_evaluated"] += 1
+
+                    # Combined scoring
+                    score, breakdown = self._score_crystal(
+                        c, energy, symmetry_weight=symmetry_weight
+                    )
+
+                    all_candidates.append((c, score, breakdown, sg_number))
+                    logger.debug(
+                        "SG %d trial %d: energy=%.4f eV, score=%.4f (SG bonus=%.4f)",
+                        sg_number,
+                        trial_idx + 1,
+                        energy,
+                        score,
+                        breakdown["symmetry_bonus"],
+                    )
+
+                except Exception as e:
+                    logger.warning(
+                        "SG %d trial %d: Energy evaluation failed: %s",
+                        sg_number,
+                        trial_idx + 1,
+                        e,
+                    )
+                    continue
+
+            generation_stats["by_spacegroup"][sg_number] = sg_stats
+            logger.info(
+                "SG %d complete: %d/%d valid, %d passed pre-filter",
+                sg_number,
+                sg_stats["valid"],
+                sg_stats["attempts"],
+                sg_stats["passed_filter"],
+            )
+
+        # Select best candidate
+        if not all_candidates:
             raise ValueError(
                 "Failed to generate valid crystal structure. "
+                f"Stats: {generation_stats}. "
                 f"Compatible space groups: {[x['number'] for x in compatible]}"
             )
 
-        # Energy evaluation and selection
-        energies: List[float] = []
-        for c in crystals:
-            atoms = c.to_ase()
-            atoms.calc = self.calculator
-            energies.append(float(atoms.get_potential_energy()))
-
-        best_idx = int(np.argmin(energies))
-        best_crystal = crystals[best_idx]
+        # Sort by combined score (lower is better)
+        all_candidates.sort(key=lambda x: x[1])
+        best_crystal, best_score, best_breakdown, best_sg = all_candidates[0]
         structure = best_crystal.to_pymatgen()
-        final_energy = float(energies[best_idx])
+        final_energy = best_breakdown["energy"]
         optimization_steps = 0
 
+        logger.info(
+            "Selected best candidate: SG %d, energy=%.4f eV, score=%.4f",
+            best_sg,
+            final_energy,
+            best_score,
+        )
+        logger.info(
+            "Generation stats: %d attempts → %d valid → %d passed filter → %d evaluated",
+            generation_stats["total_attempts"],
+            generation_stats["valid_pyxtal"],
+            generation_stats["passed_prefilter"],
+            generation_stats["energy_evaluated"],
+        )
+
+        # Geometry optimization
         if optimize_geometry:
+            logger.info("Starting geometry optimization...")
             self.set_structure(structure, add_to_trajectory=True)
             structure, final_energy, optimization_steps = self.optimize_geometry(
                 max_steps=400, fmax=0.01, relax_cell=True
             )
+            logger.info(
+                "Optimization complete: %d steps, final energy=%.4f eV",
+                optimization_steps,
+                final_energy,
+            )
 
-        # Set final structure and analyze symmetry
+            # Symmetry refinement after relaxation
+            if refine_symmetry:
+                logger.info("Attempting post-relaxation symmetry refinement...")
+                refined_struct, refined_sg, refined_symbol = (
+                    self._refine_to_higher_symmetry(structure)
+                )
+                if refined_sg > 1:
+                    original_atoms = len(structure)
+                    refined_atoms = len(refined_struct)
+
+                    # Symmetry refinement moves atoms to ideal positions, which may
+                    # introduce strain. Do a quick re-relaxation to ensure we're at
+                    # a true local minimum with correct energy.
+                    logger.info(
+                        "Re-relaxing after symmetry refinement (%d -> %d atoms)...",
+                        original_atoms,
+                        refined_atoms,
+                    )
+                    self.set_structure(refined_struct, add_to_trajectory=False)
+                    refined_struct, final_energy, rerelax_steps = (
+                        self.optimize_geometry(
+                            max_steps=100,  # Quick relaxation since we're already close
+                            fmax=0.01,
+                            relax_cell=True,
+                        )
+                    )
+                    optimization_steps += rerelax_steps
+                    logger.info(
+                        "Post-refinement relaxation: %d steps, energy=%.4f eV",
+                        rerelax_steps,
+                        final_energy,
+                    )
+
+                    structure = refined_struct
+                    logger.info(
+                        "Symmetry refinement successful: %s (#%d)",
+                        refined_symbol,
+                        refined_sg,
+                    )
+                else:
+                    logger.info("No higher symmetry detected after relaxation")
+
+        # Final structure and analysis
         self.set_structure(structure, add_to_trajectory=not optimize_geometry)
         spg = SpacegroupAnalyzer(structure, symprec=SYMPREC)
         final_sg_num = spg.get_space_group_number()
@@ -696,41 +1219,55 @@ class GGen:
 
         optimization_text = ""
         if optimize_geometry:
-            optimization_text = (
-                f", optimized: {optimization_steps} steps, cell relaxed (isotropic)"
+            optimization_text = f", optimized: {optimization_steps} steps, cell relaxed"
+            if refine_symmetry:
+                optimization_text += ", symmetry refined"
+
+        # Build description
+        if multi_spacegroup and was_randomly_selected:
+            description = (
+                f"{formula} (best of {len(target_space_groups)} space groups, "
+                f"final: {final_sg_sym} #{final_sg_num}{optimization_text})"
+            )
+        elif was_randomly_selected:
+            description = (
+                f"{formula} (auto-selected SG: {requested_space_group_symbol} #{best_sg}, "
+                f"calculated: {final_sg_sym} #{final_sg_num}{optimization_text})"
+            )
+        else:
+            description = (
+                f"{formula} (requested SG: {requested_space_group_symbol} #{space_group}, "
+                f"calculated: {final_sg_sym} #{final_sg_num}{optimization_text})"
             )
 
-        if optimize_geometry and final_sg_num != selected_space_group:
-            if was_randomly_selected:
-                description = (
-                    f"{formula} (auto-selected SG: {requested_space_group_symbol} #{selected_space_group}, "
-                    f"calculated SG: {final_sg_sym} #{final_sg_num}{optimization_text})"
-                )
-            else:
-                description = (
-                    f"{formula} (requested SG: {requested_space_group_symbol} #{selected_space_group}, "
-                    f"calculated SG: {final_sg_sym} #{final_sg_num}{optimization_text})"
-                )
-        else:
-            sg_source = "auto-selected" if was_randomly_selected else "requested"
-            description = f"{formula} ({sg_source} space group: {final_sg_sym} #{final_sg_num}{optimization_text})"
-
-        # Produce CIF content using CifWriter (ensures clean symmetry-bearing CIF)
+        # Produce CIF content
         cif_text = str(CifWriter(structure, symprec=SYMPREC))
         cif64 = base64.b64encode(cif_text.encode("utf-8")).decode("utf-8")
+
+        logger.info(
+            "Crystal generation complete: %s, SG=%s (#%d), energy=%.4f eV",
+            formula,
+            final_sg_sym,
+            final_sg_num,
+            final_energy,
+        )
 
         resp: Dict[str, Any] = {
             "formula": formula,
             "requested_space_group": space_group,
-            "selected_space_group": selected_space_group,
+            "selected_space_group": best_sg,
             "space_group_randomly_selected": was_randomly_selected,
             "requested_space_group_symbol": requested_space_group_symbol,
             "final_space_group": final_sg_num,
             "final_space_group_symbol": final_sg_sym,
-            "space_group_changed": final_sg_num != selected_space_group,
+            "space_group_changed": final_sg_num != best_sg,
             "num_trials": num_trials,
             "best_crystal_energy": final_energy,
+            "best_crystal_score": best_score,
+            "score_breakdown": best_breakdown,
             "geometry_optimized": optimize_geometry,
+            "symmetry_refined": refine_symmetry and optimize_geometry,
+            "generation_stats": generation_stats,
             "cif_content": cif_text,
             "cif_base64": cif64,
             "filename": filename,
@@ -740,6 +1277,243 @@ class GGen:
         if optimize_geometry:
             resp["optimization_steps"] = optimization_steps
         return resp
+
+    def generate_crystal_advanced(
+        self,
+        formula: str,
+        max_iterations: int = 3,
+        num_trials_per_iteration: int = 10,
+        convergence_threshold: float = 0.01,
+        # Generation parameters
+        top_k_spacegroups: int = 5,
+        symmetry_weight: float = 0.1,
+        symmetry_bias: float = 0.0,
+        crystal_systems: Optional[List[str]] = None,
+        min_distance_filter: float = 1.0,
+        # Optimization parameters
+        optimization_max_steps: int = 400,
+        optimization_fmax: float = 0.01,
+    ) -> Dict[str, Any]:
+        """Advanced iterative crystal generation for maximum stability and symmetry.
+
+        This method implements an iterative refinement workflow:
+        1. Generate structures across multiple space groups
+        2. Relax the best structure
+        3. Detect actual symmetry after relaxation
+        4. Regenerate in detected symmetry space group
+        5. Repeat until convergence or max iterations
+
+        This approach often finds more stable, higher-symmetry structures than
+        single-shot generation because:
+        - Relaxation may reveal hidden symmetry
+        - Regenerating in detected symmetry constrains the search
+        - Multiple iterations explore the energy landscape more thoroughly
+
+        Args:
+            formula: Chemical formula (e.g., "NaCl", "TiO2")
+            max_iterations: Maximum number of generate-relax-regenerate cycles.
+            num_trials_per_iteration: Trials per space group per iteration.
+            convergence_threshold: Energy change threshold for convergence (eV).
+            top_k_spacegroups: Number of space groups to try in first iteration.
+            symmetry_weight: Weight for symmetry in combined scoring.
+            symmetry_bias: Controls preference for higher-symmetry crystal systems.
+                0.0 = uniform distribution across orthorhombic and above.
+                1.0 = strong preference for cubic/hexagonal. Default: 0.0
+            crystal_systems: Optional list of crystal systems to restrict generation to.
+                Valid values: "triclinic", "monoclinic", "orthorhombic", "tetragonal",
+                "trigonal", "hexagonal", "cubic". If None, all systems are considered.
+            min_distance_filter: Minimum interatomic distance for pre-filtering (Å).
+            optimization_max_steps: Max steps for geometry optimization.
+            optimization_fmax: Force convergence criterion (eV/Å).
+
+        Returns:
+            Dictionary with final structure, iteration history, and statistics.
+        """
+        logger.info(
+            "Starting advanced iterative generation for %s (max_iterations=%d)",
+            formula,
+            max_iterations,
+        )
+
+        elements, counts = parse_chemical_formula(formula)
+        compatible = self.get_compatible_space_groups(elements, counts)
+        if not compatible:
+            raise ValueError(
+                f"No compatible space groups found for composition {formula}"
+            )
+
+        iteration_history: List[Dict[str, Any]] = []
+        best_structure: Optional[Structure] = None
+        best_energy = float("inf")
+        best_sg = None
+        detected_sg = None
+        converged = False
+
+        for iteration in range(max_iterations):
+            logger.info(
+                "=== Iteration %d/%d ===",
+                iteration + 1,
+                max_iterations,
+            )
+
+            # Determine space groups to try
+            if iteration == 0:
+                # First iteration: try top K space groups
+                target_sg = None  # Will use multi_spacegroup mode
+                logger.info(
+                    "First iteration: exploring top %d space groups",
+                    top_k_spacegroups,
+                )
+            else:
+                # Later iterations: use detected space group from previous iteration
+                target_sg = detected_sg
+                logger.info(
+                    "Iteration %d: regenerating in detected space group %d",
+                    iteration + 1,
+                    target_sg,
+                )
+
+            # Generate and optimize
+            try:
+                result = self.generate_crystal(
+                    formula=formula,
+                    space_group=target_sg,
+                    num_trials=num_trials_per_iteration,
+                    optimize_geometry=True,
+                    multi_spacegroup=(iteration == 0),
+                    top_k_spacegroups=top_k_spacegroups,
+                    symmetry_weight=symmetry_weight,
+                    symmetry_bias=symmetry_bias,
+                    crystal_systems=crystal_systems if iteration == 0 else None,
+                    refine_symmetry=True,
+                    min_distance_filter=min_distance_filter,
+                )
+            except Exception as e:
+                logger.warning("Iteration %d failed: %s", iteration + 1, e)
+                if iteration == 0:
+                    raise  # First iteration must succeed
+                break
+
+            current_energy = result["best_crystal_energy"]
+            current_sg = result["final_space_group"]
+            current_structure = self.get_structure()
+
+            # Log iteration results
+            energy_delta = (
+                best_energy - current_energy if best_energy != float("inf") else 0
+            )
+            logger.info(
+                "Iteration %d result: SG=%d (%s), energy=%.4f eV (Δ=%.4f eV)",
+                iteration + 1,
+                current_sg,
+                result["final_space_group_symbol"],
+                current_energy,
+                energy_delta,
+            )
+
+            # Record iteration
+            iteration_history.append(
+                {
+                    "iteration": iteration + 1,
+                    "target_space_group": target_sg,
+                    "final_space_group": current_sg,
+                    "final_space_group_symbol": result["final_space_group_symbol"],
+                    "energy": current_energy,
+                    "energy_delta": energy_delta,
+                    "optimization_steps": result.get("optimization_steps", 0),
+                    "generation_stats": result.get("generation_stats", {}),
+                }
+            )
+
+            # Check for improvement
+            if current_energy < best_energy:
+                improvement = best_energy - current_energy
+                logger.info(
+                    "New best structure found! Energy improved by %.4f eV",
+                    improvement,
+                )
+                best_structure = current_structure
+                best_energy = current_energy
+                best_sg = current_sg
+
+                # Check convergence
+                if improvement < convergence_threshold and iteration > 0:
+                    logger.info(
+                        "Converged: energy improvement %.4f eV < threshold %.4f eV",
+                        improvement,
+                        convergence_threshold,
+                    )
+                    converged = True
+                    break
+            else:
+                logger.info(
+                    "No improvement in iteration %d (energy %.4f vs best %.4f)",
+                    iteration + 1,
+                    current_energy,
+                    best_energy,
+                )
+                # No improvement - maybe we found a local minimum
+                if iteration > 0:
+                    logger.info("Stopping: no improvement after refinement")
+                    break
+
+            # Detect symmetry for next iteration
+            try:
+                spg = SpacegroupAnalyzer(current_structure, symprec=SYMPREC)
+                detected_sg = spg.get_space_group_number()
+                logger.info(
+                    "Detected symmetry for next iteration: SG %d (%s)",
+                    detected_sg,
+                    spg.get_space_group_symbol(),
+                )
+            except Exception as e:
+                logger.warning("Symmetry detection failed: %s", e)
+                detected_sg = best_sg
+
+        # Set final structure
+        if best_structure is not None:
+            self.set_structure(best_structure, add_to_trajectory=True)
+
+        # Final analysis
+        final_spg = SpacegroupAnalyzer(best_structure, symprec=SYMPREC)
+        final_sg_num = final_spg.get_space_group_number()
+        final_sg_sym = final_spg.get_space_group_symbol()
+
+        # Generate CIF
+        cif_text = str(CifWriter(best_structure, symprec=SYMPREC))
+        cif64 = base64.b64encode(cif_text.encode("utf-8")).decode("utf-8")
+
+        filename = f"{formula}_{final_sg_sym.replace('/', '-')}_advanced.cif"
+        name = f"{formula} ({final_sg_sym})"
+        description = (
+            f"{formula} (iterative generation: {len(iteration_history)} iterations, "
+            f"{'converged' if converged else 'max iterations'}, "
+            f"final SG: {final_sg_sym} #{final_sg_num})"
+        )
+
+        logger.info(
+            "Advanced generation complete: %d iterations, %s, final SG=%s (#%d), energy=%.4f eV",
+            len(iteration_history),
+            "converged" if converged else "max iterations reached",
+            final_sg_sym,
+            final_sg_num,
+            best_energy,
+        )
+
+        return {
+            "formula": formula,
+            "final_space_group": final_sg_num,
+            "final_space_group_symbol": final_sg_sym,
+            "best_crystal_energy": best_energy,
+            "converged": converged,
+            "num_iterations": len(iteration_history),
+            "iteration_history": iteration_history,
+            "cif_content": cif_text,
+            "cif_base64": cif64,
+            "filename": filename,
+            "name": name,
+            "description": description,
+        }
 
     # -------------------- Structure description / IO --------------------
 

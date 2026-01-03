@@ -7,6 +7,7 @@ modifying, and analyzing crystal structures with built-in energy evaluation usin
 """
 
 from .calculator import get_orb_calculator
+from .explorer import CandidateResult, ChemistryExplorer, ExplorationResult
 from .ggen import GGen
 from .operations import MutationError, Operations
 from .utils import parse_chemical_formula
@@ -17,6 +18,9 @@ __email__ = "matt@ouro.foundation"
 
 __all__ = [
     "GGen",
+    "ChemistryExplorer",
+    "CandidateResult",
+    "ExplorationResult",
     "Operations",
     "MutationError",
     "get_orb_calculator",
