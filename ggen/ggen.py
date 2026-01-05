@@ -244,6 +244,7 @@ class GGen:
         calculator=None,
         random_seed: Optional[int] = None,
         enable_trajectory: bool = True,
+        device: Optional[str] = None,
     ):
         """Initialize the crystal generator.
 
@@ -251,8 +252,10 @@ class GGen:
             calculator: ASE calculator instance. If None, uses ORB calculator.
             random_seed: Optional random seed for reproducible operations.
             enable_trajectory: Whether to enable trajectory tracking for mutations and relaxations.
+            device: Device to use for calculator ('cpu' or 'cuda'). If None, automatically
+                detects CUDA availability and uses it if available. Only used when calculator is None.
         """
-        self.calculator = calculator or get_orb_calculator()
+        self.calculator = calculator or get_orb_calculator(device=device)
         self.random_seed = random_seed
         self.rng = np.random.default_rng(random_seed)
 

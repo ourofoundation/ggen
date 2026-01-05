@@ -9,11 +9,36 @@ from orb_models.forcefield.calculator import ORBCalculator
 MODELS_PATH = Path(os.environ.get("ORB_MODELS_PATH", Path.home() / ".orb_models"))
 
 
+def _detect_device() -> str:
+    """Detect the best available device (CUDA if available, otherwise CPU)."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+    except ImportError:
+        pass
+    return "cpu"
+
+
 def get_orb_calculator(
-    device: str = "cpu",
+    device: str = None,
     weights_path: str = None,
 ):
-    """Return an instance of the ORB calculator."""
+    """Return an instance of the ORB calculator.
+
+    Args:
+        device: Device to run the calculator on ('cpu' or 'cuda').
+                If None, automatically detects CUDA availability and uses it if available.
+        weights_path: Optional path to model weights file.
+
+    Returns:
+        ORBCalculator instance configured for the specified device.
+    """
+    # Auto-detect device if not specified
+    if device is None:
+        device = _detect_device()
+
     try:
         if weights_path:
             print(f"Loading ORB calculator from {weights_path}")
