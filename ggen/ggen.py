@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import math
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import requests
+from ase.constraints import FixSymmetry
 from ase.filters import FrechetCellFilter
 from ase.io import read as ase_read
 from ase.io import write as ase_write
@@ -149,6 +151,45 @@ def _structure_from_description_like(
 
 def _atoms_from_structure(structure: Structure):
     return AseAtomsAdaptor().get_atoms(structure)
+
+
+def _wrap_to_unit_cell(structure: Structure) -> Structure:
+    """Wrap all fractional coordinates to [0, 1) range.
+
+    After relaxation, atoms can drift outside the unit cell. This wraps
+    them back to ensure clean visualization and proper symmetry detection.
+    """
+    new_coords = []
+    for site in structure:
+        wrapped = site.frac_coords % 1.0
+        # Handle numerical precision issues near 1.0
+        wrapped = np.where(np.abs(wrapped - 1.0) < 1e-10, 0.0, wrapped)
+        new_coords.append(wrapped)
+
+    return Structure(
+        structure.lattice,
+        [site.specie for site in structure],
+        new_coords,
+        site_properties=(
+            structure.site_properties if structure.site_properties else None
+        ),
+    )
+
+
+def _atoms_to_structure_wrapped(atoms) -> Structure:
+    """Convert ASE atoms to pymatgen Structure with wrapped coordinates.
+
+    This suppresses the harmless warning about unsupported constraints (like FixSymmetry)
+    and ensures coordinates are wrapped to [0, 1).
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Only FixAtoms and FixCartesian is supported",
+            category=UserWarning,
+        )
+        structure = AseAtomsAdaptor().get_structure(atoms)
+    return _wrap_to_unit_cell(structure)
 
 
 def _structures_to_atoms_list(structures: List[Structure]):
@@ -748,11 +789,28 @@ class GGen:
         fmax: float = 0.01,
         relax_cell: bool = True,
         trajectory_interval: int = 5,
+        preserve_symmetry: bool = False,
+        symmetry_symprec: float = 0.01,
     ) -> Tuple[Structure, float, int]:
         """Optimize geometry using ASE LBFGS with optional variable cell.
 
+        When preserve_symmetry=True, uses a two-stage approach:
+        1. Symmetry-constrained relaxation with FixSymmetry constraint
+        2. Unconstrained fine-tuning to allow true symmetry-breaking instabilities
+
+        Args:
+            max_steps: Maximum optimization steps (used for both stages if preserve_symmetry).
+            fmax: Force convergence criterion (eV/Å).
+            relax_cell: Whether to allow cell shape/volume changes.
+            trajectory_interval: Steps between trajectory snapshots.
+            preserve_symmetry: If True, use two-stage symmetry-preserving relaxation.
+                Stage 1 applies FixSymmetry constraint to keep atoms on Wyckoff positions.
+                Stage 2 does unconstrained fine-tuning with conservative settings.
+            symmetry_symprec: Tolerance for symmetry detection when preserve_symmetry
+                is True. Smaller values are stricter. Default: 0.01 Å.
+
         Returns:
-            (optimized_structure, final_energy_eV, steps)
+            (optimized_structure, final_energy_eV, total_steps)
         """
         if self._current_structure is None:
             raise ValueError(
@@ -768,12 +826,33 @@ class GGen:
                     "max_steps": max_steps,
                     "fmax": fmax,
                     "relax_cell": relax_cell,
+                    "preserve_symmetry": preserve_symmetry,
                 },
                 metadata={"step": 0},
             )
 
         atoms = _atoms_from_structure(self._current_structure)
         atoms.calc = self.calculator
+
+        # Apply symmetry constraint if requested
+        if preserve_symmetry:
+            try:
+                sym_constraint = FixSymmetry(
+                    atoms,
+                    symprec=symmetry_symprec,
+                    adjust_positions=True,
+                    adjust_cell=True,
+                )
+                atoms.set_constraint(sym_constraint)
+                logger.info(
+                    "Symmetry constraint applied (symprec=%.4f) - forces will be projected "
+                    "onto symmetry-allowed subspace",
+                    symmetry_symprec,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to apply symmetry constraint: %s. Proceeding without.", e
+                )
 
         dyn_target = FrechetCellFilter(atoms) if relax_cell else atoms
 
@@ -785,7 +864,6 @@ class GGen:
                     self.ggen = ggen
                     self.interval = interval
                     self.step_count = 0
-                    self.adaptor = AseAtomsAdaptor()
 
                 def step(self, f=None):
                     result = super().step(f)
@@ -797,7 +875,7 @@ class GGen:
                             if hasattr(self.atoms, "atoms")
                             else self.atoms
                         )
-                        structure = self.adaptor.get_structure(a)
+                        structure = _atoms_to_structure_wrapped(a)
                         self.ggen._add_trajectory_frame(
                             structure=structure,
                             frame_type="optimization_step",
@@ -818,10 +896,12 @@ class GGen:
             num_steps = optimizer.get_number_of_steps()
 
             if self.enable_trajectory:
-                final_struct = AseAtomsAdaptor().get_structure(atoms)
+                final_struct = _atoms_to_structure_wrapped(atoms)
                 self._add_trajectory_frame(
                     structure=final_struct,
-                    frame_type="optimization_end",
+                    frame_type=(
+                        "optimization_end" if not preserve_symmetry else "stage1_end"
+                    ),
                     operation="optimize_geometry",
                     parameters={
                         "max_steps": max_steps,
@@ -832,8 +912,77 @@ class GGen:
                     metadata={"step": num_steps, "converged": True},
                 )
 
-            optimized_structure = AseAtomsAdaptor().get_structure(atoms)
+            optimized_structure = _atoms_to_structure_wrapped(atoms)
             self.set_structure(optimized_structure, add_to_trajectory=False)
+
+            # Stage 2: unconstrained fine-tuning after symmetry-constrained relaxation
+            if preserve_symmetry:
+                logger.info(
+                    "Stage 1 complete: %d steps, E=%.4f eV", num_steps, final_energy
+                )
+
+                # Get symmetry after stage 1 for comparison
+                spg1 = SpacegroupAnalyzer(optimized_structure, symprec=SYMPREC)
+                sg1 = spg1.get_space_group_number()
+                logger.info(
+                    "Stage 1 symmetry: SG=%d (%s)", sg1, spg1.get_space_group_symbol()
+                )
+
+                logger.info("Stage 2: Unconstrained fine-tuning...")
+
+                # Fresh atoms without symmetry constraint
+                atoms2 = _atoms_from_structure(optimized_structure)
+                atoms2.calc = self.calculator
+                dyn_target2 = FrechetCellFilter(atoms2) if relax_cell else atoms2
+
+                # Conservative optimizer settings to avoid escaping high-symmetry basin
+                optimizer2 = LBFGS(dyn_target2, maxstep=0.05, logfile=None)
+
+                try:
+                    optimizer2.run(fmax=fmax, steps=max_steps)
+                    final_energy = atoms2.get_potential_energy()
+                    steps2 = optimizer2.get_number_of_steps()
+                    num_steps += steps2
+
+                    optimized_structure = _atoms_to_structure_wrapped(atoms2)
+                    self.set_structure(optimized_structure, add_to_trajectory=False)
+
+                    # Check if symmetry was lost
+                    spg2 = SpacegroupAnalyzer(optimized_structure, symprec=SYMPREC)
+                    sg2 = spg2.get_space_group_number()
+
+                    if sg2 < sg1:
+                        logger.info(
+                            "Stage 2: Symmetry reduced %d -> %d (true instability), "
+                            "%d steps, E=%.4f eV",
+                            sg1,
+                            sg2,
+                            steps2,
+                            final_energy,
+                        )
+                    else:
+                        logger.info(
+                            "Stage 2 complete: %d steps, E=%.4f eV, symmetry preserved SG=%d",
+                            steps2,
+                            final_energy,
+                            sg2,
+                        )
+
+                    if self.enable_trajectory:
+                        self._add_trajectory_frame(
+                            structure=optimized_structure,
+                            frame_type="optimization_end",
+                            operation="optimize_geometry",
+                            parameters={
+                                "stage2_steps": steps2,
+                                "stage2_fmax": fmax,
+                            },
+                            metadata={"stage": 2, "converged": True},
+                        )
+
+                except Exception as e:
+                    logger.warning("Stage 2 failed: %s. Using stage 1 result.", e)
+
             return optimized_structure, float(final_energy), int(num_steps)
 
         except Exception as e:
@@ -844,7 +993,7 @@ class GGen:
                 original_energy = float("nan")
 
             if self.enable_trajectory:
-                fallback_struct = AseAtomsAdaptor().get_structure(atoms)
+                fallback_struct = _atoms_to_structure_wrapped(atoms)
                 self._add_trajectory_frame(
                     structure=fallback_struct,
                     frame_type="optimization_failed",
@@ -869,12 +1018,20 @@ class GGen:
         # Enhanced generation parameters
         multi_spacegroup: bool = True,
         top_k_spacegroups: int = 5,
-        symmetry_weight: float = 0.1,
+        symmetry_weight: float = 0.01,
         symmetry_bias: float = 0.0,
         crystal_systems: Optional[List[str]] = None,
         refine_symmetry: bool = True,
         min_distance_filter: float = 1.0,
         volume_bounds: Tuple[float, float] = (2.0, 100.0),
+        preserve_symmetry: bool = False,
+        # Iterative refinement parameters
+        max_iterations: int = 1,
+        convergence_threshold: float = 0.01,
+        # Optimization parameters
+        optimization_max_steps: int = 400,
+        optimization_fmax: float = 0.01,
+        trajectory_interval: int = 5,
     ) -> Dict[str, Any]:
         """Generate a crystal structure using PyXtal with enhanced stability and symmetry.
 
@@ -883,6 +1040,13 @@ class GGen:
         2. Pre-filtering of invalid structures before expensive energy evaluation
         3. Combined scoring considering both energy and symmetry
         4. Optional post-relaxation symmetry refinement
+        5. Optional iterative refinement (when max_iterations > 1)
+
+        When max_iterations > 1, uses iterative refinement:
+        - Generate and relax the best structure
+        - Detect actual symmetry after relaxation
+        - Regenerate in detected symmetry space group
+        - Repeat until convergence or max iterations
 
         Args:
             formula: Chemical formula (e.g., "NaCl", "TiO2")
@@ -903,10 +1067,42 @@ class GGen:
             refine_symmetry: Whether to attempt symmetry refinement after relaxation.
             min_distance_filter: Minimum interatomic distance for pre-filtering (Å).
             volume_bounds: (min, max) volume per atom bounds for pre-filtering (Å³).
+            preserve_symmetry: If True, use symmetry-constrained relaxation to keep atoms
+                on Wyckoff positions during optimization. This uses a two-stage approach:
+                (1) symmetry-constrained relaxation, then (2) brief unconstrained fine-tuning.
+                This preserves high symmetry when energetically reasonable. Default: False.
+            max_iterations: Maximum generate-relax-regenerate cycles. When > 1, enables
+                iterative refinement where the structure is regenerated in the detected
+                symmetry space group. Default: 1 (single-shot).
+            convergence_threshold: Energy change threshold (eV) for convergence in iterative
+                mode. Stops when improvement is less than this. Default: 0.01.
+            optimization_max_steps: Max steps for geometry optimization. Default: 400.
+            optimization_fmax: Force convergence criterion (eV/Å). Default: 0.01.
+            trajectory_interval: Steps between trajectory frame snapshots during
+                optimization. Set to 0 to disable intermediate frames. Default: 5.
 
         Returns:
             Dictionary with structure metadata, CIF content, and generation statistics.
+            When max_iterations > 1, also includes iteration_history and convergence info.
         """
+        # Handle iterative refinement mode
+        if max_iterations > 1:
+            return self._generate_crystal_iterative(
+                formula=formula,
+                max_iterations=max_iterations,
+                num_trials=num_trials,
+                convergence_threshold=convergence_threshold,
+                top_k_spacegroups=top_k_spacegroups,
+                symmetry_weight=symmetry_weight,
+                symmetry_bias=symmetry_bias,
+                crystal_systems=crystal_systems,
+                min_distance_filter=min_distance_filter,
+                volume_bounds=volume_bounds,
+                preserve_symmetry=preserve_symmetry,
+                optimization_max_steps=optimization_max_steps,
+                optimization_fmax=optimization_fmax,
+                trajectory_interval=trajectory_interval,
+            )
         if num_trials < 1:
             raise ValueError("num_trials must be >= 1")
         num_trials = int(min(num_trials, 100))
@@ -1154,10 +1350,17 @@ class GGen:
 
         # Geometry optimization
         if optimize_geometry:
-            logger.info("Starting geometry optimization...")
             self.set_structure(structure, add_to_trajectory=True)
+            logger.info(
+                "Starting geometry optimization%s...",
+                " (symmetry-preserving)" if preserve_symmetry else "",
+            )
             structure, final_energy, optimization_steps = self.optimize_geometry(
-                max_steps=400, fmax=0.01, relax_cell=True
+                max_steps=optimization_max_steps,
+                fmax=optimization_fmax,
+                relax_cell=True,
+                trajectory_interval=trajectory_interval,
+                preserve_symmetry=preserve_symmetry,
             )
             logger.info(
                 "Optimization complete: %d steps, final energy=%.4f eV",
@@ -1165,8 +1368,8 @@ class GGen:
                 final_energy,
             )
 
-            # Symmetry refinement after relaxation
-            if refine_symmetry:
+            # Symmetry refinement after relaxation (only if not using preserve_symmetry)
+            if refine_symmetry and not preserve_symmetry:
                 logger.info("Attempting post-relaxation symmetry refinement...")
                 refined_struct, refined_sg, refined_symbol = (
                     self._refine_to_higher_symmetry(structure)
@@ -1186,9 +1389,12 @@ class GGen:
                     self.set_structure(refined_struct, add_to_trajectory=False)
                     refined_struct, final_energy, rerelax_steps = (
                         self.optimize_geometry(
-                            max_steps=100,  # Quick relaxation since we're already close
-                            fmax=0.01,
+                            max_steps=min(
+                                100, optimization_max_steps
+                            ),  # Quick re-relax
+                            fmax=optimization_fmax,
                             relax_cell=True,
+                            trajectory_interval=trajectory_interval,
                         )
                     )
                     optimization_steps += rerelax_steps
@@ -1220,7 +1426,9 @@ class GGen:
         optimization_text = ""
         if optimize_geometry:
             optimization_text = f", optimized: {optimization_steps} steps, cell relaxed"
-            if refine_symmetry:
+            if preserve_symmetry:
+                optimization_text += ", symmetry-constrained"
+            elif refine_symmetry:
                 optimization_text += ", symmetry refined"
 
         # Build description
@@ -1278,59 +1486,26 @@ class GGen:
             resp["optimization_steps"] = optimization_steps
         return resp
 
-    def generate_crystal_advanced(
+    def _generate_crystal_iterative(
         self,
         formula: str,
-        max_iterations: int = 3,
-        num_trials_per_iteration: int = 10,
-        convergence_threshold: float = 0.01,
-        # Generation parameters
-        top_k_spacegroups: int = 5,
-        symmetry_weight: float = 0.1,
-        symmetry_bias: float = 0.0,
-        crystal_systems: Optional[List[str]] = None,
-        min_distance_filter: float = 1.0,
-        # Optimization parameters
-        optimization_max_steps: int = 400,
-        optimization_fmax: float = 0.01,
+        max_iterations: int,
+        num_trials: int,
+        convergence_threshold: float,
+        top_k_spacegroups: int,
+        symmetry_weight: float,
+        symmetry_bias: float,
+        crystal_systems: Optional[List[str]],
+        min_distance_filter: float,
+        volume_bounds: Tuple[float, float],
+        preserve_symmetry: bool,
+        optimization_max_steps: int,
+        optimization_fmax: float,
+        trajectory_interval: int,
     ) -> Dict[str, Any]:
-        """Advanced iterative crystal generation for maximum stability and symmetry.
-
-        This method implements an iterative refinement workflow:
-        1. Generate structures across multiple space groups
-        2. Relax the best structure
-        3. Detect actual symmetry after relaxation
-        4. Regenerate in detected symmetry space group
-        5. Repeat until convergence or max iterations
-
-        This approach often finds more stable, higher-symmetry structures than
-        single-shot generation because:
-        - Relaxation may reveal hidden symmetry
-        - Regenerating in detected symmetry constrains the search
-        - Multiple iterations explore the energy landscape more thoroughly
-
-        Args:
-            formula: Chemical formula (e.g., "NaCl", "TiO2")
-            max_iterations: Maximum number of generate-relax-regenerate cycles.
-            num_trials_per_iteration: Trials per space group per iteration.
-            convergence_threshold: Energy change threshold for convergence (eV).
-            top_k_spacegroups: Number of space groups to try in first iteration.
-            symmetry_weight: Weight for symmetry in combined scoring.
-            symmetry_bias: Controls preference for higher-symmetry crystal systems.
-                0.0 = uniform distribution across orthorhombic and above.
-                1.0 = strong preference for cubic/hexagonal. Default: 0.0
-            crystal_systems: Optional list of crystal systems to restrict generation to.
-                Valid values: "triclinic", "monoclinic", "orthorhombic", "tetragonal",
-                "trigonal", "hexagonal", "cubic". If None, all systems are considered.
-            min_distance_filter: Minimum interatomic distance for pre-filtering (Å).
-            optimization_max_steps: Max steps for geometry optimization.
-            optimization_fmax: Force convergence criterion (eV/Å).
-
-        Returns:
-            Dictionary with final structure, iteration history, and statistics.
-        """
+        """Internal iterative crystal generation (called when max_iterations > 1)."""
         logger.info(
-            "Starting advanced iterative generation for %s (max_iterations=%d)",
+            "Starting iterative generation for %s (max_iterations=%d)",
             formula,
             max_iterations,
         )
@@ -1373,20 +1548,26 @@ class GGen:
                     target_sg,
                 )
 
-            # Generate and optimize
+            # Generate and optimize (single-shot, max_iterations=1)
             try:
                 result = self.generate_crystal(
                     formula=formula,
                     space_group=target_sg,
-                    num_trials=num_trials_per_iteration,
+                    num_trials=num_trials,
                     optimize_geometry=True,
                     multi_spacegroup=(iteration == 0),
                     top_k_spacegroups=top_k_spacegroups,
                     symmetry_weight=symmetry_weight,
                     symmetry_bias=symmetry_bias,
                     crystal_systems=crystal_systems if iteration == 0 else None,
-                    refine_symmetry=True,
+                    refine_symmetry=not preserve_symmetry,
                     min_distance_filter=min_distance_filter,
+                    volume_bounds=volume_bounds,
+                    preserve_symmetry=preserve_symmetry,
+                    max_iterations=1,  # Single-shot for each iteration
+                    optimization_max_steps=optimization_max_steps,
+                    optimization_fmax=optimization_fmax,
+                    trajectory_interval=trajectory_interval,
                 )
             except Exception as e:
                 logger.warning("Iteration %d failed: %s", iteration + 1, e)
@@ -1483,16 +1664,16 @@ class GGen:
         cif_text = str(CifWriter(best_structure, symprec=SYMPREC))
         cif64 = base64.b64encode(cif_text.encode("utf-8")).decode("utf-8")
 
-        filename = f"{formula}_{final_sg_sym.replace('/', '-')}_advanced.cif"
+        filename = f"{formula}_{final_sg_sym.replace('/', '-')}.cif"
         name = f"{formula} ({final_sg_sym})"
         description = (
-            f"{formula} (iterative generation: {len(iteration_history)} iterations, "
+            f"{formula} (iterative: {len(iteration_history)} iterations, "
             f"{'converged' if converged else 'max iterations'}, "
             f"final SG: {final_sg_sym} #{final_sg_num})"
         )
 
         logger.info(
-            "Advanced generation complete: %d iterations, %s, final SG=%s (#%d), energy=%.4f eV",
+            "Iterative generation complete: %d iterations, %s, final SG=%s (#%d), energy=%.4f eV",
             len(iteration_history),
             "converged" if converged else "max iterations reached",
             final_sg_sym,
@@ -1598,7 +1779,7 @@ class GGen:
             atoms = atoms[0]
         atoms.pbc = True
 
-        structure = AseAtomsAdaptor().get_structure(atoms)
+        structure = _atoms_to_structure_wrapped(atoms)
         return self._describe_structure(structure)
 
     def create_cif_from_description(
@@ -2027,7 +2208,7 @@ class GGen:
         if isinstance(atoms, list):
             atoms = atoms[0]
         atoms.pbc = True
-        structure = AseAtomsAdaptor().get_structure(atoms)
+        structure = _atoms_to_structure_wrapped(atoms)
         self.set_structure(structure)
 
     def from_json(self, crystal_data: Dict[str, Any]) -> None:

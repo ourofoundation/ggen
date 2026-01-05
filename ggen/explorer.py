@@ -379,6 +379,7 @@ class ChemistryExplorer:
         optimize: bool = True,
         symmetry_bias: float = 0.0,
         crystal_systems: Optional[List[str]] = None,
+        preserve_symmetry: bool = False,
     ) -> CandidateResult:
         """Generate and optimize a structure for a given stoichiometry.
 
@@ -390,6 +391,8 @@ class ChemistryExplorer:
                 0.0 = uniform distribution across orthorhombic and above.
                 1.0 = strong preference for cubic/hexagonal. Default: 0.0
             crystal_systems: Optional list of crystal systems to restrict to.
+            preserve_symmetry: If True, use symmetry-constrained relaxation to preserve
+                high symmetry during optimization.
 
         Returns:
             CandidateResult with structure and energy information.
@@ -419,7 +422,8 @@ class ChemistryExplorer:
                 top_k_spacegroups=5,
                 symmetry_bias=symmetry_bias,
                 crystal_systems=crystal_systems,
-                refine_symmetry=True,
+                refine_symmetry=not preserve_symmetry,  # Don't need refinement if preserving
+                preserve_symmetry=preserve_symmetry,
             )
 
             structure = ggen.get_structure()
@@ -464,14 +468,28 @@ class ChemistryExplorer:
     def _save_structure_cif(
         self, candidate: CandidateResult, structures_dir: Path
     ) -> Path:
-        """Save structure to CIF file."""
+        """Save structure to CIF file.
+
+        Always saves the primitive cell to avoid supercell issues when
+        loading CIFs back. Centered space groups (Im-3m, Fm-3m, etc.) have
+        conventional cells 2-4x larger than primitive cells, which can cause
+        issues with phase diagram calculations if the wrong cell is loaded.
+        """
         filename = (
             f"{candidate.formula}_{candidate.space_group_symbol.replace('/', '-')}.cif"
         )
         cif_path = structures_dir / filename
 
+        # Get primitive cell to avoid supercell issues on reload
+        # This ensures consistent atom counts between save and load
         try:
-            cif_writer = CifWriter(candidate.structure, symprec=0.1)
+            structure = candidate.structure.get_primitive_structure()
+        except Exception:
+            # Fall back to original structure if primitive conversion fails
+            structure = candidate.structure
+
+        try:
+            cif_writer = CifWriter(structure, symprec=0.1)
         except Exception as e:
             # Fall back to saving without symmetry if spglib fails
             # (e.g., atoms too close together)
@@ -479,7 +497,7 @@ class ChemistryExplorer:
                 f"Symmetry detection failed for {candidate.formula}, "
                 f"saving without symmetry: {e}"
             )
-            cif_writer = CifWriter(candidate.structure, symprec=None)
+            cif_writer = CifWriter(structure, symprec=None)
 
         with open(cif_path, "w") as f:
             f.write(str(cif_writer))
@@ -494,6 +512,7 @@ class ChemistryExplorer:
         num_trials: int = 10,
         optimize: bool = True,
         symmetry_bias: float = 0.0,
+        preserve_symmetry: bool = False,
     ) -> List[CandidateResult]:
         """Generate structures for pure elements (terminal entries for phase diagram).
 
@@ -506,6 +525,7 @@ class ChemistryExplorer:
             num_trials: Number of generation attempts per element.
             optimize: Whether to optimize geometry.
             symmetry_bias: Controls preference for higher-symmetry crystal systems.
+            preserve_symmetry: If True, use symmetry-constrained relaxation.
 
         Returns:
             List of CandidateResult for each element.
@@ -541,7 +561,8 @@ class ChemistryExplorer:
                         top_k_spacegroups=5,
                         symmetry_bias=symmetry_bias,
                         crystal_systems=None,  # Allow all crystal systems
-                        refine_symmetry=True,
+                        refine_symmetry=not preserve_symmetry,
+                        preserve_symmetry=preserve_symmetry,
                     )
 
                     structure = ggen.get_structure()
@@ -618,9 +639,17 @@ class ChemistryExplorer:
             # Include space group in entry_id for better phase diagram labels
             sg_label = candidate.space_group_symbol.replace("/", "-")
             entry_id = f"{candidate.formula} ({sg_label})"
+
+            # IMPORTANT: Use stored stoichiometry, not structure.composition
+            # CIF loading can create supercells, causing composition mismatch
+            # Also recalculate total_energy from energy_per_atom to ensure consistency
+            composition = Composition(candidate.stoichiometry)
+            num_atoms = sum(candidate.stoichiometry.values())
+            total_energy = candidate.energy_per_atom * num_atoms
+
             entry = ComputedEntry(
-                candidate.structure.composition,
-                candidate.total_energy,
+                composition,
+                total_energy,
                 entry_id=entry_id,
             )
             entries.append(entry)
@@ -631,9 +660,16 @@ class ChemistryExplorer:
             if terminal.is_valid and terminal.structure is not None:
                 sg_label = terminal.space_group_symbol.replace("/", "-")
                 entry_id = f"{terminal.formula} ({sg_label})"
+
+                # IMPORTANT: Use stored stoichiometry and recalculate total_energy
+                # to avoid CIF supercell issues
+                composition = Composition(terminal.stoichiometry)
+                num_atoms = sum(terminal.stoichiometry.values())
+                total_energy = terminal.energy_per_atom * num_atoms
+
                 entry = ComputedEntry(
-                    terminal.structure.composition,
-                    terminal.total_energy,
+                    composition,
+                    total_energy,
                     entry_id=entry_id,
                 )
                 entries.append(entry)
@@ -694,6 +730,7 @@ class ChemistryExplorer:
         crystal_systems: Optional[List[str]] = None,
         load_previous_runs: Union[bool, int] = False,
         skip_existing_formulas: bool = True,
+        preserve_symmetry: bool = False,
     ) -> ExplorationResult:
         """Explore a chemical system by generating candidate structures.
 
@@ -732,6 +769,10 @@ class ChemistryExplorer:
             skip_existing_formulas: If True (default) and load_previous_runs is enabled,
                 skip generating structures for formulas that were already successfully
                 generated in previous runs. If False, regenerate all and keep the best.
+            preserve_symmetry: If True, use symmetry-constrained relaxation to preserve
+                high symmetry during optimization. This uses ASE's FixSymmetry constraint
+                to keep atoms on their Wyckoff positions. Recommended when you want to
+                maintain the generated space group. Default: False.
 
         Returns:
             ExplorationResult with all candidates, phase diagram, and stable phases.
@@ -850,6 +891,7 @@ class ChemistryExplorer:
                 optimize=optimize,
                 symmetry_bias=symmetry_bias,
                 crystal_systems=crystal_systems,
+                preserve_symmetry=preserve_symmetry,
             )
 
             # If we have a previous structure and this one failed or is worse, use the previous
@@ -932,6 +974,7 @@ class ChemistryExplorer:
             num_trials=num_trials,
             optimize=optimize,
             symmetry_bias=symmetry_bias,
+            preserve_symmetry=preserve_symmetry,
         )
 
         # Compare with previous runs and keep the better terminal
@@ -1348,13 +1391,15 @@ class ChemistryExplorer:
             )
 
             # Try to load structure from CIF
+            # Use primitive=True to avoid conventional cell expansion
+            # (centered space groups like Im-3m, Fm-3m have 2-4x larger conventional cells)
             structure = None
             cif_path = None
             if row["cif_filename"]:
                 cif_path = structures_dir / row["cif_filename"]
                 if cif_path.exists():
                     try:
-                        structure = Structure.from_file(str(cif_path))
+                        structure = Structure.from_file(str(cif_path), primitive=True)
                     except Exception:
                         pass
 
