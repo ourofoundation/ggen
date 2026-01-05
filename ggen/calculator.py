@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 from pathlib import Path
@@ -7,6 +8,11 @@ from orb_models.forcefield.calculator import ORBCalculator
 
 # Default models path - can be overridden via environment variable
 MODELS_PATH = Path(os.environ.get("ORB_MODELS_PATH", Path.home() / ".orb_models"))
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    # Avoid "No handler found" warnings; user/app can configure logging level/handlers.
+    logger.addHandler(logging.NullHandler())
 
 
 def _detect_device() -> str:
@@ -41,8 +47,8 @@ def get_orb_calculator(
 
     try:
         if weights_path:
-            print(f"Loading ORB calculator from {weights_path}")
-            print(f"Using device: {device}")
+            logger.info("Loading ORB calculator from %s", weights_path)
+            logger.info("Using device: %s", device)
 
             # Check if weights file exists
             weights_file = Path(weights_path)
@@ -54,10 +60,11 @@ def get_orb_calculator(
                 device=device, weights_path=weights_path, compile=False
             )
         else:
+            logger.info("Loading ORB calculator (using device: %s)", device)
             orbff = pretrained.orb_v3_conservative_inf_mpa(device=device, compile=False)
         calculator = ORBCalculator(orbff, device=device)
         return calculator
 
     except Exception as e:
-        print(f"Error loading ORB calculator: {str(e)}")
+        logger.error("Error loading ORB calculator: %s", e)
         raise RuntimeError(f"Failed to load ORB calculator: {str(e)}") from e

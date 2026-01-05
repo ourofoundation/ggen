@@ -96,7 +96,8 @@ class ChemistryExplorer:
             random_seed: Optional random seed for reproducibility.
             output_dir: Base directory for storing results. If None, uses current directory.
         """
-        self.calculator = calculator
+        self._calculator = calculator  # Store provided calculator (may be None)
+        self._calculator_initialized = calculator is not None
         self.random_seed = random_seed
         self.rng = np.random.default_rng(random_seed)
         self.output_dir = Path(output_dir) if output_dir else Path.cwd()
@@ -105,6 +106,21 @@ class ChemistryExplorer:
         self._run_dir: Optional[Path] = None
         self._db_path: Optional[Path] = None
         self._db_conn: Optional[sqlite3.Connection] = None
+
+    @property
+    def calculator(self):
+        """Lazily initialize and return the calculator.
+
+        The MLIP model is only loaded once on first access, then reused
+        for all subsequent structure generations.
+        """
+        if not self._calculator_initialized:
+            from .calculator import get_orb_calculator
+
+            logger.info("Initializing calculator (will be reused for all generations)")
+            self._calculator = get_orb_calculator()
+            self._calculator_initialized = True
+        return self._calculator
 
     # -------------------- Chemical System Parsing --------------------
 
