@@ -1137,7 +1137,7 @@ class GGen:
                 model=ts_model,
                 optimizer=ts.Optimizer.fire,
                 max_steps=max_steps,
-                autobatcher=True,  # Automatically handles GPU memory
+                autobatcher=False,  # Skip slow memory estimation
                 init_kwargs={"cell_filter": ts.CellFilter.frechet},
                 pbar=show_progress,
             )
