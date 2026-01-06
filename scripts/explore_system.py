@@ -26,9 +26,7 @@ warnings.filterwarnings(
     "ignore", category=UserWarning, module="pymatgen.core.structure"
 )
 # Suppress pymatgen CIF stoichiometry warnings
-warnings.filterwarnings(
-    "ignore", category=UserWarning, module="pymatgen.io.cif"
-)
+warnings.filterwarnings("ignore", category=UserWarning, module="pymatgen.io.cif")
 # Suppress orb_models torch dtype warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="orb_models.utils")
 
@@ -357,11 +355,20 @@ def main():
             else:
                 formula_color = C.BLUE
                 marker = "[db]"
+            # Dynamic stability indicator
+            if s.is_dynamically_stable is True:
+                dyn_status = f"{C.GREEN}dyn:✓{C.RESET}"
+            elif s.is_dynamically_stable is False:
+                dyn_status = f"{C.RED}dyn:✗{C.RESET}"
+            else:
+                dyn_status = f"{C.DIM}dyn:?{C.RESET}"
+
             logger.info(
                 f"  {formula_color}{s.formula:12s}{C.RESET}  "
                 f"E={s.energy_per_atom:.4f} eV/atom  "
                 f"SG={s.space_group_symbol:10s}  "
                 f"E_hull={e_above * 1000:.1f} meV  "
+                f"{dyn_status}  "
                 f"{C.DIM}{marker}{C.RESET}"
             )
 

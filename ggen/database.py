@@ -102,6 +102,13 @@ class StoredStructure:
     e_above_hull: Optional[float] = None
     is_on_hull: bool = False
 
+    # Dynamical stability (phonon) info
+    is_dynamically_stable: Optional[bool] = None
+    num_imaginary_modes: Optional[int] = None
+    min_phonon_frequency: Optional[float] = None
+    max_phonon_frequency: Optional[float] = None
+    phonon_supercell: Optional[str] = None  # JSON string of supercell tuple
+
     # Loaded structure object (not stored in DB)
     structure: Optional[Structure] = None
 
@@ -224,11 +231,41 @@ class StructureDatabase:
                 error_message TEXT,
                 generation_metadata TEXT,
                 
+                -- Dynamical stability (phonon) fields
+                is_dynamically_stable INTEGER,
+                num_imaginary_modes INTEGER,
+                min_phonon_frequency REAL,
+                max_phonon_frequency REAL,
+                phonon_supercell TEXT,
+                
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """
         )
+        
+        # Migration: Add dynamical stability columns if they don't exist
+        # This allows existing databases to be upgraded
+        try:
+            conn.execute("ALTER TABLE structures ADD COLUMN is_dynamically_stable INTEGER")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        try:
+            conn.execute("ALTER TABLE structures ADD COLUMN num_imaginary_modes INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE structures ADD COLUMN min_phonon_frequency REAL")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE structures ADD COLUMN max_phonon_frequency REAL")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE structures ADD COLUMN phonon_supercell TEXT")
+        except sqlite3.OperationalError:
+            pass
 
         # Subsystem index table
         conn.execute(
@@ -381,6 +418,12 @@ class StructureDatabase:
         error_message: Optional[str] = None,
         generation_metadata: Optional[Dict[str, Any]] = None,
         run_id: Optional[str] = None,
+        # Phonon stability fields
+        is_dynamically_stable: Optional[bool] = None,
+        num_imaginary_modes: Optional[int] = None,
+        min_phonon_frequency: Optional[float] = None,
+        max_phonon_frequency: Optional[float] = None,
+        phonon_supercell: Optional[Tuple[int, int, int]] = None,
     ) -> str:
         """
         Add a structure to the database.
@@ -399,6 +442,11 @@ class StructureDatabase:
             error_message: Error message if invalid
             generation_metadata: Additional metadata dict
             run_id: Optional run ID to link this structure to
+            is_dynamically_stable: Whether structure is dynamically stable (no imaginary phonon modes)
+            num_imaginary_modes: Number of imaginary phonon modes
+            min_phonon_frequency: Minimum phonon frequency in THz
+            max_phonon_frequency: Maximum phonon frequency in THz
+            phonon_supercell: Supercell dimensions used for phonon calculation
 
         Returns:
             Structure ID (UUID)
@@ -433,6 +481,11 @@ class StructureDatabase:
                     total_energy=total_energy,
                     cif_content=cif_content,
                     generation_metadata=generation_metadata,
+                    is_dynamically_stable=is_dynamically_stable,
+                    num_imaginary_modes=num_imaginary_modes,
+                    min_phonon_frequency=min_phonon_frequency,
+                    max_phonon_frequency=max_phonon_frequency,
+                    phonon_supercell=phonon_supercell,
                 )
                 logger.debug(f"Updated existing structure {formula} with lower energy")
             return existing["id"]
@@ -449,8 +502,10 @@ class StructureDatabase:
                 space_group_number, space_group_symbol,
                 structure_hash, cif_content,
                 is_valid, error_message, generation_metadata,
+                is_dynamically_stable, num_imaginary_modes,
+                min_phonon_frequency, max_phonon_frequency, phonon_supercell,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 structure_id,
@@ -468,6 +523,11 @@ class StructureDatabase:
                 1 if is_valid else 0,
                 error_message,
                 json.dumps(generation_metadata) if generation_metadata else None,
+                1 if is_dynamically_stable else (0 if is_dynamically_stable is False else None),
+                num_imaginary_modes,
+                min_phonon_frequency,
+                max_phonon_frequency,
+                json.dumps(phonon_supercell) if phonon_supercell else None,
                 now,
                 now,
             ),
@@ -497,6 +557,11 @@ class StructureDatabase:
         total_energy: Optional[float] = None,
         cif_content: Optional[str] = None,
         generation_metadata: Optional[Dict[str, Any]] = None,
+        is_dynamically_stable: Optional[bool] = None,
+        num_imaginary_modes: Optional[int] = None,
+        min_phonon_frequency: Optional[float] = None,
+        max_phonon_frequency: Optional[float] = None,
+        phonon_supercell: Optional[Tuple[int, int, int]] = None,
     ) -> None:
         """Update an existing structure with better data."""
         updates = []
@@ -514,6 +579,21 @@ class StructureDatabase:
         if generation_metadata is not None:
             updates.append("generation_metadata = ?")
             values.append(json.dumps(generation_metadata))
+        if is_dynamically_stable is not None:
+            updates.append("is_dynamically_stable = ?")
+            values.append(1 if is_dynamically_stable else 0)
+        if num_imaginary_modes is not None:
+            updates.append("num_imaginary_modes = ?")
+            values.append(num_imaginary_modes)
+        if min_phonon_frequency is not None:
+            updates.append("min_phonon_frequency = ?")
+            values.append(min_phonon_frequency)
+        if max_phonon_frequency is not None:
+            updates.append("max_phonon_frequency = ?")
+            values.append(max_phonon_frequency)
+        if phonon_supercell is not None:
+            updates.append("phonon_supercell = ?")
+            values.append(json.dumps(phonon_supercell))
 
         updates.append("updated_at = ?")
         values.append(datetime.now().isoformat())
@@ -614,6 +694,20 @@ class StructureDatabase:
             (row["id"],),
         ).fetchone()
 
+        # Extract phonon fields (may not exist in older databases)
+        row_keys = row.keys()
+        is_dynamically_stable = None
+        if "is_dynamically_stable" in row_keys and row["is_dynamically_stable"] is not None:
+            is_dynamically_stable = bool(row["is_dynamically_stable"])
+        
+        num_imaginary_modes = row["num_imaginary_modes"] if "num_imaginary_modes" in row_keys else None
+        min_phonon_frequency = row["min_phonon_frequency"] if "min_phonon_frequency" in row_keys else None
+        max_phonon_frequency = row["max_phonon_frequency"] if "max_phonon_frequency" in row_keys else None
+        
+        phonon_supercell = None
+        if "phonon_supercell" in row_keys and row["phonon_supercell"]:
+            phonon_supercell = row["phonon_supercell"]  # Already JSON string
+
         return StoredStructure(
             id=row["id"],
             formula=row["formula"],
@@ -638,6 +732,11 @@ class StructureDatabase:
             updated_at=row["updated_at"],
             e_above_hull=hull_row["e_above_hull"] if hull_row else None,
             is_on_hull=bool(hull_row["is_on_hull"]) if hull_row else False,
+            is_dynamically_stable=is_dynamically_stable,
+            num_imaginary_modes=num_imaginary_modes,
+            min_phonon_frequency=min_phonon_frequency,
+            max_phonon_frequency=max_phonon_frequency,
+            phonon_supercell=phonon_supercell,
         )
 
     # -------------------- Hull Computation --------------------

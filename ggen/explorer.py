@@ -150,6 +150,10 @@ class CandidateResult:
     is_valid: bool = True
     error_message: Optional[str] = None
 
+    # Dynamical stability (phonon) properties
+    is_dynamically_stable: Optional[bool] = None
+    phonon_result: Optional[Any] = None  # PhononResult from phonons module
+
     def get_structure(self) -> Optional[Structure]:
         """Get the structure, loading from CIF if not in memory."""
         if self.structure is not None:
@@ -421,6 +425,12 @@ class ChemistryExplorer:
                 generation_metadata TEXT,
                 e_above_hull REAL,
                 is_on_hull INTEGER DEFAULT 0,
+                -- Dynamical stability (phonon) fields
+                is_dynamically_stable INTEGER,
+                num_imaginary_modes INTEGER,
+                min_phonon_frequency REAL,
+                max_phonon_frequency REAL,
+                phonon_supercell TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """
@@ -460,13 +470,23 @@ class ChemistryExplorer:
         # Convert metadata to JSON-serializable types
         metadata = self._to_json_serializable(candidate.generation_metadata)
 
+        # Extract phonon stability info if available
+        phonon_stability = candidate.generation_metadata.get("phonon_stability", {})
+        is_dynamically_stable = phonon_stability.get("is_stable")
+        num_imaginary_modes = phonon_stability.get("num_imaginary_modes")
+        min_phonon_frequency = phonon_stability.get("min_frequency")
+        max_phonon_frequency = phonon_stability.get("max_frequency")
+        phonon_supercell = phonon_stability.get("supercell")
+
         cursor = conn.execute(
             """
             INSERT INTO candidates (
                 formula, stoichiometry, energy_per_atom, total_energy,
                 num_atoms, space_group_number, space_group_symbol,
-                cif_filename, is_valid, error_message, generation_metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                cif_filename, is_valid, error_message, generation_metadata,
+                is_dynamically_stable, num_imaginary_modes, 
+                min_phonon_frequency, max_phonon_frequency, phonon_supercell
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 candidate.formula,
@@ -488,6 +508,15 @@ class ChemistryExplorer:
                 1 if candidate.is_valid else 0,
                 candidate.error_message,
                 json.dumps(metadata),
+                (
+                    1
+                    if is_dynamically_stable
+                    else (0 if is_dynamically_stable is False else None)
+                ),
+                num_imaginary_modes,
+                min_phonon_frequency,
+                max_phonon_frequency,
+                json.dumps(phonon_supercell) if phonon_supercell else None,
             ),
         )
         conn.commit()
@@ -520,6 +549,11 @@ class ChemistryExplorer:
                     error_message=candidate.error_message,
                     generation_metadata=metadata,
                     run_id=self._unified_run_id,
+                    is_dynamically_stable=is_dynamically_stable,
+                    num_imaginary_modes=num_imaginary_modes,
+                    min_phonon_frequency=min_phonon_frequency,
+                    max_phonon_frequency=max_phonon_frequency,
+                    phonon_supercell=phonon_supercell,
                 )
             except Exception as e:
                 logger.warning(
@@ -549,6 +583,188 @@ class ChemistryExplorer:
             (e_above_val, is_on_hull_val, formula),
         )
         conn.commit()
+
+    def _update_phonon_stability(
+        self,
+        conn: sqlite3.Connection,
+        formula: str,
+        is_stable: bool,
+        num_imaginary_modes: int,
+        min_frequency: Optional[float],
+        max_frequency: Optional[float],
+        supercell: Optional[Tuple[int, int, int]],
+    ) -> None:
+        """Update the phonon stability info for a candidate."""
+        conn.execute(
+            """
+            UPDATE candidates
+            SET is_dynamically_stable = ?,
+                num_imaginary_modes = ?,
+                min_phonon_frequency = ?,
+                max_phonon_frequency = ?,
+                phonon_supercell = ?
+            WHERE formula = ?
+            """,
+            (
+                1 if is_stable else 0,
+                num_imaginary_modes,
+                min_frequency,
+                max_frequency,
+                json.dumps(supercell) if supercell else None,
+                formula,
+            ),
+        )
+        conn.commit()
+
+    def _calculate_phonon_stability(
+        self,
+        candidate: CandidateResult,
+        supercell: Tuple[int, int, int] = (2, 2, 2),
+        show_progress: bool = True,
+    ) -> None:
+        """Calculate phonon stability for a candidate and update its metadata.
+
+        Args:
+            candidate: CandidateResult to test.
+            supercell: Supercell dimensions for phonon calculation.
+            show_progress: Whether to show progress.
+        """
+        from .phonons import calculate_phonons
+
+        structure = candidate.get_structure()
+        if structure is None:
+            return
+
+        if show_progress:
+            C = Colors
+            print(f"    {C.DIM}Calculating phonons...{C.RESET}", end=" ", flush=True)
+
+        try:
+            phonon_result = calculate_phonons(
+                structure=structure,
+                calculator=self.calculator,
+                supercell=supercell,
+                generate_plot=False,
+            )
+
+            # Update candidate with stability info
+            candidate.is_dynamically_stable = phonon_result.is_stable
+            candidate.phonon_result = phonon_result
+            candidate.generation_metadata["phonon_stability"] = {
+                "is_stable": phonon_result.is_stable,
+                "num_imaginary_modes": phonon_result.num_imaginary_modes,
+                "min_frequency": phonon_result.min_frequency,
+                "max_frequency": phonon_result.max_frequency,
+                "min_imaginary_frequency": phonon_result.min_imaginary_frequency,
+                "supercell": supercell,
+            }
+
+            if show_progress:
+                C = Colors
+                if phonon_result.is_stable:
+                    print(f"{C.GREEN}✓ stable{C.RESET}")
+                else:
+                    print(
+                        f"{C.RED}✗ unstable{C.RESET} "
+                        f"({phonon_result.num_imaginary_modes} imag. modes)"
+                    )
+
+        except Exception as e:
+            logger.warning(f"Phonon calculation failed for {candidate.formula}: {e}")
+            candidate.generation_metadata["phonon_stability"] = {"error": str(e)}
+            if show_progress:
+                C = Colors
+                print(f"{C.YELLOW}⚠ failed{C.RESET}")
+
+    def _backfill_stability_for_hull_entries(
+        self,
+        candidates: List[CandidateResult],
+        hull_entries: List[CandidateResult],
+        conn: sqlite3.Connection,
+        phonon_supercell: Tuple[int, int, int],
+        e_above_hull_cutoff: float = 0.05,
+        show_progress: bool = True,
+    ) -> None:
+        """Backfill phonon stability for hull and near-hull entries missing stability data.
+
+        Args:
+            candidates: All candidates from exploration.
+            hull_entries: Candidates on the convex hull.
+            conn: Database connection.
+            phonon_supercell: Supercell dimensions for phonon calculation.
+            e_above_hull_cutoff: Energy above hull cutoff for near-hull entries.
+            show_progress: Whether to show progress.
+        """
+        # Identify candidates that need stability backfill
+        # Include hull entries and near-hull entries
+        candidates_to_backfill = []
+
+        for candidate in candidates:
+            if not candidate.is_valid:
+                continue
+            # Skip if already has stability data
+            if candidate.is_dynamically_stable is not None:
+                continue
+            if "phonon_stability" in candidate.generation_metadata:
+                if "error" not in candidate.generation_metadata["phonon_stability"]:
+                    continue
+
+            # Check if on hull or near hull
+            e_above_hull = candidate.generation_metadata.get("e_above_hull")
+            is_on_hull = candidate.generation_metadata.get("is_on_hull", False)
+
+            if is_on_hull or (
+                e_above_hull is not None and e_above_hull <= e_above_hull_cutoff
+            ):
+                candidates_to_backfill.append(candidate)
+
+        if not candidates_to_backfill:
+            return
+
+        if show_progress:
+            C = Colors
+            print(
+                f"\n{C.BOLD}Backfilling stability for {len(candidates_to_backfill)} "
+                f"hull/near-hull entries...{C.RESET}"
+            )
+
+        for i, candidate in enumerate(candidates_to_backfill):
+            if show_progress:
+                C = Colors
+                e_above = candidate.generation_metadata.get("e_above_hull", 0)
+                print(
+                    f"  {C.CYAN}[{i + 1}/{len(candidates_to_backfill)}]{C.RESET} "
+                    f"{C.BOLD}{candidate.formula}{C.RESET} "
+                    f"(E_hull={e_above:.3f} eV/atom)",
+                    flush=True,
+                )
+
+            # Need to reload structure if cleared
+            structure = candidate.get_structure()
+            if structure is None:
+                if show_progress:
+                    C = Colors
+                    print(f"    {C.YELLOW}⚠ Cannot load structure{C.RESET}")
+                continue
+
+            self._calculate_phonon_stability(
+                candidate,
+                supercell=phonon_supercell,
+                show_progress=show_progress,
+            )
+
+            # Update database
+            phonon_info = candidate.generation_metadata.get("phonon_stability", {})
+            if "is_stable" in phonon_info:
+                self._update_phonon_stability(
+                    conn=conn,
+                    formula=candidate.formula,
+                    is_stable=phonon_info["is_stable"],
+                    num_imaginary_modes=phonon_info.get("num_imaginary_modes", 0),
+                    min_frequency=phonon_info.get("min_frequency"),
+                    max_frequency=phonon_info.get("max_frequency"),
+                    supercell=phonon_info.get("supercell"),
+                )
 
     # -------------------- Structure Generation --------------------
 
@@ -934,6 +1150,7 @@ class ChemistryExplorer:
         show_progress: bool,
         keep_structures_in_memory: bool,
         interrupted_flag,
+        phonon_supercell: Tuple[int, int, int] = (2, 2, 2),
     ) -> Tuple[List[CandidateResult], int, int]:
         """Generate structures in parallel using ProcessPoolExecutor.
 
@@ -1021,6 +1238,13 @@ class ChemistryExplorer:
                         candidate.cif_path = cif_path
                         num_successful += 1
 
+                        # Calculate phonon stability
+                        self._calculate_phonon_stability(
+                            candidate,
+                            supercell=phonon_supercell,
+                            show_progress=False,  # Don't show individual progress in parallel mode
+                        )
+
                         # Clear structure from memory if not needed
                         if not keep_structures_in_memory:
                             candidate.clear_structure()
@@ -1078,6 +1302,7 @@ class ChemistryExplorer:
         keep_structures_in_memory: bool = False,
         relax_all_trials: bool = True,
         use_unified_database: bool = True,
+        phonon_supercell: Tuple[int, int, int] = (2, 2, 2),
     ) -> ExplorationResult:
         """Explore a chemical system by generating candidate structures.
 
@@ -1138,6 +1363,9 @@ class ChemistryExplorer:
                 example, when exploring Fe-Mn-Co, this will load existing Fe, Mn, Co,
                 Fe-Mn, Fe-Co, Mn-Co structures. This is more powerful than load_previous_runs
                 as it shares structures across different chemical systems.
+            phonon_supercell: Supercell dimensions for phonon calculations to test
+                dynamical stability. Default (2,2,2). Phonon calculations are performed
+                after each candidate is generated and relaxed.
 
         Returns:
             ExplorationResult with all candidates, phase diagram, and stable phases.
@@ -1358,6 +1586,7 @@ class ChemistryExplorer:
                     show_progress=show_progress,
                     keep_structures_in_memory=keep_structures_in_memory,
                     interrupted_flag=lambda: interrupted,
+                    phonon_supercell=phonon_supercell,
                 )
             else:
                 # Sequential generation - show relaxation progress for each structure
@@ -1406,6 +1635,13 @@ class ChemistryExplorer:
                         cif_path = self._save_structure_cif(candidate, structures_dir)
                         candidate.cif_path = cif_path
                         num_successful += 1
+
+                        # Calculate phonon stability
+                        self._calculate_phonon_stability(
+                            candidate,
+                            supercell=phonon_supercell,
+                            show_progress=show_progress,
+                        )
 
                         # Clear structure from memory if not needed
                         if not keep_structures_in_memory:
@@ -1593,6 +1829,17 @@ class ChemistryExplorer:
                 logger.warning(
                     "Cannot build phase diagram: no valid compound candidates"
                 )
+
+        # Backfill: Check hull/near-hull entries for missing stability data
+        if not interrupted and hull_entries:
+            self._backfill_stability_for_hull_entries(
+                candidates=candidates,
+                hull_entries=hull_entries,
+                conn=conn,
+                phonon_supercell=phonon_supercell,
+                e_above_hull_cutoff=0.05,  # Also check near-hull entries
+                show_progress=show_progress,
+            )
 
         # Finalize
         total_time = time.time() - start_time
@@ -2031,3 +2278,289 @@ class ChemistryExplorer:
             database_path=db_path,
             total_time_seconds=float(metadata.get("total_time_seconds", 0)),
         )
+
+    # -------------------- Dynamical Stability Testing --------------------
+
+    def test_dynamical_stability(
+        self,
+        result: ExplorationResult,
+        candidates_to_test: Optional[List[CandidateResult]] = None,
+        supercell: Tuple[int, int, int] = (2, 2, 2),
+        test_hull_only: bool = True,
+        max_candidates: Optional[int] = None,
+        show_progress: bool = True,
+    ) -> Dict[str, Any]:
+        """Test candidates for dynamical stability using phonon calculations.
+
+        This method computes phonon dispersion for selected candidates and
+        checks for imaginary modes that indicate dynamical instability.
+
+        Args:
+            result: ExplorationResult from explore().
+            candidates_to_test: Specific candidates to test. If None, uses
+                hull entries (if test_hull_only=True) or all valid candidates.
+            supercell: Supercell dimensions for phonon calculation.
+                Larger = more accurate but slower. (2,2,2) is usually sufficient.
+            test_hull_only: If True and candidates_to_test is None, only test
+                candidates on the convex hull.
+            max_candidates: Maximum number of candidates to test.
+            show_progress: Whether to show progress information.
+
+        Returns:
+            Dictionary with:
+            - 'tested': List of tested candidates with stability info
+            - 'stable': List of dynamically stable candidates
+            - 'unstable': List of dynamically unstable candidates
+            - 'failed': List of candidates where phonon calc failed
+            - 'summary': Summary statistics
+
+        Raises:
+            ImportError: If phonopy is not installed.
+        """
+        from .phonons import calculate_phonons, PhononResult
+
+        # Select candidates to test
+        if candidates_to_test is not None:
+            to_test = candidates_to_test
+        elif test_hull_only and result.hull_entries:
+            to_test = result.hull_entries
+        else:
+            to_test = [c for c in result.candidates if c.is_valid]
+
+        # Apply max limit
+        if max_candidates is not None:
+            to_test = to_test[:max_candidates]
+
+        if not to_test:
+            logger.warning("No candidates to test for dynamical stability")
+            return {
+                "tested": [],
+                "stable": [],
+                "unstable": [],
+                "failed": [],
+                "summary": {"num_tested": 0},
+            }
+
+        stable = []
+        unstable = []
+        failed = []
+
+        if show_progress:
+            C = Colors
+            print(
+                f"\n{C.BOLD}Testing {len(to_test)} candidates for dynamical stability...{C.RESET}"
+            )
+
+        for i, candidate in enumerate(to_test):
+            structure = candidate.get_structure()
+            if structure is None:
+                logger.warning(f"Cannot load structure for {candidate.formula}")
+                failed.append(candidate)
+                continue
+
+            if show_progress:
+                C = Colors
+                print(
+                    f"  {C.CYAN}[{i + 1}/{len(to_test)}]{C.RESET} "
+                    f"{C.BOLD}{candidate.formula}{C.RESET} "
+                    f"(E={candidate.energy_per_atom:.4f} eV/atom, SG={candidate.space_group_symbol})",
+                    flush=True,
+                )
+
+            try:
+                phonon_result = calculate_phonons(
+                    structure=structure,
+                    calculator=self.calculator,
+                    supercell=supercell,
+                    generate_plot=False,
+                )
+
+                # Update candidate with stability info
+                candidate.is_dynamically_stable = phonon_result.is_stable
+                candidate.phonon_result = phonon_result
+                candidate.generation_metadata["phonon_stability"] = {
+                    "is_stable": phonon_result.is_stable,
+                    "num_imaginary_modes": phonon_result.num_imaginary_modes,
+                    "min_frequency": phonon_result.min_frequency,
+                    "max_frequency": phonon_result.max_frequency,
+                    "min_imaginary_frequency": phonon_result.min_imaginary_frequency,
+                    "supercell": supercell,
+                }
+
+                if phonon_result.is_stable:
+                    stable.append(candidate)
+                    if show_progress:
+                        print(f"    {C.GREEN}✓ Dynamically stable{C.RESET}")
+                else:
+                    unstable.append(candidate)
+                    if show_progress:
+                        print(
+                            f"    {C.RED}✗ Unstable{C.RESET} "
+                            f"({phonon_result.num_imaginary_modes} imaginary modes, "
+                            f"min freq: {phonon_result.min_imaginary_frequency:.3f} THz)"
+                        )
+
+            except Exception as e:
+                logger.warning(
+                    f"Phonon calculation failed for {candidate.formula}: {e}"
+                )
+                candidate.is_dynamically_stable = None
+                candidate.generation_metadata["phonon_stability"] = {"error": str(e)}
+                failed.append(candidate)
+                if show_progress:
+                    print(f"    {C.YELLOW}⚠ Calculation failed: {e}{C.RESET}")
+
+        summary = {
+            "num_tested": len(to_test),
+            "num_stable": len(stable),
+            "num_unstable": len(unstable),
+            "num_failed": len(failed),
+            "supercell": supercell,
+        }
+
+        if show_progress:
+            C = Colors
+            print(f"\n{C.BOLD}Stability Summary:{C.RESET}")
+            print(f"  Stable:   {C.GREEN}{len(stable)}{C.RESET}")
+            print(f"  Unstable: {C.RED}{len(unstable)}{C.RESET}")
+            if failed:
+                print(f"  Failed:   {C.YELLOW}{len(failed)}{C.RESET}")
+
+        return {
+            "tested": to_test,
+            "stable": stable,
+            "unstable": unstable,
+            "failed": failed,
+            "summary": summary,
+        }
+
+    def find_stable_hull_candidates(
+        self,
+        result: ExplorationResult,
+        supercell: Tuple[int, int, int] = (2, 2, 2),
+        max_alternatives: int = 3,
+        show_progress: bool = True,
+    ) -> Dict[str, CandidateResult]:
+        """Find dynamically stable candidates for each composition on the hull.
+
+        For each composition on the convex hull, tests the best candidate for
+        stability. If unstable, tests alternatives (next-best by energy) until
+        a stable candidate is found or max_alternatives is reached.
+
+        Args:
+            result: ExplorationResult from explore().
+            supercell: Supercell dimensions for phonon calculation.
+            max_alternatives: Maximum alternative candidates to test per composition
+                if the best is unstable.
+            show_progress: Whether to show progress information.
+
+        Returns:
+            Dictionary mapping formula -> best stable CandidateResult for that formula.
+            Only includes formulas where a stable candidate was found.
+        """
+        from .phonons import calculate_phonons
+
+        if not result.hull_entries:
+            logger.warning("No hull entries to test")
+            return {}
+
+        # Group all candidates by formula
+        candidates_by_formula: Dict[str, List[CandidateResult]] = {}
+        for candidate in result.candidates:
+            if candidate.is_valid and candidate.get_structure() is not None:
+                formula = candidate.formula
+                if formula not in candidates_by_formula:
+                    candidates_by_formula[formula] = []
+                candidates_by_formula[formula].append(candidate)
+
+        # Sort each formula's candidates by energy
+        for formula in candidates_by_formula:
+            candidates_by_formula[formula].sort(key=lambda c: c.energy_per_atom)
+
+        # Get unique formulas on the hull
+        hull_formulas = set(c.formula for c in result.hull_entries)
+
+        stable_candidates: Dict[str, CandidateResult] = {}
+
+        if show_progress:
+            C = Colors
+            print(
+                f"\n{C.BOLD}Finding stable candidates for {len(hull_formulas)} hull compositions...{C.RESET}\n"
+            )
+
+        for formula in hull_formulas:
+            candidates = candidates_by_formula.get(formula, [])
+            if not candidates:
+                continue
+
+            num_to_test = min(len(candidates), max_alternatives + 1)
+
+            if show_progress:
+                C = Colors
+                print(f"{C.BOLD}{formula}{C.RESET} ({num_to_test} candidates to test)")
+
+            for i, candidate in enumerate(candidates[:num_to_test]):
+                structure = candidate.get_structure()
+                if structure is None:
+                    continue
+
+                if show_progress:
+                    rank_label = "best" if i == 0 else f"#{i + 1}"
+                    print(
+                        f"  Testing {rank_label}: E={candidate.energy_per_atom:.4f} eV/atom, "
+                        f"SG={candidate.space_group_symbol}",
+                        end=" ",
+                        flush=True,
+                    )
+
+                try:
+                    phonon_result = calculate_phonons(
+                        structure=structure,
+                        calculator=self.calculator,
+                        supercell=supercell,
+                        generate_plot=False,
+                    )
+
+                    candidate.is_dynamically_stable = phonon_result.is_stable
+                    candidate.phonon_result = phonon_result
+                    candidate.generation_metadata["phonon_stability"] = {
+                        "is_stable": phonon_result.is_stable,
+                        "num_imaginary_modes": phonon_result.num_imaginary_modes,
+                        "min_frequency": phonon_result.min_frequency,
+                        "min_imaginary_frequency": phonon_result.min_imaginary_frequency,
+                    }
+
+                    if phonon_result.is_stable:
+                        stable_candidates[formula] = candidate
+                        if show_progress:
+                            C = Colors
+                            print(f"{C.GREEN}✓ STABLE{C.RESET}")
+                        break  # Found stable candidate for this formula
+                    else:
+                        if show_progress:
+                            C = Colors
+                            print(
+                                f"{C.RED}✗ unstable{C.RESET} "
+                                f"({phonon_result.num_imaginary_modes} imag. modes)"
+                            )
+
+                except Exception as e:
+                    if show_progress:
+                        C = Colors
+                        print(f"{C.YELLOW}⚠ failed{C.RESET}")
+                    logger.warning(f"Phonon calculation failed: {e}")
+
+            if formula not in stable_candidates and show_progress:
+                C = Colors
+                print(f"  {C.YELLOW}No stable candidate found for {formula}{C.RESET}")
+
+            if show_progress:
+                print()  # Blank line between formulas
+
+        if show_progress:
+            C = Colors
+            print(
+                f"{C.BOLD}Found {len(stable_candidates)}/{len(hull_formulas)} stable hull compositions{C.RESET}"
+            )
+
+        return stable_candidates
