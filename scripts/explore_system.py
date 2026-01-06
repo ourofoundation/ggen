@@ -54,8 +54,8 @@ def main():
         "--crystal-systems",
         type=str,
         nargs="+",
-        default=["hexagonal", "tetragonal"],
-        help="Crystal systems to explore (default: hexagonal tetragonal)",
+        default=None,
+        help="Crystal systems to explore (default: all)",
     )
     parser.add_argument(
         "--output-dir",
