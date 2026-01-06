@@ -1145,7 +1145,7 @@ class GGen:
             # Extract results
             results = []
             final_atoms_list = final_state.to_atoms()
-            energies = final_state.energy.cpu().numpy()
+            energies = final_state.energy.detach().cpu().numpy()
 
             for i, atoms in enumerate(final_atoms_list):
                 structure = _atoms_to_structure_wrapped(atoms)
