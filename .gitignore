@@ -3,6 +3,9 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# GGen unified database
+ggen.db
+
 # C extensions
 *.so
 
@@ -213,6 +216,9 @@ __marimo__/
 *.cif
 *.json
 *.db
+*.db-shm
+*.db-wal
 .DS_Store
 
 exploration_runs/*
+runs/*

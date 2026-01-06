@@ -31,6 +31,7 @@ from pyxtal.symmetry import Group
 from scipy.spatial.distance import cosine
 
 from .calculator import get_orb_calculator
+from .colors import Colors
 from .operations import Operations
 from .utils import parse_chemical_formula
 
@@ -1124,7 +1125,7 @@ class GGen:
         )
 
         # Run batched optimization
-        logger.info(
+        logger.debug(
             "Starting batched relaxation of %d candidates using torch-sim (device=%s)",
             len(atoms_list),
             device,
@@ -1154,7 +1155,7 @@ class GGen:
                 steps = max_steps  # Conservative estimate
                 results.append((structure, energy, steps))
 
-            logger.info(
+            logger.debug(
                 "Batched relaxation complete. Energies: min=%.4f, max=%.4f eV",
                 min(energies),
                 max(energies),
@@ -1362,7 +1363,7 @@ class GGen:
         num_trials = int(min(num_trials, 100))
 
         elements, counts = parse_chemical_formula(formula)
-        logger.info(
+        logger.debug(
             "Starting crystal generation for %s (elements=%s, counts=%s)",
             formula,
             elements,
@@ -1375,7 +1376,7 @@ class GGen:
             raise ValueError(
                 f"No compatible space groups found for composition {formula}"
             )
-        logger.info("Found %d compatible space groups", len(compatible))
+        logger.debug("Found %d compatible space groups", len(compatible))
 
         # Filter by crystal system if specified
         if crystal_systems is not None:
@@ -1441,7 +1442,7 @@ class GGen:
                 compatible, top_k=top_k_spacegroups, symmetry_bias=symmetry_bias
             )
             was_randomly_selected = True
-            logger.info(
+            logger.debug(
                 "Multi-spacegroup mode (symmetry_bias=%.2f): trying %d space groups: %s",
                 symmetry_bias,
                 len(target_space_groups),
@@ -1471,107 +1472,119 @@ class GGen:
         }
 
         trials_per_sg = max(1, num_trials // len(target_space_groups))
+        total_trials = trials_per_sg * len(target_space_groups)
 
-        for sg_number in target_space_groups:
-            sg_stats = {"attempts": 0, "valid": 0, "passed_filter": 0}
-            logger.info(
-                "Generating %d trials in space group %d (%s)",
-                trials_per_sg,
-                sg_number,
-                self._get_crystal_system_name(sg_number),
+        # Build trial list: [(sg_number, trial_idx), ...]
+        trial_tasks = [
+            (sg_number, trial_idx)
+            for sg_number in target_space_groups
+            for trial_idx in range(trials_per_sg)
+        ]
+
+        # Create tqdm iterator for trials
+        C = Colors
+        trial_iter = trial_tasks
+        if show_progress:
+            sg_str = ", ".join(str(sg) for sg in target_space_groups[:3])
+            if len(target_space_groups) > 3:
+                sg_str += f", +{len(target_space_groups) - 3} more"
+            trial_iter = tqdm(
+                trial_tasks,
+                desc=f"{C.DIM}Trials (SG {sg_str}){C.RESET}",
+                unit="trial",
+                leave=False,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
             )
 
-            for trial_idx in range(trials_per_sg):
-                generation_stats["total_attempts"] += 1
-                sg_stats["attempts"] += 1
+        for sg_number, trial_idx in trial_iter:
+            # Initialize sg_stats on first trial for this SG
+            if sg_number not in generation_stats["by_spacegroup"]:
+                generation_stats["by_spacegroup"][sg_number] = {
+                    "attempts": 0,
+                    "valid": 0,
+                    "passed_filter": 0,
+                }
+            sg_stats = generation_stats["by_spacegroup"][sg_number]
 
-                # Generate random crystal
-                c = pyxtal()
-                try:
-                    c.from_random(
-                        dim=3,
-                        group=sg_number,
-                        species=elements,
-                        numIons=counts,
-                        seed=self.random_seed,
-                    )
-                except TypeError:
-                    # Older pyxtal versions may not accept seed
-                    c.from_random(
-                        dim=3, group=sg_number, species=elements, numIons=counts
-                    )
+            generation_stats["total_attempts"] += 1
+            sg_stats["attempts"] += 1
 
-                if not c.valid:
-                    logger.debug(
-                        "SG %d trial %d: PyXtal generation failed (invalid)",
-                        sg_number,
-                        trial_idx + 1,
-                    )
-                    continue
+            # Generate random crystal
+            c = pyxtal()
+            try:
+                c.from_random(
+                    dim=3,
+                    group=sg_number,
+                    species=elements,
+                    numIons=counts,
+                    seed=self.random_seed,
+                )
+            except TypeError:
+                # Older pyxtal versions may not accept seed
+                c.from_random(dim=3, group=sg_number, species=elements, numIons=counts)
 
-                generation_stats["valid_pyxtal"] += 1
-                sg_stats["valid"] += 1
+            if not c.valid:
+                logger.debug(
+                    "SG %d trial %d: PyXtal generation failed (invalid)",
+                    sg_number,
+                    trial_idx + 1,
+                )
+                continue
 
-                # Pre-filter: check structural validity before energy evaluation
-                structure = c.to_pymatgen()
-                is_valid, reason = self._is_structurally_valid(
-                    structure,
-                    min_distance=min_distance_filter,
-                    min_volume_per_atom=volume_bounds[0],
-                    max_volume_per_atom=volume_bounds[1],
+            generation_stats["valid_pyxtal"] += 1
+            sg_stats["valid"] += 1
+
+            # Pre-filter: check structural validity before energy evaluation
+            structure = c.to_pymatgen()
+            is_valid, reason = self._is_structurally_valid(
+                structure,
+                min_distance=min_distance_filter,
+                min_volume_per_atom=volume_bounds[0],
+                max_volume_per_atom=volume_bounds[1],
+            )
+
+            if not is_valid:
+                logger.debug(
+                    "SG %d trial %d: Pre-filter rejected (%s)",
+                    sg_number,
+                    trial_idx + 1,
+                    reason,
+                )
+                continue
+
+            generation_stats["passed_prefilter"] += 1
+            sg_stats["passed_filter"] += 1
+
+            # Energy evaluation
+            try:
+                atoms = c.to_ase()
+                atoms.calc = self.calculator
+                energy = float(atoms.get_potential_energy())
+                generation_stats["energy_evaluated"] += 1
+
+                # Combined scoring
+                score, breakdown = self._score_crystal(
+                    c, energy, symmetry_weight=symmetry_weight
                 )
 
-                if not is_valid:
-                    logger.debug(
-                        "SG %d trial %d: Pre-filter rejected (%s)",
-                        sg_number,
-                        trial_idx + 1,
-                        reason,
-                    )
-                    continue
+                all_candidates.append((c, score, breakdown, sg_number))
+                logger.debug(
+                    "SG %d trial %d: energy=%.4f eV, score=%.4f (SG bonus=%.4f)",
+                    sg_number,
+                    trial_idx + 1,
+                    energy,
+                    score,
+                    breakdown["symmetry_bonus"],
+                )
 
-                generation_stats["passed_prefilter"] += 1
-                sg_stats["passed_filter"] += 1
-
-                # Energy evaluation
-                try:
-                    atoms = c.to_ase()
-                    atoms.calc = self.calculator
-                    energy = float(atoms.get_potential_energy())
-                    generation_stats["energy_evaluated"] += 1
-
-                    # Combined scoring
-                    score, breakdown = self._score_crystal(
-                        c, energy, symmetry_weight=symmetry_weight
-                    )
-
-                    all_candidates.append((c, score, breakdown, sg_number))
-                    logger.debug(
-                        "SG %d trial %d: energy=%.4f eV, score=%.4f (SG bonus=%.4f)",
-                        sg_number,
-                        trial_idx + 1,
-                        energy,
-                        score,
-                        breakdown["symmetry_bonus"],
-                    )
-
-                except Exception as e:
-                    logger.warning(
-                        "SG %d trial %d: Energy evaluation failed: %s",
-                        sg_number,
-                        trial_idx + 1,
-                        e,
-                    )
-                    continue
-
-            generation_stats["by_spacegroup"][sg_number] = sg_stats
-            logger.info(
-                "SG %d complete: %d/%d valid, %d passed pre-filter",
-                sg_number,
-                sg_stats["valid"],
-                sg_stats["attempts"],
-                sg_stats["passed_filter"],
-            )
+            except Exception as e:
+                logger.warning(
+                    "SG %d trial %d: Energy evaluation failed: %s",
+                    sg_number,
+                    trial_idx + 1,
+                    e,
+                )
+                continue
 
         # Select best candidate
         if not all_candidates:
@@ -1581,21 +1594,30 @@ class GGen:
                 f"Compatible space groups: {[x['number'] for x in compatible]}"
             )
 
-        logger.info(
-            "Generation stats: %d attempts → %d valid → %d passed filter → %d evaluated",
-            generation_stats["total_attempts"],
-            generation_stats["valid_pyxtal"],
-            generation_stats["passed_prefilter"],
-            generation_stats["energy_evaluated"],
-        )
+        # Summary log with colors (only if show_progress enabled for cleaner output)
+        if show_progress:
+            stats = generation_stats
+            sg_summary = ", ".join(
+                f"SG{sg}:{d['passed_filter']}/{d['attempts']}"
+                for sg, d in stats["by_spacegroup"].items()
+            )
+            print(
+                f"  {C.DIM}Generated:{C.RESET} {C.WHITE}{stats['energy_evaluated']}{C.RESET} candidates "
+                f"from {C.WHITE}{stats['total_attempts']}{C.RESET} trials "
+                f"{C.DIM}({sg_summary}){C.RESET}",
+                flush=True,
+            )
+        else:
+            logger.info(
+                "Generation: %d attempts → %d valid → %d passed filter → %d evaluated",
+                generation_stats["total_attempts"],
+                generation_stats["valid_pyxtal"],
+                generation_stats["passed_prefilter"],
+                generation_stats["energy_evaluated"],
+            )
 
         # New approach: relax ALL candidates and pick the best by final energy
         if relax_all_trials and optimize_geometry:
-            logger.info(
-                "Relaxing all %d candidates in parallel (relax_all_trials=True)...",
-                len(all_candidates),
-            )
-
             # Extract just the pyxtal objects
             candidate_crystals = [c[0] for c in all_candidates]
             candidate_sgs = [c[3] for c in all_candidates]
@@ -1638,7 +1660,7 @@ class GGen:
                 range(len(initial_energies)), key=lambda i: initial_energies[i]
             )
 
-            logger.info(
+            logger.debug(
                 "Selected best by FINAL energy: SG %d, energy=%.4f eV (was rank %d by initial energy)",
                 best_sg,
                 final_energy,
@@ -1649,7 +1671,7 @@ class GGen:
             )
 
             if initial_best_idx != best_idx:
-                logger.info(
+                logger.debug(
                     "Initial energy heuristic would have picked SG %d (final energy=%.4f eV, rank %d)",
                     candidate_sgs[initial_best_idx],
                     final_energies[initial_best_idx],
@@ -1792,13 +1814,23 @@ class GGen:
         cif_text = str(CifWriter(structure, symprec=SYMPREC))
         cif64 = base64.b64encode(cif_text.encode("utf-8")).decode("utf-8")
 
-        logger.info(
-            "Crystal generation complete: %s, SG=%s (#%d), energy=%.4f eV",
-            formula,
-            final_sg_sym,
-            final_sg_num,
-            final_energy,
-        )
+        # Final summary
+        if show_progress:
+            C = Colors
+            print(
+                f"  {C.DIM}Result:{C.RESET} {C.GREEN}{formula}{C.RESET} "
+                f"SG={C.CYAN}{final_sg_sym}{C.RESET} ({final_sg_num}) "
+                f"E={C.WHITE}{final_energy:.4f}{C.RESET} eV",
+                flush=True,
+            )
+        else:
+            logger.info(
+                "Crystal generation complete: %s, SG=%s (#%d), energy=%.4f eV",
+                formula,
+                final_sg_sym,
+                final_sg_num,
+                final_energy,
+            )
 
         resp: Dict[str, Any] = {
             "formula": formula,

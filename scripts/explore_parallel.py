@@ -2,6 +2,10 @@
 """
 Run multiple chemical system explorations in parallel.
 
+All explorations share a unified database, so structures from one system
+(e.g., Fe-Mn from Fe-Mn-Co) are automatically reused in related systems
+(e.g., Fe-Mn-Sn).
+
 Usage:
     python explore_parallel.py Fe-Mn-Si Li-Co-O Fe-Sn-B
     python explore_parallel.py Fe-Mn-Si Li-Co-O --workers 2 --max-atoms 20
@@ -69,8 +73,14 @@ def main():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="./exploration_runs",
-        help="Output directory for results (default: ./exploration_runs)",
+        default="./runs",
+        help="Output directory for CIF files and plots (default: ./runs)",
+    )
+    parser.add_argument(
+        "--db-path",
+        type=str,
+        default="./ggen.db",
+        help="Path to unified structure database (default: ./ggen.db)",
     )
     parser.add_argument(
         "--inner-workers",
@@ -99,6 +109,8 @@ def main():
         str(args.max_stoichiometries),
         "--output-dir",
         args.output_dir,
+        "--db-path",
+        args.db_path,
         "--workers",
         str(args.inner_workers),
     ]
@@ -111,6 +123,7 @@ def main():
 
     print(f"Running {len(args.systems)} explorations with {num_workers} workers")
     print(f"Systems: {', '.join(args.systems)}")
+    print(f"Unified database: {args.db_path}")
     print("=" * 60)
 
     results = []
@@ -148,6 +161,7 @@ def main():
     if failed > 0:
         print(f"Failed: {', '.join(s for s, ok in results if not ok)}")
     print(f"Results in: {args.output_dir}")
+    print(f"Unified database: {args.db_path}")
 
 
 if __name__ == "__main__":

@@ -7,6 +7,8 @@ modifying, and analyzing crystal structures with built-in energy evaluation usin
 """
 
 from .calculator import get_orb_calculator
+from .colors import Colors
+from .database import ExplorationRun, StoredStructure, StructureDatabase
 from .explorer import CandidateResult, ChemistryExplorer, ExplorationResult
 from .ggen import GGen
 from .operations import MutationError, Operations
@@ -21,8 +23,12 @@ __all__ = [
     "ChemistryExplorer",
     "CandidateResult",
     "ExplorationResult",
+    "StructureDatabase",
+    "StoredStructure",
+    "ExplorationRun",
     "Operations",
     "MutationError",
+    "Colors",
     "get_orb_calculator",
     "parse_chemical_formula",
 ]

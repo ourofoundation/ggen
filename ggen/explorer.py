@@ -10,6 +10,7 @@ import json
 import logging
 import signal
 import sqlite3
+import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -24,7 +25,14 @@ from pymatgen.core import Composition, Element, Structure
 from pymatgen.entries.computed_entries import ComputedEntry
 from pymatgen.io.cif import CifWriter
 
+from .colors import Colors
 from .ggen import GGen
+
+# Import for type hints only to avoid circular imports
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .database import StructureDatabase
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +209,7 @@ class ChemistryExplorer:
         calculator=None,
         random_seed: Optional[int] = None,
         output_dir: Optional[Union[str, Path]] = None,
+        database: Optional["StructureDatabase"] = None,
     ):
         """Initialize the chemistry explorer.
 
@@ -208,12 +217,19 @@ class ChemistryExplorer:
             calculator: ASE calculator instance. If None, uses ORB calculator.
             random_seed: Optional random seed for reproducibility.
             output_dir: Base directory for storing results. If None, uses current directory.
+            database: Optional unified StructureDatabase for cross-run structure sharing
+                and global hull tracking. If provided, structures are automatically saved
+                to both the per-run database and the unified database.
         """
         self._calculator = calculator  # Store provided calculator (may be None)
         self._calculator_initialized = calculator is not None
         self.random_seed = random_seed
         self.rng = np.random.default_rng(random_seed)
         self.output_dir = Path(output_dir) if output_dir else Path.cwd()
+
+        # Unified database for cross-run sharing
+        self.database = database
+        self._unified_run_id: Optional[str] = None
 
         # Will be set during exploration
         self._run_dir: Optional[Path] = None
@@ -440,7 +456,7 @@ class ChemistryExplorer:
     def _save_candidate(
         self, conn: sqlite3.Connection, candidate: CandidateResult
     ) -> int:
-        """Save a candidate to the database."""
+        """Save a candidate to the per-run database and optionally to unified database."""
         # Convert metadata to JSON-serializable types
         metadata = self._to_json_serializable(candidate.generation_metadata)
 
@@ -475,6 +491,41 @@ class ChemistryExplorer:
             ),
         )
         conn.commit()
+
+        # Also save to unified database if available
+        if self.database is not None and candidate.is_valid:
+            try:
+                # Get CIF content
+                cif_content = None
+                structure = candidate.get_structure()
+                if structure is not None:
+                    try:
+                        cif_content = structure.to(fmt="cif")
+                    except Exception:
+                        pass
+                elif candidate.cif_path and candidate.cif_path.exists():
+                    cif_content = candidate.cif_path.read_text()
+
+                self.database.add_structure(
+                    formula=candidate.formula,
+                    stoichiometry=candidate.stoichiometry,
+                    energy_per_atom=float(candidate.energy_per_atom),
+                    total_energy=float(candidate.total_energy),
+                    num_atoms=int(candidate.num_atoms),
+                    space_group_number=int(candidate.space_group_number),
+                    space_group_symbol=candidate.space_group_symbol,
+                    cif_content=cif_content,
+                    structure=structure,
+                    is_valid=candidate.is_valid,
+                    error_message=candidate.error_message,
+                    generation_metadata=metadata,
+                    run_id=self._unified_run_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to save {candidate.formula} to unified database: {e}"
+                )
+
         return cursor.lastrowid
 
     def _update_hull_status(
@@ -538,7 +589,7 @@ class ChemistryExplorer:
             for el, count in sorted(stoichiometry.items())
         )
 
-        logger.info(f"Generating structure for {formula}")
+        logger.debug(f"Generating structure for {formula}")
 
         try:
             # Create a fresh GGen instance for each generation
@@ -772,7 +823,9 @@ class ChemistryExplorer:
         # A candidate is valid for phase diagram if it has valid energy data
         # (structure may be cleared from memory but data is preserved)
         valid_candidates = [
-            c for c in candidates if c.is_valid and (c.structure is not None or c.cif_path is not None)
+            c
+            for c in candidates
+            if c.is_valid and (c.structure is not None or c.cif_path is not None)
         ]
 
         if not valid_candidates:
@@ -804,7 +857,9 @@ class ChemistryExplorer:
 
         # Add terminal element entries (required for formation energy calculation)
         for terminal in terminal_candidates:
-            if terminal.is_valid and (terminal.structure is not None or terminal.cif_path is not None):
+            if terminal.is_valid and (
+                terminal.structure is not None or terminal.cif_path is not None
+            ):
                 sg_label = terminal.space_group_symbol.replace("/", "-")
                 entry_id = f"{terminal.formula} ({sg_label})"
 
@@ -887,21 +942,26 @@ class ChemistryExplorer:
         # Prepare worker arguments
         worker_args = []
         for stoich, formula in stoichs_to_generate:
-            worker_args.append({
-                "stoichiometry": stoich,
-                "num_trials": num_trials,
-                "optimize": optimize,
-                "symmetry_bias": symmetry_bias,
-                "crystal_systems": crystal_systems,
-                "preserve_symmetry": preserve_symmetry,
-                "random_seed": self.random_seed,
-            })
+            worker_args.append(
+                {
+                    "stoichiometry": stoich,
+                    "num_trials": num_trials,
+                    "optimize": optimize,
+                    "symmetry_bias": symmetry_bias,
+                    "crystal_systems": crystal_systems,
+                    "preserve_symmetry": preserve_symmetry,
+                    "random_seed": self.random_seed,
+                }
+            )
 
         # Use ProcessPoolExecutor for parallel generation
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
             # Submit all tasks
             future_to_args = {
-                executor.submit(_generate_structure_worker, args): (args, stoichs_to_generate[i][1])
+                executor.submit(_generate_structure_worker, args): (
+                    args,
+                    stoichs_to_generate[i][1],
+                )
                 for i, args in enumerate(worker_args)
             }
 
@@ -946,7 +1006,8 @@ class ChemistryExplorer:
                         prev_candidate = previous_structures[formula]
                         if not candidate.is_valid or (
                             prev_candidate.is_valid
-                            and prev_candidate.energy_per_atom < candidate.energy_per_atom
+                            and prev_candidate.energy_per_atom
+                            < candidate.energy_per_atom
                         ):
                             logger.debug(
                                 f"Using better structure from previous run for {formula}"
@@ -1016,6 +1077,7 @@ class ChemistryExplorer:
         show_progress: bool = True,
         keep_structures_in_memory: bool = False,
         relax_all_trials: bool = True,
+        use_unified_database: bool = True,
     ) -> ExplorationResult:
         """Explore a chemical system by generating candidate structures.
 
@@ -1071,11 +1133,25 @@ class ChemistryExplorer:
                 stoichiometry and select the one with lowest final energy. Uses torch-sim
                 for GPU-batched parallel relaxation. This produces better results than
                 the legacy approach of selecting by initial (unrelaxed) energy.
+            use_unified_database: If True (default) and a unified StructureDatabase is
+                configured, load existing structures from all relevant subsystems. For
+                example, when exploring Fe-Mn-Co, this will load existing Fe, Mn, Co,
+                Fe-Mn, Fe-Co, Mn-Co structures. This is more powerful than load_previous_runs
+                as it shares structures across different chemical systems.
 
         Returns:
             ExplorationResult with all candidates, phase diagram, and stable phases.
         """
         import time
+
+        # Suppress pymatgen CIF parsing warnings
+        warnings.filterwarnings(
+            "ignore", category=UserWarning, module="pymatgen.core.structure"
+        )
+        # Suppress orb_models torch dtype warnings
+        warnings.filterwarnings(
+            "ignore", category=UserWarning, module="orb_models.utils"
+        )
 
         start_time = time.time()
 
@@ -1130,17 +1206,63 @@ class ChemistryExplorer:
         )
         conn.commit()
 
-        # Load structures from previous runs if requested
+        # Create run in unified database if available
+        if self.database is not None:
+            self._unified_run_id = self.database.create_run(
+                chemical_system=chemsys,
+                parameters={
+                    "max_atoms": max_atoms,
+                    "min_atoms": min_atoms,
+                    "num_trials": num_trials,
+                    "optimize": optimize,
+                    "include_binaries": include_binaries,
+                    "include_ternaries": include_ternaries,
+                    "require_all_elements": require_all_elements,
+                    "symmetry_bias": symmetry_bias,
+                    "crystal_systems": crystal_systems,
+                    "preserve_symmetry": preserve_symmetry,
+                    "num_workers": num_workers,
+                },
+            )
+            logger.info(f"Created unified database run: {self._unified_run_id[:8]}...")
+
+        # Load structures from unified database if available
         previous_structures: Dict[str, CandidateResult] = {}
+        if use_unified_database and self.database is not None:
+            unified_structures = self._load_from_unified_database(chemsys)
+            if unified_structures:
+                previous_structures.update(unified_structures)
+                logger.info(
+                    f"Loaded {len(unified_structures)} structures from unified database"
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO run_metadata VALUES (?, ?)",
+                    (
+                        "loaded_from_unified_db",
+                        json.dumps(list(unified_structures.keys())),
+                    ),
+                )
+                conn.commit()
+
+        # Load structures from previous runs if requested (legacy mode)
         if load_previous_runs:
             max_runs = None if load_previous_runs is True else int(load_previous_runs)
-            previous_structures = self.load_structures_from_previous_runs(
+            run_structures = self.load_structures_from_previous_runs(
                 chemical_system=chemsys,
                 max_runs=max_runs,
             )
+            # Merge, keeping lower energy structures
+            for formula, candidate in run_structures.items():
+                if formula not in previous_structures:
+                    previous_structures[formula] = candidate
+                elif (
+                    candidate.energy_per_atom
+                    < previous_structures[formula].energy_per_atom
+                ):
+                    previous_structures[formula] = candidate
             conn.execute(
                 "INSERT OR REPLACE INTO run_metadata VALUES (?, ?)",
-                ("loaded_from_previous", json.dumps(list(previous_structures.keys()))),
+                ("loaded_from_previous", json.dumps(list(run_structures.keys()))),
             )
             conn.commit()
 
@@ -1241,8 +1363,11 @@ class ChemistryExplorer:
                         break
 
                     if show_progress:
+                        C = Colors
                         print(
-                            f"[{i + 1}/{len(stoichs_to_generate)}] Generating {formula}..."
+                            f"{C.CYAN}[{i + 1}/{len(stoichs_to_generate)}]{C.RESET} "
+                            f"{C.BOLD}{formula}{C.RESET}",
+                            flush=True,
                         )
 
                     candidate = self._generate_structure_for_stoichiometry(
@@ -1261,7 +1386,8 @@ class ChemistryExplorer:
                         prev_candidate = previous_structures[formula]
                         if not candidate.is_valid or (
                             prev_candidate.is_valid
-                            and prev_candidate.energy_per_atom < candidate.energy_per_atom
+                            and prev_candidate.energy_per_atom
+                            < candidate.energy_per_atom
                         ):
                             logger.debug(
                                 f"Using better structure from previous run for {formula} "
@@ -1441,6 +1567,16 @@ class ChemistryExplorer:
 
                 logger.info(f"Found {len(hull_entries)} phases on the convex hull")
 
+                # Update hull in unified database
+                if self.database is not None:
+                    try:
+                        self.database.compute_hull(chemsys, update_database=True)
+                        logger.info(
+                            f"Updated global hull for {chemsys} in unified database"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to update unified database hull: {e}")
+
             except Exception as e:
                 logger.warning(f"Failed to build phase diagram: {e}")
         else:
@@ -1478,6 +1614,15 @@ class ChemistryExplorer:
         )
         conn.commit()
         conn.close()
+
+        # Complete run in unified database
+        if self.database is not None and self._unified_run_id is not None:
+            self.database.complete_run(
+                run_id=self._unified_run_id,
+                num_candidates=len(candidates),
+                num_successful=num_successful,
+                num_failed=num_failed,
+            )
 
         reused_msg = f" ({num_reused} from previous runs)" if num_reused > 0 else ""
         interrupted_msg = " (INTERRUPTED)" if interrupted else ""
@@ -1735,6 +1880,55 @@ class ChemistryExplorer:
             f"Loaded {len(best_by_formula)} unique structures from previous runs"
         )
         return best_by_formula
+
+    def _load_from_unified_database(
+        self, chemical_system: str
+    ) -> Dict[str, CandidateResult]:
+        """Load structures from unified database for a chemical system and all subsystems.
+
+        Args:
+            chemical_system: Chemical system to load (e.g., "Fe-Mn-Co")
+
+        Returns:
+            Dictionary mapping formula -> CandidateResult with best structures
+            from all relevant subsystems.
+        """
+        if self.database is None:
+            return {}
+
+        best_structures = self.database.get_best_structures_for_subsystem(
+            chemical_system
+        )
+
+        # Convert StoredStructure to CandidateResult
+        results: Dict[str, CandidateResult] = {}
+        for formula, stored in best_structures.items():
+            # Load structure from CIF content
+            structure = stored.get_structure()
+
+            candidate = CandidateResult(
+                formula=stored.formula,
+                stoichiometry=stored.stoichiometry,
+                structure=structure,
+                energy_per_atom=stored.energy_per_atom,
+                total_energy=stored.total_energy,
+                num_atoms=stored.num_atoms,
+                space_group_number=stored.space_group_number or 1,
+                space_group_symbol=stored.space_group_symbol or "P1",
+                cif_path=None,  # Will be set when saved to new run
+                is_valid=stored.is_valid,
+                error_message=stored.error_message,
+                generation_metadata={
+                    **stored.generation_metadata,
+                    "loaded_from_unified_db": True,
+                    "unified_db_id": stored.id,
+                    "e_above_hull": stored.e_above_hull,
+                    "is_on_hull": stored.is_on_hull,
+                },
+            )
+            results[formula] = candidate
+
+        return results
 
     @classmethod
     def load_run(cls, run_directory: Union[str, Path]) -> ExplorationResult:
