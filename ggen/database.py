@@ -18,8 +18,9 @@ from itertools import combinations
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
 
-from pymatgen.analysis.phase_diagram import PDEntry, PhaseDiagram
+from pymatgen.analysis.phase_diagram import PhaseDiagram
 from pymatgen.core import Composition, Structure
+from pymatgen.entries.computed_entries import ComputedEntry
 
 logger = logging.getLogger(__name__)
 
@@ -668,17 +669,21 @@ class StructureDatabase:
             f"Computing hull for {chemsys} with {len(best_structures)} formulas"
         )
 
-        # Build phase diagram entries
+        # Build phase diagram entries using ComputedEntry
+        # (pymatgen's plotter shows labels as "Formula (entry_id)")
         entries = []
-        structure_map: Dict[str, StoredStructure] = {}  # entry_name -> structure
+        structure_map: Dict[str, StoredStructure] = {}  # reduced_formula -> structure
 
         for formula, structure in best_structures.items():
             comp = Composition(formula)
             # Use energy per atom * num atoms in reduced formula
             energy = structure.energy_per_atom * comp.num_atoms
-            entry = PDEntry(comp, energy, name=formula)
+            # Use space group as entry_id for phase diagram labels
+            sg = structure.space_group_symbol or "?"
+            entry = ComputedEntry(comp, energy, entry_id=sg)
             entries.append(entry)
-            structure_map[formula] = structure
+            # Key by reduced_formula to match lookup later
+            structure_map[comp.reduced_formula] = structure
 
         if len(entries) < 2:
             logger.warning(f"Need at least 2 entries for hull, got {len(entries)}")
@@ -697,7 +702,7 @@ class StructureDatabase:
 
         for entry in entries:
             e_hull = pd.get_e_above_hull(entry)
-            formula = entry.name
+            formula = entry.composition.reduced_formula
             e_above_hull_map[formula] = e_hull
 
             if e_hull < 1e-6:  # On hull

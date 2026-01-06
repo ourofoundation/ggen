@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 from tqdm import tqdm
-from pymatgen.analysis.phase_diagram import PDEntry, PhaseDiagram
+from pymatgen.analysis.phase_diagram import PhaseDiagram
 from pymatgen.core import Composition, Element, Structure
 from pymatgen.entries.computed_entries import ComputedEntry
 from pymatgen.io.cif import CifWriter
@@ -1147,6 +1147,10 @@ class ChemistryExplorer:
         # Suppress pymatgen CIF parsing warnings
         warnings.filterwarnings(
             "ignore", category=UserWarning, module="pymatgen.core.structure"
+        )
+        # Suppress pymatgen CIF stoichiometry warnings
+        warnings.filterwarnings(
+            "ignore", category=UserWarning, module="pymatgen.io.cif"
         )
         # Suppress orb_models torch dtype warnings
         warnings.filterwarnings(

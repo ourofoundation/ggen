@@ -25,6 +25,10 @@ from ggen import ChemistryExplorer, Colors, StructureDatabase
 warnings.filterwarnings(
     "ignore", category=UserWarning, module="pymatgen.core.structure"
 )
+# Suppress pymatgen CIF stoichiometry warnings
+warnings.filterwarnings(
+    "ignore", category=UserWarning, module="pymatgen.io.cif"
+)
 # Suppress orb_models torch dtype warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="orb_models.utils")
 
