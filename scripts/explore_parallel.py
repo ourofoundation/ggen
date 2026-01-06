@@ -73,6 +73,17 @@ def main():
         help="Output directory for results (default: ./exploration_runs)",
     )
     parser.add_argument(
+        "--inner-workers",
+        type=int,
+        default=1,
+        help="Parallel workers per exploration (default: 1)",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable progress bars",
+    )
+    parser.add_argument(
         "--quiet", action="store_true", help="Suppress individual exploration output"
     )
 
@@ -88,9 +99,13 @@ def main():
         str(args.max_stoichiometries),
         "--output-dir",
         args.output_dir,
+        "--workers",
+        str(args.inner_workers),
     ]
     if args.quiet:
         extra_args.append("--quiet")
+    if args.no_progress:
+        extra_args.append("--no-progress")
 
     num_workers = args.workers or len(args.systems)
 

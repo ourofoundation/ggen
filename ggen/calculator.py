@@ -57,11 +57,16 @@ def get_orb_calculator(
 
             # Load the model
             orbff = pretrained.orb_v3_conservative_inf_mpa(
-                device=device, weights_path=weights_path, compile=False
+                device=device,
+                weights_path=weights_path,
+                compile=True,
+                precision="float32-high",
             )
         else:
             logger.info("Loading ORB calculator (using device: %s)", device)
-            orbff = pretrained.orb_v3_conservative_inf_mpa(device=device, compile=False)
+            orbff = pretrained.orb_v3_conservative_inf_mpa(
+                device=device, compile=True, precision="float32-high"
+            )
         calculator = ORBCalculator(orbff, device=device)
         return calculator
 

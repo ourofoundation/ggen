@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import logging
+import signal
 import sqlite3
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import combinations_with_replacement
@@ -16,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+from tqdm import tqdm
 from pymatgen.analysis.phase_diagram import PDEntry, PhaseDiagram
 from pymatgen.core import Composition, Element, Structure
 from pymatgen.entries.computed_entries import ComputedEntry
@@ -25,12 +28,106 @@ from .ggen import GGen
 
 logger = logging.getLogger(__name__)
 
+# ===================== Module-level helpers for parallel execution =====================
+
+
+def _generate_structure_worker(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Worker function for parallel structure generation.
+
+    This is a module-level function to enable pickling for ProcessPoolExecutor.
+    Returns a dictionary with results that can be converted to CandidateResult.
+    """
+    from .ggen import GGen
+    from .calculator import get_orb_calculator
+
+    stoichiometry = args["stoichiometry"]
+    num_trials = args["num_trials"]
+    optimize = args["optimize"]
+    symmetry_bias = args["symmetry_bias"]
+    crystal_systems = args["crystal_systems"]
+    preserve_symmetry = args["preserve_symmetry"]
+    random_seed = args["random_seed"]
+
+    # Build formula string
+    formula = "".join(
+        f"{el}{count if count > 1 else ''}"
+        for el, count in sorted(stoichiometry.items())
+    )
+
+    try:
+        # Each worker needs its own calculator instance
+        calculator = get_orb_calculator()
+
+        ggen = GGen(
+            calculator=calculator,
+            random_seed=random_seed,
+            enable_trajectory=False,
+        )
+
+        result = ggen.generate_crystal(
+            formula=formula,
+            num_trials=num_trials,
+            optimize_geometry=optimize,
+            multi_spacegroup=True,
+            top_k_spacegroups=5,
+            symmetry_bias=symmetry_bias,
+            crystal_systems=crystal_systems,
+            refine_symmetry=not preserve_symmetry,
+            preserve_symmetry=preserve_symmetry,
+        )
+
+        structure = ggen.get_structure()
+        if structure is None:
+            raise ValueError("No structure generated")
+
+        energy = result["best_crystal_energy"]
+        num_atoms = len(structure)
+        energy_per_atom = energy / num_atoms
+
+        return {
+            "formula": formula,
+            "stoichiometry": stoichiometry,
+            "energy_per_atom": energy_per_atom,
+            "total_energy": energy,
+            "num_atoms": num_atoms,
+            "space_group_number": result["final_space_group"],
+            "space_group_symbol": result["final_space_group_symbol"],
+            "structure": structure,
+            "generation_metadata": {
+                "generation_stats": result.get("generation_stats", {}),
+                "score_breakdown": result.get("score_breakdown", {}),
+                "optimization_steps": result.get("optimization_steps", 0),
+            },
+            "is_valid": True,
+            "error_message": None,
+        }
+
+    except Exception as e:
+        return {
+            "formula": formula,
+            "stoichiometry": stoichiometry,
+            "energy_per_atom": float("nan"),
+            "total_energy": float("nan"),
+            "num_atoms": 0,
+            "space_group_number": 0,
+            "space_group_symbol": "",
+            "structure": None,
+            "generation_metadata": {},
+            "is_valid": False,
+            "error_message": str(e),
+        }
+
+
 # ===================== Data Classes =====================
 
 
 @dataclass
 class CandidateResult:
-    """Result of a structure generation attempt."""
+    """Result of a structure generation attempt.
+
+    Note: For memory efficiency, the `structure` field may be None even for valid
+    candidates. Use `get_structure()` to lazily load from CIF when needed.
+    """
 
     formula: str
     stoichiometry: Dict[str, int]
@@ -39,11 +136,27 @@ class CandidateResult:
     num_atoms: int
     space_group_number: int
     space_group_symbol: str
-    structure: Structure
+    structure: Optional[Structure] = None
     cif_path: Optional[Path] = None
     generation_metadata: Dict[str, Any] = field(default_factory=dict)
     is_valid: bool = True
     error_message: Optional[str] = None
+
+    def get_structure(self) -> Optional[Structure]:
+        """Get the structure, loading from CIF if not in memory."""
+        if self.structure is not None:
+            return self.structure
+        if self.cif_path is not None and self.cif_path.exists():
+            try:
+                self.structure = Structure.from_file(str(self.cif_path), primitive=True)
+                return self.structure
+            except Exception:
+                return None
+        return None
+
+    def clear_structure(self) -> None:
+        """Clear structure from memory (can be reloaded from CIF)."""
+        self.structure = None
 
 
 @dataclass
@@ -396,6 +509,7 @@ class ChemistryExplorer:
         symmetry_bias: float = 0.0,
         crystal_systems: Optional[List[str]] = None,
         preserve_symmetry: bool = False,
+        show_progress: bool = False,
     ) -> CandidateResult:
         """Generate and optimize a structure for a given stoichiometry.
 
@@ -409,6 +523,7 @@ class ChemistryExplorer:
             crystal_systems: Optional list of crystal systems to restrict to.
             preserve_symmetry: If True, use symmetry-constrained relaxation to preserve
                 high symmetry during optimization.
+            show_progress: If True, show tqdm progress bar during relaxation.
 
         Returns:
             CandidateResult with structure and energy information.
@@ -440,6 +555,7 @@ class ChemistryExplorer:
                 crystal_systems=crystal_systems,
                 refine_symmetry=not preserve_symmetry,  # Don't need refinement if preserving
                 preserve_symmetry=preserve_symmetry,
+                show_progress=show_progress,
             )
 
             structure = ggen.get_structure()
@@ -496,13 +612,18 @@ class ChemistryExplorer:
         )
         cif_path = structures_dir / filename
 
+        # Get the structure (may load from CIF if cleared from memory)
+        structure = candidate.get_structure()
+        if structure is None:
+            raise ValueError(f"No structure available for {candidate.formula}")
+
         # Get primitive cell to avoid supercell issues on reload
         # This ensures consistent atom counts between save and load
         try:
-            structure = candidate.structure.get_primitive_structure()
+            structure = structure.get_primitive_structure()
         except Exception:
             # Fall back to original structure if primitive conversion fails
-            structure = candidate.structure
+            pass
 
         try:
             cif_writer = CifWriter(structure, symprec=0.1)
@@ -529,6 +650,7 @@ class ChemistryExplorer:
         optimize: bool = True,
         symmetry_bias: float = 0.0,
         preserve_symmetry: bool = False,
+        show_progress: bool = False,
     ) -> List[CandidateResult]:
         """Generate structures for pure elements (terminal entries for phase diagram).
 
@@ -542,6 +664,7 @@ class ChemistryExplorer:
             optimize: Whether to optimize geometry.
             symmetry_bias: Controls preference for higher-symmetry crystal systems.
             preserve_symmetry: If True, use symmetry-constrained relaxation.
+            show_progress: If True, show tqdm progress bar during relaxation.
 
         Returns:
             List of CandidateResult for each element.
@@ -579,6 +702,7 @@ class ChemistryExplorer:
                         crystal_systems=None,  # Allow all crystal systems
                         refine_symmetry=not preserve_symmetry,
                         preserve_symmetry=preserve_symmetry,
+                        show_progress=show_progress,
                     )
 
                     structure = ggen.get_structure()
@@ -640,8 +764,10 @@ class ChemistryExplorer:
         Returns:
             Tuple of (PhaseDiagram, list of hull entries from candidates)
         """
+        # A candidate is valid for phase diagram if it has valid energy data
+        # (structure may be cleared from memory but data is preserved)
         valid_candidates = [
-            c for c in candidates if c.is_valid and c.structure is not None
+            c for c in candidates if c.is_valid and (c.structure is not None or c.cif_path is not None)
         ]
 
         if not valid_candidates:
@@ -673,7 +799,7 @@ class ChemistryExplorer:
 
         # Add terminal element entries (required for formation energy calculation)
         for terminal in terminal_candidates:
-            if terminal.is_valid and terminal.structure is not None:
+            if terminal.is_valid and (terminal.structure is not None or terminal.cif_path is not None):
                 sg_label = terminal.space_group_symbol.replace("/", "-")
                 entry_id = f"{terminal.formula} ({sg_label})"
 
@@ -728,6 +854,140 @@ class ChemistryExplorer:
 
         return pd, hull_candidates
 
+    # -------------------- Parallel Generation --------------------
+
+    def _generate_parallel(
+        self,
+        stoichs_to_generate: List[Tuple[Dict[str, int], str]],
+        previous_structures: Dict[str, CandidateResult],
+        candidates: List[CandidateResult],
+        num_successful: int,
+        num_failed: int,
+        structures_dir: Path,
+        conn: sqlite3.Connection,
+        num_trials: int,
+        optimize: bool,
+        symmetry_bias: float,
+        crystal_systems: Optional[List[str]],
+        preserve_symmetry: bool,
+        num_workers: int,
+        show_progress: bool,
+        keep_structures_in_memory: bool,
+        interrupted_flag,
+    ) -> Tuple[List[CandidateResult], int, int]:
+        """Generate structures in parallel using ProcessPoolExecutor.
+
+        Returns updated (candidates, num_successful, num_failed).
+        """
+        # Prepare worker arguments
+        worker_args = []
+        for stoich, formula in stoichs_to_generate:
+            worker_args.append({
+                "stoichiometry": stoich,
+                "num_trials": num_trials,
+                "optimize": optimize,
+                "symmetry_bias": symmetry_bias,
+                "crystal_systems": crystal_systems,
+                "preserve_symmetry": preserve_symmetry,
+                "random_seed": self.random_seed,
+            })
+
+        # Use ProcessPoolExecutor for parallel generation
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all tasks
+            future_to_args = {
+                executor.submit(_generate_structure_worker, args): (args, stoichs_to_generate[i][1])
+                for i, args in enumerate(worker_args)
+            }
+
+            # Process results as they complete with progress bar
+            pbar = tqdm(
+                as_completed(future_to_args),
+                total=len(future_to_args),
+                desc="Generating structures",
+                disable=not show_progress,
+                unit="struct",
+            )
+
+            for future in pbar:
+                if interrupted_flag():
+                    logger.info("Interrupt detected - cancelling remaining tasks")
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+
+                args, formula = future_to_args[future]
+                pbar.set_postfix_str(formula)
+
+                try:
+                    result_dict = future.result()
+
+                    # Convert dict to CandidateResult
+                    candidate = CandidateResult(
+                        formula=result_dict["formula"],
+                        stoichiometry=result_dict["stoichiometry"],
+                        energy_per_atom=result_dict["energy_per_atom"],
+                        total_energy=result_dict["total_energy"],
+                        num_atoms=result_dict["num_atoms"],
+                        space_group_number=result_dict["space_group_number"],
+                        space_group_symbol=result_dict["space_group_symbol"],
+                        structure=result_dict["structure"],
+                        generation_metadata=result_dict["generation_metadata"],
+                        is_valid=result_dict["is_valid"],
+                        error_message=result_dict["error_message"],
+                    )
+
+                    # If we have a previous structure and this one failed or is worse, use the previous
+                    if formula in previous_structures:
+                        prev_candidate = previous_structures[formula]
+                        if not candidate.is_valid or (
+                            prev_candidate.is_valid
+                            and prev_candidate.energy_per_atom < candidate.energy_per_atom
+                        ):
+                            logger.debug(
+                                f"Using better structure from previous run for {formula}"
+                            )
+                            candidate = prev_candidate
+                            candidate.generation_metadata["reused_from_previous"] = True
+
+                    if candidate.is_valid and candidate.structure is not None:
+                        # Save CIF
+                        cif_path = self._save_structure_cif(candidate, structures_dir)
+                        candidate.cif_path = cif_path
+                        num_successful += 1
+
+                        # Clear structure from memory if not needed
+                        if not keep_structures_in_memory:
+                            candidate.clear_structure()
+                    else:
+                        num_failed += 1
+
+                    # Save to database
+                    self._save_candidate(conn, candidate)
+                    candidates.append(candidate)
+
+                except Exception as e:
+                    logger.warning(f"Worker failed for {formula}: {e}")
+                    # Create a failed candidate
+                    candidate = CandidateResult(
+                        formula=formula,
+                        stoichiometry=args["stoichiometry"],
+                        energy_per_atom=float("nan"),
+                        total_energy=float("nan"),
+                        num_atoms=0,
+                        space_group_number=0,
+                        space_group_symbol="",
+                        structure=None,
+                        is_valid=False,
+                        error_message=str(e),
+                    )
+                    self._save_candidate(conn, candidate)
+                    candidates.append(candidate)
+                    num_failed += 1
+
+            pbar.close()
+
+        return candidates, num_successful, num_failed
+
     # -------------------- Main Exploration Method --------------------
 
     def explore(
@@ -747,6 +1007,9 @@ class ChemistryExplorer:
         load_previous_runs: Union[bool, int] = False,
         skip_existing_formulas: bool = True,
         preserve_symmetry: bool = False,
+        num_workers: int = 1,
+        show_progress: bool = True,
+        keep_structures_in_memory: bool = False,
     ) -> ExplorationResult:
         """Explore a chemical system by generating candidate structures.
 
@@ -758,6 +1021,8 @@ class ChemistryExplorer:
         5. Stores all data in SQLite and CIF files
         6. Builds a phase diagram
         7. Returns stable candidates
+
+        Supports graceful interruption with Ctrl+C - partial results will be saved.
 
         Args:
             chemical_system: Chemical system to explore (e.g., "Li-Co-O")
@@ -789,6 +1054,13 @@ class ChemistryExplorer:
                 high symmetry during optimization. This uses ASE's FixSymmetry constraint
                 to keep atoms on their Wyckoff positions. Recommended when you want to
                 maintain the generated space group. Default: False.
+            num_workers: Number of parallel workers for structure generation. Default: 1
+                (sequential). Set > 1 for parallel generation. Note: each worker loads
+                its own ML model, so memory usage scales with num_workers.
+            show_progress: Whether to show tqdm progress bar. Default: True.
+            keep_structures_in_memory: If False (default), structures are saved to CIF
+                and cleared from memory to reduce memory usage. Set True to keep all
+                structures in memory (useful for small explorations or post-processing).
 
         Returns:
             ExplorationResult with all candidates, phase diagram, and stable phases.
@@ -796,6 +1068,23 @@ class ChemistryExplorer:
         import time
 
         start_time = time.time()
+
+        # Setup interrupt handling for graceful shutdown
+        interrupted = False
+        original_sigint_handler = signal.getsignal(signal.SIGINT)
+
+        def handle_interrupt(signum, frame):
+            nonlocal interrupted
+            if interrupted:
+                # Second Ctrl+C - force exit
+                logger.warning("Force interrupt - exiting immediately")
+                raise KeyboardInterrupt
+            interrupted = True
+            logger.warning(
+                "\nInterrupt received - finishing current structure and saving results..."
+            )
+
+        signal.signal(signal.SIGINT, handle_interrupt)
 
         # Parse chemical system
         elements = self.parse_chemical_system(chemical_system)
@@ -870,7 +1159,9 @@ class ChemistryExplorer:
         num_failed = 0
         num_reused = 0
 
-        for i, stoich in enumerate(stoichiometries):
+        # Separate stoichiometries into reused vs need-to-generate
+        stoichs_to_generate = []
+        for stoich in stoichiometries:
             formula = "".join(
                 f"{el}{count if count > 1 else ''}"
                 for el, count in sorted(stoich.items())
@@ -879,15 +1170,18 @@ class ChemistryExplorer:
             # Check if we already have this formula from previous runs
             if formula in previous_structures and skip_existing_formulas:
                 prev_candidate = previous_structures[formula]
-                logger.info(
-                    f"[{i+1}/{len(stoichiometries)}] Reusing {formula} from previous run "
+                logger.debug(
+                    f"Reusing {formula} from previous run "
                     f"(E={prev_candidate.energy_per_atom:.4f} eV/atom)"
                 )
 
                 # Copy the structure to the new run's structures directory
-                if prev_candidate.structure is not None:
+                structure = prev_candidate.get_structure()
+                if structure is not None:
                     cif_path = self._save_structure_cif(prev_candidate, structures_dir)
                     prev_candidate.cif_path = cif_path
+                    if not keep_structures_in_memory:
+                        prev_candidate.clear_structure()
 
                 # Mark as reused in metadata
                 prev_candidate.generation_metadata["reused_from_previous"] = True
@@ -897,45 +1191,90 @@ class ChemistryExplorer:
                 candidates.append(prev_candidate)
                 num_successful += 1
                 num_reused += 1
-                continue
-
-            logger.info(f"[{i+1}/{len(stoichiometries)}] Generating {formula}")
-
-            candidate = self._generate_structure_for_stoichiometry(
-                stoichiometry=stoich,
-                num_trials=num_trials,
-                optimize=optimize,
-                symmetry_bias=symmetry_bias,
-                crystal_systems=crystal_systems,
-                preserve_symmetry=preserve_symmetry,
-            )
-
-            # If we have a previous structure and this one failed or is worse, use the previous
-            if formula in previous_structures:
-                prev_candidate = previous_structures[formula]
-                if not candidate.is_valid or (
-                    prev_candidate.is_valid
-                    and prev_candidate.energy_per_atom < candidate.energy_per_atom
-                ):
-                    logger.info(
-                        f"Using better structure from previous run for {formula} "
-                        f"(prev={prev_candidate.energy_per_atom:.4f} vs "
-                        f"new={candidate.energy_per_atom:.4f} eV/atom)"
-                    )
-                    candidate = prev_candidate
-                    candidate.generation_metadata["reused_from_previous"] = True
-
-            if candidate.is_valid and candidate.structure is not None:
-                # Save CIF
-                cif_path = self._save_structure_cif(candidate, structures_dir)
-                candidate.cif_path = cif_path
-                num_successful += 1
             else:
-                num_failed += 1
+                stoichs_to_generate.append((stoich, formula))
 
-            # Save to database
-            self._save_candidate(conn, candidate)
-            candidates.append(candidate)
+        if num_reused > 0:
+            logger.info(f"Reused {num_reused} structures from previous runs")
+
+        # Generate new structures (sequential or parallel)
+        if stoichs_to_generate and not interrupted:
+            if num_workers > 1:
+                # Parallel generation
+                logger.info(
+                    f"Generating {len(stoichs_to_generate)} structures "
+                    f"with {num_workers} workers"
+                )
+                candidates, num_successful, num_failed = self._generate_parallel(
+                    stoichs_to_generate=stoichs_to_generate,
+                    previous_structures=previous_structures,
+                    candidates=candidates,
+                    num_successful=num_successful,
+                    num_failed=num_failed,
+                    structures_dir=structures_dir,
+                    conn=conn,
+                    num_trials=num_trials,
+                    optimize=optimize,
+                    symmetry_bias=symmetry_bias,
+                    crystal_systems=crystal_systems,
+                    preserve_symmetry=preserve_symmetry,
+                    num_workers=num_workers,
+                    show_progress=show_progress,
+                    keep_structures_in_memory=keep_structures_in_memory,
+                    interrupted_flag=lambda: interrupted,
+                )
+            else:
+                # Sequential generation - show relaxation progress for each structure
+                for i, (stoich, formula) in enumerate(stoichs_to_generate):
+                    if interrupted:
+                        logger.info("Stopping generation due to interrupt")
+                        break
+
+                    if show_progress:
+                        print(
+                            f"[{i + 1}/{len(stoichs_to_generate)}] Generating {formula}..."
+                        )
+
+                    candidate = self._generate_structure_for_stoichiometry(
+                        stoichiometry=stoich,
+                        num_trials=num_trials,
+                        optimize=optimize,
+                        symmetry_bias=symmetry_bias,
+                        crystal_systems=crystal_systems,
+                        preserve_symmetry=preserve_symmetry,
+                        show_progress=show_progress,
+                    )
+
+                    # If we have a previous structure and this one failed or is worse, use the previous
+                    if formula in previous_structures:
+                        prev_candidate = previous_structures[formula]
+                        if not candidate.is_valid or (
+                            prev_candidate.is_valid
+                            and prev_candidate.energy_per_atom < candidate.energy_per_atom
+                        ):
+                            logger.debug(
+                                f"Using better structure from previous run for {formula} "
+                                f"(prev={prev_candidate.energy_per_atom:.4f} vs "
+                                f"new={candidate.energy_per_atom:.4f} eV/atom)"
+                            )
+                            candidate = prev_candidate
+                            candidate.generation_metadata["reused_from_previous"] = True
+
+                    if candidate.is_valid and candidate.structure is not None:
+                        # Save CIF
+                        cif_path = self._save_structure_cif(candidate, structures_dir)
+                        candidate.cif_path = cif_path
+                        num_successful += 1
+
+                        # Clear structure from memory if not needed
+                        if not keep_structures_in_memory:
+                            candidate.clear_structure()
+                    else:
+                        num_failed += 1
+
+                    # Save to database
+                    self._save_candidate(conn, candidate)
+                    candidates.append(candidate)
 
         # Add remaining structures from previous runs that weren't in our enumeration
         if load_previous_runs:
@@ -954,11 +1293,14 @@ class ChemistryExplorer:
                         f"(E={prev_candidate.energy_per_atom:.4f} eV/atom)"
                     )
                     # Copy the structure to the new run's structures directory
-                    if prev_candidate.structure is not None:
+                    structure = prev_candidate.get_structure()
+                    if structure is not None:
                         cif_path = self._save_structure_cif(
                             prev_candidate, structures_dir
                         )
                         prev_candidate.cif_path = cif_path
+                        if not keep_structures_in_memory:
+                            prev_candidate.clear_structure()
 
                     prev_candidate.generation_metadata["reused_from_previous"] = True
                     self._save_candidate(conn, prev_candidate)
@@ -971,7 +1313,7 @@ class ChemistryExplorer:
                 f"({num_reused} from previous runs)"
             )
 
-        # Generate terminal element structures for phase diagram
+        # Generate terminal element structures for phase diagram (unless interrupted)
         # Always generate fresh terminals and compare with previous runs to get the best
         terminal_candidates = []
 
@@ -984,79 +1326,84 @@ class ChemistryExplorer:
         def _is_reasonable_terminal_energy(energy: float) -> bool:
             return MIN_REASONABLE_ENERGY <= energy <= MAX_REASONABLE_ENERGY
 
-        logger.info(f"Generating terminal element structures for {elements}")
-        new_terminals = self._generate_terminal_elements(
-            elements=elements,
-            num_trials=num_trials,
-            optimize=optimize,
-            symmetry_bias=symmetry_bias,
-            preserve_symmetry=preserve_symmetry,
-        )
+        if not interrupted:
+            logger.info(f"Generating terminal element structures for {elements}")
+            new_terminals = self._generate_terminal_elements(
+                elements=elements,
+                num_trials=num_trials,
+                optimize=optimize,
+                symmetry_bias=symmetry_bias,
+                preserve_symmetry=preserve_symmetry,
+                show_progress=show_progress,
+            )
 
-        # Compare with previous runs and keep the better terminal
-        # But reject terminals with obviously wrong energies
-        for new_terminal in new_terminals:
-            element = new_terminal.formula
-            new_energy = new_terminal.energy_per_atom
-            new_reasonable = _is_reasonable_terminal_energy(new_energy)
+            # Compare with previous runs and keep the better terminal
+            # But reject terminals with obviously wrong energies
+            for new_terminal in new_terminals:
+                element = new_terminal.formula
+                new_energy = new_terminal.energy_per_atom
+                new_reasonable = _is_reasonable_terminal_energy(new_energy)
 
-            if element in previous_structures:
-                prev_terminal = previous_structures[element]
-                prev_energy = prev_terminal.energy_per_atom
-                prev_reasonable = _is_reasonable_terminal_energy(prev_energy)
+                if element in previous_structures:
+                    prev_terminal = previous_structures[element]
+                    prev_energy = prev_terminal.energy_per_atom
+                    prev_reasonable = _is_reasonable_terminal_energy(prev_energy)
 
-                # Decision logic:
-                # 1. If only one is reasonable, use that one
-                # 2. If both reasonable, use lower energy
-                # 3. If neither reasonable, use whichever is closer to reasonable range
-                if prev_reasonable and not new_reasonable:
-                    logger.warning(
-                        f"New terminal {element} has unreasonable energy "
-                        f"({new_energy:.4f} eV/atom), using previous "
-                        f"({prev_energy:.4f} eV/atom)"
-                    )
-                    prev_terminal.generation_metadata["reused_from_previous"] = True
-                    terminal_candidates.append(prev_terminal)
-                elif new_reasonable and not prev_reasonable:
-                    logger.warning(
-                        f"Previous terminal {element} has unreasonable energy "
-                        f"({prev_energy:.4f} eV/atom), using new "
-                        f"({new_energy:.4f} eV/atom)"
-                    )
-                    terminal_candidates.append(new_terminal)
-                elif prev_energy < new_energy:
-                    logger.info(
-                        f"Using terminal {element} from previous run "
-                        f"(prev={prev_energy:.4f} vs new={new_energy:.4f} eV/atom)"
-                    )
-                    prev_terminal.generation_metadata["reused_from_previous"] = True
-                    terminal_candidates.append(prev_terminal)
+                    # Decision logic:
+                    # 1. If only one is reasonable, use that one
+                    # 2. If both reasonable, use lower energy
+                    # 3. If neither reasonable, use whichever is closer to reasonable range
+                    if prev_reasonable and not new_reasonable:
+                        logger.warning(
+                            f"New terminal {element} has unreasonable energy "
+                            f"({new_energy:.4f} eV/atom), using previous "
+                            f"({prev_energy:.4f} eV/atom)"
+                        )
+                        prev_terminal.generation_metadata["reused_from_previous"] = True
+                        terminal_candidates.append(prev_terminal)
+                    elif new_reasonable and not prev_reasonable:
+                        logger.warning(
+                            f"Previous terminal {element} has unreasonable energy "
+                            f"({prev_energy:.4f} eV/atom), using new "
+                            f"({new_energy:.4f} eV/atom)"
+                        )
+                        terminal_candidates.append(new_terminal)
+                    elif prev_energy < new_energy:
+                        logger.info(
+                            f"Using terminal {element} from previous run "
+                            f"(prev={prev_energy:.4f} vs new={new_energy:.4f} eV/atom)"
+                        )
+                        prev_terminal.generation_metadata["reused_from_previous"] = True
+                        terminal_candidates.append(prev_terminal)
+                    else:
+                        logger.info(
+                            f"Using newly generated terminal {element} "
+                            f"(new={new_energy:.4f} vs prev={prev_energy:.4f} eV/atom)"
+                        )
+                        terminal_candidates.append(new_terminal)
                 else:
-                    logger.info(
-                        f"Using newly generated terminal {element} "
-                        f"(new={new_energy:.4f} vs prev={prev_energy:.4f} eV/atom)"
-                    )
+                    if not new_reasonable:
+                        logger.warning(
+                            f"Terminal {element} has unreasonable energy: "
+                            f"{new_energy:.4f} eV/atom (expected {MIN_REASONABLE_ENERGY} to "
+                            f"{MAX_REASONABLE_ENERGY}). Phase diagram may be incorrect."
+                        )
+                    else:
+                        logger.info(
+                            f"Terminal {element}: E={new_energy:.4f} eV/atom, "
+                            f"SG={new_terminal.space_group_symbol}"
+                        )
                     terminal_candidates.append(new_terminal)
-            else:
-                if not new_reasonable:
-                    logger.warning(
-                        f"Terminal {element} has unreasonable energy: "
-                        f"{new_energy:.4f} eV/atom (expected {MIN_REASONABLE_ENERGY} to "
-                        f"{MAX_REASONABLE_ENERGY}). Phase diagram may be incorrect."
-                    )
-                else:
-                    logger.info(
-                        f"Terminal {element}: E={new_energy:.4f} eV/atom, "
-                        f"SG={new_terminal.space_group_symbol}"
-                    )
-                terminal_candidates.append(new_terminal)
 
-        # Save terminal structures
-        for terminal in terminal_candidates:
-            if terminal.is_valid and terminal.structure is not None:
-                cif_path = self._save_structure_cif(terminal, structures_dir)
-                terminal.cif_path = cif_path
-                self._save_candidate(conn, terminal)
+            # Save terminal structures
+            for terminal in terminal_candidates:
+                structure = terminal.get_structure()
+                if terminal.is_valid and structure is not None:
+                    cif_path = self._save_structure_cif(terminal, structures_dir)
+                    terminal.cif_path = cif_path
+                    self._save_candidate(conn, terminal)
+                    if not keep_structures_in_memory:
+                        terminal.clear_structure()
 
         # Build phase diagram
         phase_diagram = None
@@ -1099,6 +1446,9 @@ class ChemistryExplorer:
         # Finalize
         total_time = time.time() - start_time
 
+        # Restore original signal handler
+        signal.signal(signal.SIGINT, original_sigint_handler)
+
         conn.execute(
             "INSERT OR REPLACE INTO run_metadata VALUES (?, ?)",
             ("completed_at", datetime.now().isoformat()),
@@ -1111,12 +1461,17 @@ class ChemistryExplorer:
             "INSERT OR REPLACE INTO run_metadata VALUES (?, ?)",
             ("num_reused_from_previous", str(num_reused)),
         )
+        conn.execute(
+            "INSERT OR REPLACE INTO run_metadata VALUES (?, ?)",
+            ("interrupted", "1" if interrupted else "0"),
+        )
         conn.commit()
         conn.close()
 
         reused_msg = f" ({num_reused} from previous runs)" if num_reused > 0 else ""
+        interrupted_msg = " (INTERRUPTED)" if interrupted else ""
         logger.info(
-            f"Exploration complete: {num_successful} successful{reused_msg}, "
+            f"Exploration{interrupted_msg}: {num_successful} successful{reused_msg}, "
             f"{len(hull_entries)} on hull, {total_time:.1f}s"
         )
 
@@ -1345,7 +1700,10 @@ class ChemistryExplorer:
                 )
 
                 for candidate in result.candidates:
-                    if not candidate.is_valid or candidate.structure is None:
+                    # Check if candidate has a loadable structure (in memory or on disk)
+                    if not candidate.is_valid:
+                        continue
+                    if candidate.structure is None and candidate.cif_path is None:
                         continue
 
                     formula = candidate.formula

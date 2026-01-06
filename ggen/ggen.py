@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import requests
 from ase.constraints import FixSymmetry
+from tqdm import tqdm
 from ase.filters import FrechetCellFilter
 from ase.io import read as ase_read
 from ase.io import write as ase_write
@@ -794,6 +795,8 @@ class GGen:
         trajectory_interval: int = 5,
         preserve_symmetry: bool = False,
         symmetry_symprec: float = 0.01,
+        show_progress: bool = False,
+        progress_desc: str = "Relaxing",
     ) -> Tuple[Structure, float, int]:
         """Optimize geometry using ASE LBFGS with optional variable cell.
 
@@ -811,6 +814,8 @@ class GGen:
                 Stage 2 does unconstrained fine-tuning with conservative settings.
             symmetry_symprec: Tolerance for symmetry detection when preserve_symmetry
                 is True. Smaller values are stricter. Default: 0.01 Å.
+            show_progress: If True, show a tqdm progress bar during optimization.
+            progress_desc: Description for the progress bar (e.g. formula name).
 
         Returns:
             (optimized_structure, final_energy_eV, total_steps)
@@ -859,42 +864,73 @@ class GGen:
 
         dyn_target = FrechetCellFilter(atoms) if relax_cell else atoms
 
-        if self.enable_trajectory and trajectory_interval > 0:
-
-            class TrajectoryLBFGS(LBFGS):
-                def __init__(self, atoms, ggen: GGen, interval: int, **kwargs):
-                    super().__init__(atoms, **kwargs)
-                    self.ggen = ggen
-                    self.interval = interval
-                    self.step_count = 0
-
-                def step(self, f=None):
-                    result = super().step(f)
-                    self.step_count += 1
-                    if self.step_count % self.interval == 0:
-                        # FrechetCellFilter has .atoms
-                        a = (
-                            self.atoms.atoms
-                            if hasattr(self.atoms, "atoms")
-                            else self.atoms
-                        )
-                        structure = _atoms_to_structure_wrapped(a)
-                        self.ggen._add_trajectory_frame(
-                            structure=structure,
-                            frame_type="optimization_step",
-                            operation="optimize_geometry",
-                            metadata={"step": self.step_count},
-                        )
-                    return result
-
-            optimizer = TrajectoryLBFGS(
-                dyn_target, self, trajectory_interval, maxstep=0.2, logfile=None
+        # Create progress bar if requested
+        pbar = None
+        if show_progress:
+            pbar = tqdm(
+                total=max_steps,
+                desc=progress_desc,
+                unit="step",
+                leave=False,
             )
-        else:
-            optimizer = LBFGS(dyn_target, maxstep=0.2, logfile=None)
+
+        class ProgressLBFGS(LBFGS):
+            def __init__(
+                self,
+                atoms,
+                ggen: Optional[GGen] = None,
+                trajectory_interval: int = 0,
+                progress_bar: Optional[tqdm] = None,
+                **kwargs,
+            ):
+                super().__init__(atoms, **kwargs)
+                self._ggen = ggen
+                self._trajectory_interval = trajectory_interval
+                self._progress_bar = progress_bar
+                self.step_count = 0
+
+            def step(self, f=None):
+                result = super().step(f)
+                self.step_count += 1
+
+                # Update progress bar
+                if self._progress_bar is not None:
+                    self._progress_bar.update(1)
+
+                # Record trajectory frame
+                if (
+                    self._ggen is not None
+                    and self._trajectory_interval > 0
+                    and self.step_count % self._trajectory_interval == 0
+                ):
+                    # FrechetCellFilter has .atoms
+                    a = (
+                        self.atoms.atoms
+                        if hasattr(self.atoms, "atoms")
+                        else self.atoms
+                    )
+                    structure = _atoms_to_structure_wrapped(a)
+                    self._ggen._add_trajectory_frame(
+                        structure=structure,
+                        frame_type="optimization_step",
+                        operation="optimize_geometry",
+                        metadata={"step": self.step_count},
+                    )
+                return result
+
+        optimizer = ProgressLBFGS(
+            dyn_target,
+            ggen=self if self.enable_trajectory else None,
+            trajectory_interval=trajectory_interval if self.enable_trajectory else 0,
+            progress_bar=pbar,
+            maxstep=0.2,
+            logfile=None,
+        )
 
         try:
             optimizer.run(fmax=fmax, steps=max_steps)
+            if pbar is not None:
+                pbar.close()
             final_energy = atoms.get_potential_energy()
             num_steps = optimizer.get_number_of_steps()
 
@@ -938,11 +974,28 @@ class GGen:
                 atoms2.calc = self.calculator
                 dyn_target2 = FrechetCellFilter(atoms2) if relax_cell else atoms2
 
+                # Create progress bar for stage 2 if requested
+                pbar2 = None
+                if show_progress:
+                    pbar2 = tqdm(
+                        total=max_steps,
+                        desc=f"{progress_desc} (stage 2)",
+                        unit="step",
+                        leave=False,
+                    )
+
                 # Conservative optimizer settings to avoid escaping high-symmetry basin
-                optimizer2 = LBFGS(dyn_target2, maxstep=0.05, logfile=None)
+                optimizer2 = ProgressLBFGS(
+                    dyn_target2,
+                    progress_bar=pbar2,
+                    maxstep=0.05,
+                    logfile=None,
+                )
 
                 try:
                     optimizer2.run(fmax=fmax, steps=max_steps)
+                    if pbar2 is not None:
+                        pbar2.close()
                     final_energy = atoms2.get_potential_energy()
                     steps2 = optimizer2.get_number_of_steps()
                     num_steps += steps2
@@ -984,11 +1037,15 @@ class GGen:
                         )
 
                 except Exception as e:
+                    if pbar2 is not None:
+                        pbar2.close()
                     logger.warning("Stage 2 failed: %s. Using stage 1 result.", e)
 
             return optimized_structure, float(final_energy), int(num_steps)
 
         except Exception as e:
+            if pbar is not None:
+                pbar.close()
             logger.error("Geometry optimization failed: %s", e)
             try:
                 original_energy = float(atoms.get_potential_energy())
@@ -1035,6 +1092,8 @@ class GGen:
         optimization_max_steps: int = 400,
         optimization_fmax: float = 0.01,
         trajectory_interval: int = 5,
+        # Progress display
+        show_progress: bool = False,
     ) -> Dict[str, Any]:
         """Generate a crystal structure using PyXtal with enhanced stability and symmetry.
 
@@ -1083,6 +1142,7 @@ class GGen:
             optimization_fmax: Force convergence criterion (eV/Å). Default: 0.01.
             trajectory_interval: Steps between trajectory frame snapshots during
                 optimization. Set to 0 to disable intermediate frames. Default: 5.
+            show_progress: If True, show a tqdm progress bar during relaxation.
 
         Returns:
             Dictionary with structure metadata, CIF content, and generation statistics.
@@ -1105,6 +1165,7 @@ class GGen:
                 optimization_max_steps=optimization_max_steps,
                 optimization_fmax=optimization_fmax,
                 trajectory_interval=trajectory_interval,
+                show_progress=show_progress,
             )
         if num_trials < 1:
             raise ValueError("num_trials must be >= 1")
@@ -1364,6 +1425,8 @@ class GGen:
                 relax_cell=True,
                 trajectory_interval=trajectory_interval,
                 preserve_symmetry=preserve_symmetry,
+                show_progress=show_progress,
+                progress_desc=f"Relaxing {formula}",
             )
             logger.info(
                 "Optimization complete: %d steps, final energy=%.4f eV",
@@ -1398,6 +1461,8 @@ class GGen:
                             fmax=optimization_fmax,
                             relax_cell=True,
                             trajectory_interval=trajectory_interval,
+                            show_progress=show_progress,
+                            progress_desc=f"Re-relaxing {formula}",
                         )
                     )
                     optimization_steps += rerelax_steps
@@ -1505,6 +1570,7 @@ class GGen:
         optimization_max_steps: int,
         optimization_fmax: float,
         trajectory_interval: int,
+        show_progress: bool = False,
     ) -> Dict[str, Any]:
         """Internal iterative crystal generation (called when max_iterations > 1)."""
         logger.info(
@@ -1571,6 +1637,7 @@ class GGen:
                     optimization_max_steps=optimization_max_steps,
                     optimization_fmax=optimization_fmax,
                     trajectory_interval=trajectory_interval,
+                    show_progress=show_progress,
                 )
             except Exception as e:
                 logger.warning("Iteration %d failed: %s", iteration + 1, e)

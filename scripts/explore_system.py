@@ -102,6 +102,23 @@ def main():
     parser.add_argument(
         "--seed", type=int, default=None, help="Random seed for reproducibility"
     )
+    parser.add_argument(
+        "--workers",
+        "-j",
+        type=int,
+        default=1,
+        help="Number of parallel workers for structure generation (default: 1)",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable progress bar",
+    )
+    parser.add_argument(
+        "--keep-in-memory",
+        action="store_true",
+        help="Keep structures in memory (default: save to CIF and free memory)",
+    )
     parser.add_argument("--quiet", action="store_true", help="Suppress info logging")
 
     args = parser.parse_args()
@@ -135,6 +152,9 @@ def main():
         load_previous_runs=args.load_previous,
         skip_existing_formulas=args.skip_existing,
         preserve_symmetry=args.preserve_symmetry,
+        num_workers=args.workers,
+        show_progress=not args.no_progress,
+        keep_structures_in_memory=args.keep_in_memory,
     )
 
     # Log results
