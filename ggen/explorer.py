@@ -510,6 +510,7 @@ class ChemistryExplorer:
         crystal_systems: Optional[List[str]] = None,
         preserve_symmetry: bool = False,
         show_progress: bool = False,
+        relax_all_trials: bool = True,
     ) -> CandidateResult:
         """Generate and optimize a structure for a given stoichiometry.
 
@@ -524,6 +525,9 @@ class ChemistryExplorer:
             preserve_symmetry: If True, use symmetry-constrained relaxation to preserve
                 high symmetry during optimization.
             show_progress: If True, show tqdm progress bar during relaxation.
+            relax_all_trials: If True, relax ALL candidate structures and select the
+                one with lowest final energy. Uses torch-sim for GPU-batched parallel
+                relaxation. Default: True (recommended for best results).
 
         Returns:
             CandidateResult with structure and energy information.
@@ -556,6 +560,7 @@ class ChemistryExplorer:
                 refine_symmetry=not preserve_symmetry,  # Don't need refinement if preserving
                 preserve_symmetry=preserve_symmetry,
                 show_progress=show_progress,
+                relax_all_trials=relax_all_trials,
             )
 
             structure = ggen.get_structure()
@@ -1010,6 +1015,7 @@ class ChemistryExplorer:
         num_workers: int = 1,
         show_progress: bool = True,
         keep_structures_in_memory: bool = False,
+        relax_all_trials: bool = True,
     ) -> ExplorationResult:
         """Explore a chemical system by generating candidate structures.
 
@@ -1061,6 +1067,10 @@ class ChemistryExplorer:
             keep_structures_in_memory: If False (default), structures are saved to CIF
                 and cleared from memory to reduce memory usage. Set True to keep all
                 structures in memory (useful for small explorations or post-processing).
+            relax_all_trials: If True (default), relax ALL candidate structures for each
+                stoichiometry and select the one with lowest final energy. Uses torch-sim
+                for GPU-batched parallel relaxation. This produces better results than
+                the legacy approach of selecting by initial (unrelaxed) energy.
 
         Returns:
             ExplorationResult with all candidates, phase diagram, and stable phases.
@@ -1243,6 +1253,7 @@ class ChemistryExplorer:
                         crystal_systems=crystal_systems,
                         preserve_symmetry=preserve_symmetry,
                         show_progress=show_progress,
+                        relax_all_trials=relax_all_trials,
                     )
 
                     # If we have a previous structure and this one failed or is worse, use the previous

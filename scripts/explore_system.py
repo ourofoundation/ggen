@@ -94,6 +94,12 @@ def main():
         help="Preserve symmetry during optimization (default: True)",
     )
     parser.add_argument(
+        "--no-relax-all",
+        action="store_true",
+        default=False,
+        help="Disable relaxing all trials (use legacy initial-energy selection)",
+    )
+    parser.add_argument(
         "--e-above-hull",
         type=float,
         default=0.15,
@@ -155,6 +161,7 @@ def main():
         num_workers=args.workers,
         show_progress=not args.no_progress,
         keep_structures_in_memory=args.keep_in_memory,
+        relax_all_trials=not args.no_relax_all,
     )
 
     # Log results

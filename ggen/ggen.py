@@ -34,6 +34,13 @@ from .calculator import get_orb_calculator
 from .operations import Operations
 from .utils import parse_chemical_formula
 
+# ===================== TorchSim Integration =====================
+
+import torch
+import torch_sim as ts
+from torch_sim.models.orb import OrbModel as TorchSimOrbModel
+
+
 # ===================== Constants & Logging =====================
 
 # Generally 0.01–0.1 is common; this is domain-specific. Keep your original default.
@@ -904,11 +911,7 @@ class GGen:
                     and self.step_count % self._trajectory_interval == 0
                 ):
                     # FrechetCellFilter has .atoms
-                    a = (
-                        self.atoms.atoms
-                        if hasattr(self.atoms, "atoms")
-                        else self.atoms
-                    )
+                    a = self.atoms.atoms if hasattr(self.atoms, "atoms") else self.atoms
                     structure = _atoms_to_structure_wrapped(a)
                     self._ggen._add_trajectory_frame(
                         structure=structure,
@@ -1067,6 +1070,185 @@ class GGen:
                 )
             return self._current_structure, original_energy, 0
 
+    # -------------------- Batched relaxation (torch-sim) --------------------
+
+    def _batch_relax_candidates_torchsim(
+        self,
+        candidates: List[pyxtal],
+        max_steps: int = 200,
+        fmax: float = 0.02,
+        show_progress: bool = False,
+    ) -> List[Tuple[Structure, float, int]]:
+        """Relax multiple candidates in parallel using torch-sim.
+
+        This method uses torch-sim's batched GPU optimization to relax all
+        candidates simultaneously, providing significant speedup over sequential
+        relaxation.
+
+        Args:
+            candidates: List of PyXtal crystal objects to relax.
+            max_steps: Maximum optimization steps per structure.
+            fmax: Force convergence criterion (eV/Å).
+            show_progress: Whether to show progress bar.
+
+        Returns:
+            List of (relaxed_structure, final_energy, steps) tuples.
+        """
+        if not candidates:
+            return []
+
+        # Convert candidates to ASE atoms
+        atoms_list = [c.to_ase() for c in candidates]
+
+        # Get the raw ORB model from our calculator
+        # The ORBCalculator stores the model in .orbff attribute
+        if hasattr(self.calculator, "orbff"):
+            raw_model = self.calculator.orbff
+        elif hasattr(self.calculator, "model"):
+            raw_model = self.calculator.model
+        else:
+            raise AttributeError(
+                "Cannot extract ORB model from calculator. "
+                "Expected 'orbff' or 'model' attribute."
+            )
+
+        # Determine device
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Create torch-sim model wrapper
+        ts_model = TorchSimOrbModel(
+            model=raw_model,
+            compute_stress=True,
+            compute_forces=True,
+            device=device,
+        )
+
+        # Run batched optimization
+        logger.info(
+            "Starting batched relaxation of %d candidates using torch-sim (device=%s)",
+            len(atoms_list),
+            device,
+        )
+
+        # Use FIRE optimizer with cell filter
+        try:
+            final_state = ts.optimize(
+                system=atoms_list,
+                model=ts_model,
+                optimizer=ts.Optimizer.fire,
+                max_steps=max_steps,
+                autobatcher=True,  # Automatically handles GPU memory
+                init_kwargs={"cell_filter": ts.CellFilter.frechet},
+                pbar=show_progress,
+            )
+
+            # Extract results
+            results = []
+            final_atoms_list = final_state.to_atoms()
+            energies = final_state.energy.cpu().numpy()
+
+            for i, atoms in enumerate(final_atoms_list):
+                structure = _atoms_to_structure_wrapped(atoms)
+                energy = float(energies[i])
+                # torch-sim doesn't track steps per structure easily, estimate
+                steps = max_steps  # Conservative estimate
+                results.append((structure, energy, steps))
+
+            logger.info(
+                "Batched relaxation complete. Energies: min=%.4f, max=%.4f eV",
+                min(energies),
+                max(energies),
+            )
+
+            return results
+
+        except Exception as e:
+            logger.error(
+                "Batched relaxation failed: %s. Falling back to sequential.", e
+            )
+            # Fall back to sequential relaxation
+            return self._batch_relax_candidates_sequential(
+                candidates, max_steps, fmax, show_progress
+            )
+
+    def _batch_relax_candidates_sequential(
+        self,
+        candidates: List[pyxtal],
+        max_steps: int = 200,
+        fmax: float = 0.02,
+        show_progress: bool = False,
+    ) -> List[Tuple[Structure, float, int]]:
+        """Relax candidates sequentially (fallback when torch-sim unavailable).
+
+        Args:
+            candidates: List of PyXtal crystal objects to relax.
+            max_steps: Maximum optimization steps per structure.
+            fmax: Force convergence criterion (eV/Å).
+            show_progress: Whether to show progress bar.
+
+        Returns:
+            List of (relaxed_structure, final_energy, steps) tuples.
+        """
+        results = []
+
+        iterator = candidates
+        if show_progress:
+            iterator = tqdm(candidates, desc="Relaxing candidates", unit="struct")
+
+        for c in iterator:
+            try:
+                atoms = c.to_ase()
+                atoms.calc = self.calculator
+
+                filtered = FrechetCellFilter(atoms)
+                opt = LBFGS(filtered, logfile=None, maxstep=0.2)
+                opt.run(fmax=fmax, steps=max_steps)
+
+                structure = _atoms_to_structure_wrapped(atoms)
+                energy = float(atoms.get_potential_energy())
+                steps = opt.nsteps
+
+                results.append((structure, energy, steps))
+
+            except Exception as e:
+                logger.warning("Sequential relaxation failed for candidate: %s", e)
+                # Return unrelaxed with high energy
+                try:
+                    structure = c.to_pymatgen()
+                    atoms = c.to_ase()
+                    atoms.calc = self.calculator
+                    energy = float(atoms.get_potential_energy())
+                    results.append((structure, energy, 0))
+                except Exception:
+                    pass
+
+        return results
+
+    def _batch_relax_candidates(
+        self,
+        candidates: List[pyxtal],
+        max_steps: int = 200,
+        fmax: float = 0.02,
+        show_progress: bool = False,
+    ) -> List[Tuple[Structure, float, int]]:
+        """Relax multiple candidates in parallel using torch-sim.
+
+        Uses torch-sim's batched GPU optimization for significant speedup.
+        Falls back to sequential relaxation if batched fails.
+
+        Args:
+            candidates: List of PyXtal crystal objects to relax.
+            max_steps: Maximum optimization steps per structure.
+            fmax: Force convergence criterion (eV/Å).
+            show_progress: Whether to show progress bar.
+
+        Returns:
+            List of (relaxed_structure, final_energy, steps) tuples.
+        """
+        return self._batch_relax_candidates_torchsim(
+            candidates, max_steps, fmax, show_progress
+        )
+
     # -------------------- Crystal generation --------------------
 
     def generate_crystal(
@@ -1094,6 +1276,8 @@ class GGen:
         trajectory_interval: int = 5,
         # Progress display
         show_progress: bool = False,
+        # Parallel relaxation (new)
+        relax_all_trials: bool = False,
     ) -> Dict[str, Any]:
         """Generate a crystal structure using PyXtal with enhanced stability and symmetry.
 
@@ -1143,6 +1327,12 @@ class GGen:
             trajectory_interval: Steps between trajectory frame snapshots during
                 optimization. Set to 0 to disable intermediate frames. Default: 5.
             show_progress: If True, show a tqdm progress bar during relaxation.
+            relax_all_trials: If True, relax ALL candidate structures (not just the
+                best by initial energy) and select the one with lowest final energy.
+                This is more computationally expensive but produces better results,
+                as initial energy is a poor predictor of final relaxed energy.
+                Uses torch-sim for GPU-batched parallel relaxation if available.
+                Default: False (legacy behavior using initial energy scoring).
 
         Returns:
             Dictionary with structure metadata, CIF content, and generation statistics.
@@ -1391,19 +1581,6 @@ class GGen:
                 f"Compatible space groups: {[x['number'] for x in compatible]}"
             )
 
-        # Sort by combined score (lower is better)
-        all_candidates.sort(key=lambda x: x[1])
-        best_crystal, best_score, best_breakdown, best_sg = all_candidates[0]
-        structure = best_crystal.to_pymatgen()
-        final_energy = best_breakdown["energy"]
-        optimization_steps = 0
-
-        logger.info(
-            "Selected best candidate: SG %d, energy=%.4f eV, score=%.4f",
-            best_sg,
-            final_energy,
-            best_score,
-        )
         logger.info(
             "Generation stats: %d attempts → %d valid → %d passed filter → %d evaluated",
             generation_stats["total_attempts"],
@@ -1412,8 +1589,103 @@ class GGen:
             generation_stats["energy_evaluated"],
         )
 
-        # Geometry optimization
-        if optimize_geometry:
+        # New approach: relax ALL candidates and pick the best by final energy
+        if relax_all_trials and optimize_geometry:
+            logger.info(
+                "Relaxing all %d candidates in parallel (relax_all_trials=True)...",
+                len(all_candidates),
+            )
+
+            # Extract just the pyxtal objects
+            candidate_crystals = [c[0] for c in all_candidates]
+            candidate_sgs = [c[3] for c in all_candidates]
+
+            # Batch relax all candidates
+            relaxed_results = self._batch_relax_candidates(
+                candidate_crystals,
+                max_steps=optimization_max_steps,
+                fmax=optimization_fmax,
+                show_progress=show_progress,
+            )
+
+            # Find the best by final relaxed energy
+            if not relaxed_results:
+                raise ValueError("All candidates failed relaxation")
+
+            best_idx = min(
+                range(len(relaxed_results)), key=lambda i: relaxed_results[i][1]
+            )
+            structure, final_energy, optimization_steps = relaxed_results[best_idx]
+            best_sg = candidate_sgs[best_idx]
+            best_crystal = candidate_crystals[best_idx]  # Keep track for metadata
+            # For relax_all_trials, score is just final energy (no initial scoring used)
+            best_score = final_energy
+            best_breakdown = {
+                "energy": final_energy,
+                "symmetry_bonus": 0.0,
+                "wyckoff_penalty": 0.0,
+                "total": final_energy,
+                "space_group": best_sg,
+                "num_wyckoff_sites": len(best_crystal.atom_sites),
+                "selection_method": "relax_all_trials",
+            }
+
+            # Log comparison of initial vs final ranking
+            initial_energies = [c[2]["energy"] for c in all_candidates]
+            final_energies = [r[1] for r in relaxed_results]
+
+            initial_best_idx = min(
+                range(len(initial_energies)), key=lambda i: initial_energies[i]
+            )
+
+            logger.info(
+                "Selected best by FINAL energy: SG %d, energy=%.4f eV (was rank %d by initial energy)",
+                best_sg,
+                final_energy,
+                sorted(
+                    range(len(initial_energies)), key=lambda i: initial_energies[i]
+                ).index(best_idx)
+                + 1,
+            )
+
+            if initial_best_idx != best_idx:
+                logger.info(
+                    "Initial energy heuristic would have picked SG %d (final energy=%.4f eV, rank %d)",
+                    candidate_sgs[initial_best_idx],
+                    final_energies[initial_best_idx],
+                    sorted(
+                        range(len(final_energies)), key=lambda i: final_energies[i]
+                    ).index(initial_best_idx)
+                    + 1,
+                )
+
+            # Update internal state
+            self.set_structure(structure, add_to_trajectory=True)
+
+            # Store relaxation comparison in generation stats
+            generation_stats["relax_all_trials"] = True
+            generation_stats["num_relaxed"] = len(relaxed_results)
+            generation_stats["initial_best_idx"] = initial_best_idx
+            generation_stats["final_best_idx"] = best_idx
+            generation_stats["initial_picked_correct"] = initial_best_idx == best_idx
+
+        else:
+            # Legacy approach: sort by initial energy score, relax only the best
+            all_candidates.sort(key=lambda x: x[1])
+            best_crystal, best_score, best_breakdown, best_sg = all_candidates[0]
+            structure = best_crystal.to_pymatgen()
+            final_energy = best_breakdown["energy"]
+            optimization_steps = 0
+
+            logger.info(
+                "Selected best candidate by initial score: SG %d, energy=%.4f eV, score=%.4f",
+                best_sg,
+                final_energy,
+                best_score,
+            )
+
+        # Geometry optimization (only if not already done via relax_all_trials)
+        if optimize_geometry and not relax_all_trials:
             self.set_structure(structure, add_to_trajectory=True)
             logger.info(
                 "Starting geometry optimization%s...",
