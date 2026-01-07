@@ -1369,7 +1369,7 @@ class ChemistryExplorer:
                 as it shares structures across different chemical systems.
             compute_phonons: If True, compute phonon stability for each generated structure.
                 Default False - phonon calculations are expensive and can be run later
-                using the backfill_phonons.py script for structures of interest.
+                using the phonons.py script for structures of interest.
             phonon_supercell: Supercell dimensions for phonon calculations (if enabled).
                 Default (2,2,2).
 

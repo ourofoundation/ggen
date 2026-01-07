@@ -7,11 +7,11 @@ For example, Fe-Mn structures explored in Fe-Mn-Co will be reused when
 exploring Fe-Mn-Sn.
 
 Usage:
-    python explore_system.py Fe-Mn-Si
-    python explore_system.py Fe-Mn-Si --max-atoms 16 --num-trials 20
+    python explore.py Fe-Mn-Si
+    python explore.py Fe-Mn-Si --max-atoms 16 --num-trials 20
 
 Run multiple systems in parallel:
-    parallel python explore_system.py ::: Fe-Mn-Si Li-Co-O Fe-Sn-B
+    parallel python explore.py ::: Fe-Mn-Si Li-Co-O Fe-Sn-B
 """
 
 import argparse

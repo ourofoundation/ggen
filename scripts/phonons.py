@@ -6,16 +6,16 @@ Focuses on low-energy entries near the convex hull that don't have phonon data y
 
 Usage:
     # Backfill all systems, entries within 100 meV of hull
-    python backfill_phonons.py
+    python phonons.py
 
     # Specific chemical system
-    python backfill_phonons.py --system Fe-Mn-Co
+    python phonons.py --system Fe-Mn-Co
 
     # Only entries on the hull (0 meV)
-    python backfill_phonons.py --e-above-hull 0.0
+    python phonons.py --e-above-hull 0.0
 
     # Limit number of structures to process
-    python backfill_phonons.py --max-structures 10
+    python phonons.py --max-structures 10
 """
 
 import argparse

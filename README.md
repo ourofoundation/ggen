@@ -28,16 +28,16 @@ GGen is designed for command-line exploration of chemical systems. The typical w
 
 ```bash
 # Explore the Fe-Mn-Si ternary system
-python scripts/explore_system.py Fe-Mn-Si
+python scripts/explore.py Fe-Mn-Si
 
 # Control search depth
-python scripts/explore_system.py Fe-Mn-Si --max-atoms 24 --num-trials 25
+python scripts/explore.py Fe-Mn-Si --max-atoms 24 --num-trials 25
 
 # Focus on specific crystal systems
-python scripts/explore_system.py Li-Co-O --crystal-systems hexagonal trigonal
+python scripts/explore.py Li-Co-O --crystal-systems hexagonal trigonal
 
 # Faster exploration with parallel workers
-python scripts/explore_system.py Fe-Sn-B -j 4
+python scripts/explore.py Fe-Sn-B -j 4
 ```
 
 **What happens:** GGen enumerates all stoichiometries up to `--max-atoms` (default: 20), generates `--num-trials` candidate structures per stoichiometry (default: 15), and relaxes each using the ORB force field. Results are stored in a unified SQLite database that persists across runs—structures from Fe-Mn explored in one run are automatically reused when you explore Fe-Mn-Co later.
@@ -70,7 +70,7 @@ Stable/Near-Stable Phases (E_hull < 150 meV/atom)
 ### CLI Options Reference
 
 ```bash
-python scripts/explore_system.py --help
+python scripts/explore.py --help
 ```
 
 | Option | Default | Description |
@@ -97,25 +97,25 @@ Since phonon calculations can be expensive (~10s per structure), GGen separates 
 
 ```bash
 # First, explore quickly (no phonons)
-python scripts/explore_system.py Zn-Cu-Sn
+python scripts/explore.py Zn-Cu-Sn
 
 # Then compute phonons for promising candidates
-python scripts/backfill_phonons.py --e-above-hull 0.1
+python scripts/phonons.py --e-above-hull 0.1
 
 # Target a specific system
-python scripts/backfill_phonons.py --system Zn-Cu-Sn --e-above-hull 0.05
+python scripts/phonons.py --system Zn-Cu-Sn --e-above-hull 0.05
 
 # Preview what would be computed
-python scripts/backfill_phonons.py --dry-run
+python scripts/phonons.py --dry-run
 
 # Limit the batch size
-python scripts/backfill_phonons.py --max-structures 20
+python scripts/phonons.py --max-structures 20
 ```
 
 If you want phonons computed during exploration (slower but all-in-one):
 
 ```bash
-python scripts/explore_system.py Zn-Cu-Sn --compute-phonons
+python scripts/explore.py Zn-Cu-Sn --compute-phonons
 ```
 
 **Interpreting results:**
@@ -123,12 +123,118 @@ python scripts/explore_system.py Zn-Cu-Sn --compute-phonons
 - `dyn:✗` — Dynamically unstable (imaginary modes present) → would distort
 - `dyn:?` — Not yet tested
 
+### Exporting Candidates
+
+Export the best candidates as CIF files for further analysis or DFT validation:
+
+```bash
+# Export top 10 dynamically stable candidates
+python scripts/export.py Co-Fe-Mn -n 10
+
+# Filter by crystal system
+python scripts/export.py Co-Fe-Mn -c tetragonal
+
+# Export more candidates with energy cutoff
+python scripts/export.py Co-Fe-Mn -n 50 --max-ehull 0.1
+
+# Include dynamically unstable structures
+python scripts/export.py Co-Fe-Mn --include-unstable
+
+# Custom output directory
+python scripts/export.py Co-Fe-Mn -o ./my_export/
+```
+
+**Output directories are auto-generated based on filters:**
+```
+exports/Co-Fe-Mn/                      # default
+exports/Co-Fe-Mn-tetragonal/           # with -c tetragonal
+exports/Co-Fe-Mn-50meV/                # with --max-ehull 0.05
+exports/Co-Fe-Mn-cubic-100meV/         # combined filters
+```
+
+**Each export includes:**
+- CIF files named `formula_spacegroup_ehull.cif` (e.g., `Co3FeMn2_P4-mmm_0meV.cif`)
+- `metadata.json` with full details for each structure
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-n`, `--top` | 10 | Number of candidates to export |
+| `-o`, `--output` | auto | Output directory |
+| `-c`, `--crystal-system` | all | Filter: `cubic`, `tetragonal`, etc. |
+| `--max-ehull` | none | Maximum energy above hull (eV/atom) |
+| `--include-unstable` | off | Include dynamically unstable structures |
+| `--no-metadata` | off | Skip writing metadata.json |
+
+### Generating Reports
+
+Query the database for statistics and structure lists:
+
+```bash
+# Summary report for a system
+python scripts/report.py Co-Fe-Mn
+
+# List all explored systems with stats
+python scripts/report.py --list
+
+# Show only on-hull structures
+python scripts/report.py Co-Fe-Mn --stable
+
+# Show fully stable (on-hull + phonon stable)
+python scripts/report.py Co-Fe-Mn --fully-stable
+
+# Filter by crystal system
+python scripts/report.py Co-Fe-Mn -c tetragonal
+
+# Filter by space group
+python scripts/report.py Co-Fe-Mn -s Fm-3m
+python scripts/report.py Co-Fe-Mn -s 225
+
+# Show stability breakdown
+python scripts/report.py Co-Fe-Mn --breakdown
+
+# Find structures needing phonon calculations
+python scripts/report.py Co-Fe-Mn --untested phonon
+
+# Export as JSON
+python scripts/report.py Co-Fe-Mn --json > report.json
+```
+
+**Example output:**
+```
+Co-Fe-Mn
+──────────────────────────────────────────────────
+  1052 structures, 847 unique formulas
+
+Stability (near = within 150 meV)
+  Hull:    42 on hull, 215 near, 795 far, 0 untested
+  Phonon:  377 stable, 412 unstable (263 untested)
+  → 38 fully stable (hull + phonon), 127 near-hull stable
+
+Crystal Systems
+  cubic        ████       156 (14.8%)
+  tetragonal   ███        102 ( 9.7%)
+  orthorhombic ████████   298 (28.3%)
+  ...
+```
+
+| Option | Description |
+|--------|-------------|
+| `--list`, `-l` | List all systems in database with summary stats |
+| `--stable` | Show on-hull structures |
+| `--fully-stable` | Show structures that are on-hull AND phonon-stable |
+| `-c`, `--crystal-system` | Filter by crystal system |
+| `-s`, `--space-group` | Filter by space group (number or symbol) |
+| `--breakdown` | Show stability category breakdown |
+| `--untested` | Show structures missing `phonon` or `hull` tests |
+| `--json`, `-j` | Output full report as JSON |
+| `--near-hull-cutoff` | Energy cutoff for "near hull" (default: 0.15 eV) |
+
 ### Running Multiple Systems
 
 Use GNU parallel to explore multiple systems concurrently:
 
 ```bash
-parallel python scripts/explore_system.py ::: Fe-Mn-Si Li-Co-O Zn-Sn-Cu Na-P-S
+parallel python scripts/explore.py ::: Fe-Mn-Si Li-Co-O Zn-Sn-Cu Na-P-S
 ```
 
 Each run shares the unified database, so common subsystems (e.g., Fe-Mn) are explored once and reused.

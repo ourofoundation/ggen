@@ -118,16 +118,16 @@ result = ggen.generate_crystal(
 |--------|---------|-----------|
 | `GGen.generate_crystal()` | `False` | Backward compatibility |
 | `ChemistryExplorer.explore()` | `True` | Better results for exploration |
-| `explore_system.py` CLI | `True` | Better phase diagrams |
+| `explore.py` CLI | `True` | Better phase diagrams |
 
 ### CLI Usage
 
 ```bash
 # New default (relax all trials)
-python scripts/explore_system.py Fe-Mn-Si
+python scripts/explore.py Fe-Mn-Si
 
 # Legacy behavior (faster but worse)
-python scripts/explore_system.py Fe-Mn-Si --no-relax-all
+python scripts/explore.py Fe-Mn-Si --no-relax-all
 ```
 
 ---

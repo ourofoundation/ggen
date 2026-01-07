@@ -20,6 +20,7 @@ from .phonons import (
     find_first_stable_candidate,
     select_stable_candidate,
 )
+from .report import SystemExplorer, SystemReport, StabilityStats, SpaceGroupStats
 from .utils import parse_chemical_formula
 
 __version__ = "0.1.0"
@@ -37,6 +38,11 @@ __all__ = [
     "StructureDatabase",
     "StoredStructure",
     "ExplorationRun",
+    # Reporting / Analysis
+    "SystemExplorer",
+    "SystemReport",
+    "StabilityStats",
+    "SpaceGroupStats",
     # Operations
     "Operations",
     "MutationError",
