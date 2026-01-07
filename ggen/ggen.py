@@ -1834,6 +1834,7 @@ class GGen:
 
         resp: Dict[str, Any] = {
             "formula": formula,
+            "structure": structure,
             "requested_space_group": space_group,
             "selected_space_group": best_sg,
             "space_group_randomly_selected": was_randomly_selected,
@@ -2572,6 +2573,22 @@ class GGen:
             if self._current_structure is not None
             else None
         )
+
+    def calculate_energy(self) -> float:
+        """Calculate the potential energy of the current structure.
+
+        Returns:
+            Energy in eV.
+
+        Raises:
+            ValueError: If no structure is set.
+        """
+        if self._current_structure is None:
+            raise ValueError("No structure set. Call generate_crystal() or set_structure() first.")
+
+        atoms = _atoms_from_structure(self._current_structure)
+        atoms.calc = self.calculator
+        return atoms.get_potential_energy()
 
     def load_structure_from_file(self, file_url: str, filename: str) -> None:
         resp = requests.get(file_url, timeout=30)
