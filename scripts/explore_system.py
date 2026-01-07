@@ -120,14 +120,8 @@ def main():
     parser.add_argument(
         "--skip-existing",
         action="store_true",
-        default=True,
-        help="Skip formulas that already exist in database (default: True)",
-    )
-    parser.add_argument(
-        "--no-skip-existing",
-        action="store_false",
-        dest="skip_existing",
-        help="Regenerate all formulas even if they exist in database",
+        default=False,
+        help="Skip formulas that already exist in database",
     )
     parser.add_argument(
         "--no-optimize",

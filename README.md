@@ -84,7 +84,7 @@ python scripts/explore_system.py --help
 | `--e-above-hull` | 0.15 | Energy cutoff (eV) for "stable" phases |
 | `--compute-phonons` | off | Run phonon calculations during exploration |
 | `--hide-unstable` | off | Hide dynamically unstable phases from output |
-| `--no-skip-existing` | — | Regenerate all formulas (ignore database) |
+| `--skip-existing` | off | Skip formulas that already exist in database |
 | `--db-path` | ./ggen.db | Path to unified structure database |
 | `--output-dir` | ./runs | Directory for CIF files and plots |
 | `--seed` | random | Random seed for reproducibility |

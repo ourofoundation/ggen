@@ -55,6 +55,7 @@ def _generate_structure_worker(args: Dict[str, Any]) -> Dict[str, Any]:
     crystal_systems = args["crystal_systems"]
     preserve_symmetry = args["preserve_symmetry"]
     random_seed = args["random_seed"]
+    relax_all_trials = args.get("relax_all_trials", True)
 
     # Build formula string
     formula = "".join(
@@ -82,6 +83,7 @@ def _generate_structure_worker(args: Dict[str, Any]) -> Dict[str, Any]:
             crystal_systems=crystal_systems,
             refine_symmetry=not preserve_symmetry,
             preserve_symmetry=preserve_symmetry,
+            relax_all_trials=relax_all_trials,
         )
 
         structure = ggen.get_structure()
@@ -1150,6 +1152,7 @@ class ChemistryExplorer:
         show_progress: bool,
         keep_structures_in_memory: bool,
         interrupted_flag,
+        relax_all_trials: bool = True,
         compute_phonons: bool = False,
         phonon_supercell: Tuple[int, int, int] = (2, 2, 2),
     ) -> Tuple[List[CandidateResult], int, int]:
@@ -1169,6 +1172,7 @@ class ChemistryExplorer:
                     "crystal_systems": crystal_systems,
                     "preserve_symmetry": preserve_symmetry,
                     "random_seed": self.random_seed,
+                    "relax_all_trials": relax_all_trials,
                 }
             )
 
@@ -1592,6 +1596,7 @@ class ChemistryExplorer:
                     show_progress=show_progress,
                     keep_structures_in_memory=keep_structures_in_memory,
                     interrupted_flag=lambda: interrupted,
+                    relax_all_trials=relax_all_trials,
                     compute_phonons=compute_phonons,
                     phonon_supercell=phonon_supercell,
                 )

@@ -853,12 +853,19 @@ class GGen:
         # Apply symmetry constraint if requested
         if preserve_symmetry:
             try:
-                sym_constraint = FixSymmetry(
-                    atoms,
-                    symprec=symmetry_symprec,
-                    adjust_positions=True,
-                    adjust_cell=True,
-                )
+                # Suppress FixSymmetry adjust_cell warning
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message="FixSymmetry adjust_cell may be ill behaved",
+                        category=UserWarning,
+                    )
+                    sym_constraint = FixSymmetry(
+                        atoms,
+                        symprec=symmetry_symprec,
+                        adjust_positions=True,
+                        adjust_cell=True,
+                    )
                 atoms.set_constraint(sym_constraint)
                 logger.info(
                     "Symmetry constraint applied (symprec=%.4f) - forces will be projected "
@@ -932,7 +939,14 @@ class GGen:
         )
 
         try:
-            optimizer.run(fmax=fmax, steps=max_steps)
+            # Suppress FixSymmetry adjust_cell warning during optimization
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="FixSymmetry adjust_cell may be ill behaved",
+                    category=UserWarning,
+                )
+                optimizer.run(fmax=fmax, steps=max_steps)
             if pbar is not None:
                 pbar.close()
             final_energy = atoms.get_potential_energy()
@@ -2584,7 +2598,9 @@ class GGen:
             ValueError: If no structure is set.
         """
         if self._current_structure is None:
-            raise ValueError("No structure set. Call generate_crystal() or set_structure() first.")
+            raise ValueError(
+                "No structure set. Call generate_crystal() or set_structure() first."
+            )
 
         atoms = _atoms_from_structure(self._current_structure)
         atoms.calc = self.calculator
