@@ -1150,6 +1150,7 @@ class ChemistryExplorer:
         show_progress: bool,
         keep_structures_in_memory: bool,
         interrupted_flag,
+        compute_phonons: bool = False,
         phonon_supercell: Tuple[int, int, int] = (2, 2, 2),
     ) -> Tuple[List[CandidateResult], int, int]:
         """Generate structures in parallel using ProcessPoolExecutor.
@@ -1238,12 +1239,13 @@ class ChemistryExplorer:
                         candidate.cif_path = cif_path
                         num_successful += 1
 
-                        # Calculate phonon stability
-                        self._calculate_phonon_stability(
-                            candidate,
-                            supercell=phonon_supercell,
-                            show_progress=False,  # Don't show individual progress in parallel mode
-                        )
+                        # Calculate phonon stability if enabled
+                        if compute_phonons:
+                            self._calculate_phonon_stability(
+                                candidate,
+                                supercell=phonon_supercell,
+                                show_progress=False,  # Don't show individual progress in parallel mode
+                            )
 
                         # Clear structure from memory if not needed
                         if not keep_structures_in_memory:
@@ -1302,6 +1304,7 @@ class ChemistryExplorer:
         keep_structures_in_memory: bool = False,
         relax_all_trials: bool = True,
         use_unified_database: bool = True,
+        compute_phonons: bool = False,
         phonon_supercell: Tuple[int, int, int] = (2, 2, 2),
     ) -> ExplorationResult:
         """Explore a chemical system by generating candidate structures.
@@ -1313,7 +1316,8 @@ class ChemistryExplorer:
         4. Generates and optimizes structures for each (skipping already-explored ones)
         5. Stores all data in SQLite and CIF files
         6. Builds a phase diagram
-        7. Returns stable candidates
+        7. Optionally tests dynamical stability via phonon calculations
+        8. Returns stable candidates
 
         Supports graceful interruption with Ctrl+C - partial results will be saved.
 
@@ -1363,9 +1367,11 @@ class ChemistryExplorer:
                 example, when exploring Fe-Mn-Co, this will load existing Fe, Mn, Co,
                 Fe-Mn, Fe-Co, Mn-Co structures. This is more powerful than load_previous_runs
                 as it shares structures across different chemical systems.
-            phonon_supercell: Supercell dimensions for phonon calculations to test
-                dynamical stability. Default (2,2,2). Phonon calculations are performed
-                after each candidate is generated and relaxed.
+            compute_phonons: If True, compute phonon stability for each generated structure.
+                Default False - phonon calculations are expensive and can be run later
+                using the backfill_phonons.py script for structures of interest.
+            phonon_supercell: Supercell dimensions for phonon calculations (if enabled).
+                Default (2,2,2).
 
         Returns:
             ExplorationResult with all candidates, phase diagram, and stable phases.
@@ -1586,6 +1592,7 @@ class ChemistryExplorer:
                     show_progress=show_progress,
                     keep_structures_in_memory=keep_structures_in_memory,
                     interrupted_flag=lambda: interrupted,
+                    compute_phonons=compute_phonons,
                     phonon_supercell=phonon_supercell,
                 )
             else:
@@ -1636,12 +1643,13 @@ class ChemistryExplorer:
                         candidate.cif_path = cif_path
                         num_successful += 1
 
-                        # Calculate phonon stability
-                        self._calculate_phonon_stability(
-                            candidate,
-                            supercell=phonon_supercell,
-                            show_progress=show_progress,
-                        )
+                        # Calculate phonon stability if enabled
+                        if compute_phonons:
+                            self._calculate_phonon_stability(
+                                candidate,
+                                supercell=phonon_supercell,
+                                show_progress=show_progress,
+                            )
 
                         # Clear structure from memory if not needed
                         if not keep_structures_in_memory:
@@ -1831,7 +1839,7 @@ class ChemistryExplorer:
                 )
 
         # Backfill: Check hull/near-hull entries for missing stability data
-        if not interrupted and hull_entries:
+        if compute_phonons and not interrupted and hull_entries:
             self._backfill_stability_for_hull_entries(
                 candidates=candidates,
                 hull_entries=hull_entries,

@@ -154,6 +154,16 @@ def main():
         help="Energy above hull cutoff in eV/atom for stable phases (default: 0.15)",
     )
     parser.add_argument(
+        "--hide-unstable",
+        action="store_true",
+        help="Hide dynamically unstable phases from the stable phases list",
+    )
+    parser.add_argument(
+        "--compute-phonons",
+        action="store_true",
+        help="Compute phonon stability during exploration (expensive, off by default)",
+    )
+    parser.add_argument(
         "--seed", type=int, default=None, help="Random seed for reproducibility"
     )
     parser.add_argument(
@@ -267,6 +277,7 @@ def main():
         keep_structures_in_memory=args.keep_in_memory,
         relax_all_trials=not args.no_relax_all,
         use_unified_database=True,
+        compute_phonons=args.compute_phonons,
     )
 
     # Get stats AFTER exploration
@@ -341,12 +352,23 @@ def main():
                 new_formulas.add(candidate.formula)
 
     if stable_from_db:
+        # Filter out dynamically unstable phases if requested
+        if args.hide_unstable:
+            phases_to_show = [
+                s for s in stable_from_db if s.is_dynamically_stable is not False
+            ]
+            hidden_count = len(stable_from_db) - len(phases_to_show)
+        else:
+            phases_to_show = stable_from_db
+            hidden_count = 0
+
         logger.info("")
-        logger.info(
-            f"{C.BOLD}Stable/Near-Stable Phases (E_hull < {args.e_above_hull * 1000:.0f} meV/atom){C.RESET}"
-        )
+        title = f"Stable/Near-Stable Phases (E_hull < {args.e_above_hull * 1000:.0f} meV/atom)"
+        if args.hide_unstable and hidden_count > 0:
+            title += f" [{hidden_count} unstable hidden]"
+        logger.info(f"{C.BOLD}{title}{C.RESET}")
         logger.info(f"{C.DIM}{'-' * 60}{C.RESET}")
-        for s in stable_from_db:
+        for s in phases_to_show:
             e_above = s.e_above_hull if s.e_above_hull is not None else 0
             # Color code: green for newly generated in this run, blue for from db
             if s.formula in new_formulas:
@@ -367,7 +389,7 @@ def main():
                 f"  {formula_color}{s.formula:12s}{C.RESET}  "
                 f"E={s.energy_per_atom:.4f} eV/atom  "
                 f"SG={s.space_group_symbol:10s}  "
-                f"E_hull={e_above * 1000:.1f} meV  "
+                f"E_hull={e_above * 1000:5.1f} meV  "
                 f"{dyn_status}  "
                 f"{C.DIM}{marker}{C.RESET}"
             )
