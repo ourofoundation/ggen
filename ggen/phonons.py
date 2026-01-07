@@ -25,6 +25,8 @@ from pymatgen.core import Structure
 
 # Suppress spglib deprecation warnings (phonopy uses old dict interface internally)
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="spglib")
+# Suppress seekpath deprecation warnings (phonopy uses old dict interface internally)
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="seekpath")
 
 logger = logging.getLogger(__name__)
 
