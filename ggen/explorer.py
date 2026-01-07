@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import multiprocessing as mp
 import signal
 import sqlite3
 import warnings
@@ -1176,8 +1177,10 @@ class ChemistryExplorer:
                 }
             )
 
-        # Use ProcessPoolExecutor for parallel generation
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # Use ProcessPoolExecutor with spawn context for CUDA compatibility
+        # (fork on Linux copies CUDA context which causes conflicts)
+        ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as executor:
             # Submit all tasks
             future_to_args = {
                 executor.submit(_generate_structure_worker, args): (
