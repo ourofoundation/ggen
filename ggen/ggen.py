@@ -1090,7 +1090,7 @@ class GGen:
     def _batch_relax_candidates_torchsim(
         self,
         candidates: List[pyxtal],
-        max_steps: int = 200,
+        max_steps: int = 400,
         fmax: float = 0.02,
         show_progress: bool = False,
     ) -> List[Tuple[Structure, float, int]]:
@@ -1145,7 +1145,7 @@ class GGen:
             device,
         )
 
-        # Use FIRE optimizer with cell filter
+        # Use FIRE optimizer with cell filter and force convergence
         try:
             final_state = ts.optimize(
                 system=atoms_list,
@@ -1154,7 +1154,8 @@ class GGen:
                 max_steps=max_steps,
                 autobatcher=False,  # Skip slow memory estimation
                 init_kwargs={"cell_filter": ts.CellFilter.frechet},
-                pbar=show_progress,
+                convergence_fn=ts.generate_force_convergence_fn(force_tol=fmax),
+                pbar={"leave": False} if show_progress else False,
             )
 
             # Extract results
@@ -1189,7 +1190,7 @@ class GGen:
     def _batch_relax_candidates_sequential(
         self,
         candidates: List[pyxtal],
-        max_steps: int = 200,
+        max_steps: int = 400,
         fmax: float = 0.02,
         show_progress: bool = False,
     ) -> List[Tuple[Structure, float, int]]:
@@ -1291,8 +1292,6 @@ class GGen:
         trajectory_interval: int = 5,
         # Progress display
         show_progress: bool = False,
-        # Parallel relaxation (new)
-        relax_all_trials: bool = False,
     ) -> Dict[str, Any]:
         """Generate a crystal structure using PyXtal with enhanced stability and symmetry.
 
@@ -1342,12 +1341,6 @@ class GGen:
             trajectory_interval: Steps between trajectory frame snapshots during
                 optimization. Set to 0 to disable intermediate frames. Default: 5.
             show_progress: If True, show a tqdm progress bar during relaxation.
-            relax_all_trials: If True, relax ALL candidate structures (not just the
-                best by initial energy) and select the one with lowest final energy.
-                This is more computationally expensive but produces better results,
-                as initial energy is a poor predictor of final relaxed energy.
-                Uses torch-sim for GPU-batched parallel relaxation if available.
-                Default: False (legacy behavior using initial energy scoring).
 
         Returns:
             Dictionary with structure metadata, CIF content, and generation statistics.
@@ -1630,13 +1623,15 @@ class GGen:
                 generation_stats["energy_evaluated"],
             )
 
-        # New approach: relax ALL candidates and pick the best by final energy
-        if relax_all_trials and optimize_geometry:
-            # Extract just the pyxtal objects
-            candidate_crystals = [c[0] for c in all_candidates]
-            candidate_sgs = [c[3] for c in all_candidates]
+        # Track additional relaxed trials (polymorphs) for database storage
+        all_relaxed_trials: List[Dict[str, Any]] = []
 
-            # Batch relax all candidates
+        # Extract candidate info
+        candidate_crystals = [c[0] for c in all_candidates]
+        candidate_sgs = [c[3] for c in all_candidates]
+
+        if optimize_geometry:
+            # Batch relax ALL candidates and pick the best by final energy
             relaxed_results = self._batch_relax_candidates(
                 candidate_crystals,
                 max_steps=optimization_max_steps,
@@ -1653,8 +1648,7 @@ class GGen:
             )
             structure, final_energy, optimization_steps = relaxed_results[best_idx]
             best_sg = candidate_sgs[best_idx]
-            best_crystal = candidate_crystals[best_idx]  # Keep track for metadata
-            # For relax_all_trials, score is just final energy (no initial scoring used)
+            best_crystal = candidate_crystals[best_idx]
             best_score = final_energy
             best_breakdown = {
                 "energy": final_energy,
@@ -1663,7 +1657,7 @@ class GGen:
                 "total": final_energy,
                 "space_group": best_sg,
                 "num_wyckoff_sites": len(best_crystal.atom_sites),
-                "selection_method": "relax_all_trials",
+                "selection_method": "batch_relax_all",
             }
 
             # Log comparison of initial vs final ranking
@@ -1698,15 +1692,44 @@ class GGen:
             # Update internal state
             self.set_structure(structure, add_to_trajectory=True)
 
-            # Store relaxation comparison in generation stats
-            generation_stats["relax_all_trials"] = True
+            # Store relaxation stats
             generation_stats["num_relaxed"] = len(relaxed_results)
             generation_stats["initial_best_idx"] = initial_best_idx
             generation_stats["final_best_idx"] = best_idx
             generation_stats["initial_picked_correct"] = initial_best_idx == best_idx
 
+            # Collect all relaxed trials (excluding the best, which is returned separately)
+            # These are valuable polymorphs that can be saved to the database
+            for idx, (trial_struct, trial_energy, trial_steps) in enumerate(
+                relaxed_results
+            ):
+                if idx == best_idx:
+                    continue  # Skip the best - it's the main return value
+
+                # Get final symmetry after relaxation
+                try:
+                    trial_spg = SpacegroupAnalyzer(trial_struct, symprec=SYMPREC)
+                    trial_sg_num = trial_spg.get_space_group_number()
+                    trial_sg_sym = trial_spg.get_space_group_symbol()
+                except Exception:
+                    trial_sg_num = candidate_sgs[idx]
+                    trial_sg_sym = "?"
+
+                all_relaxed_trials.append(
+                    {
+                        "structure": trial_struct,
+                        "energy": trial_energy,
+                        "energy_per_atom": trial_energy / len(trial_struct),
+                        "num_atoms": len(trial_struct),
+                        "space_group_number": trial_sg_num,
+                        "space_group_symbol": trial_sg_sym,
+                        "original_space_group": candidate_sgs[idx],
+                        "optimization_steps": trial_steps,
+                    }
+                )
+
         else:
-            # Legacy approach: sort by initial energy score, relax only the best
+            # No geometry optimization - just pick best by initial energy score
             all_candidates.sort(key=lambda x: x[1])
             best_crystal, best_score, best_breakdown, best_sg = all_candidates[0]
             structure = best_crystal.to_pymatgen()
@@ -1720,74 +1743,48 @@ class GGen:
                 best_score,
             )
 
-        # Geometry optimization (only if not already done via relax_all_trials)
-        if optimize_geometry and not relax_all_trials:
-            self.set_structure(structure, add_to_trajectory=True)
-            logger.info(
-                "Starting geometry optimization%s...",
-                " (symmetry-preserving)" if preserve_symmetry else "",
+        # Post-relaxation symmetry refinement
+        if optimize_geometry and refine_symmetry and not preserve_symmetry:
+            logger.info("Attempting post-relaxation symmetry refinement...")
+            refined_struct, refined_sg, refined_symbol = (
+                self._refine_to_higher_symmetry(structure)
             )
-            structure, final_energy, optimization_steps = self.optimize_geometry(
-                max_steps=optimization_max_steps,
-                fmax=optimization_fmax,
-                relax_cell=True,
-                trajectory_interval=trajectory_interval,
-                preserve_symmetry=preserve_symmetry,
-                show_progress=show_progress,
-                progress_desc=f"Relaxing {formula}",
-            )
-            logger.info(
-                "Optimization complete: %d steps, final energy=%.4f eV",
-                optimization_steps,
-                final_energy,
-            )
+            if refined_sg > 1:
+                original_atoms = len(structure)
+                refined_atoms = len(refined_struct)
 
-            # Symmetry refinement after relaxation (only if not using preserve_symmetry)
-            if refine_symmetry and not preserve_symmetry:
-                logger.info("Attempting post-relaxation symmetry refinement...")
-                refined_struct, refined_sg, refined_symbol = (
-                    self._refine_to_higher_symmetry(structure)
+                # Symmetry refinement moves atoms to ideal positions, which may
+                # introduce strain. Do a quick re-relaxation to ensure we're at
+                # a true local minimum with correct energy.
+                logger.info(
+                    "Re-relaxing after symmetry refinement (%d -> %d atoms)...",
+                    original_atoms,
+                    refined_atoms,
                 )
-                if refined_sg > 1:
-                    original_atoms = len(structure)
-                    refined_atoms = len(refined_struct)
+                self.set_structure(refined_struct, add_to_trajectory=False)
+                refined_struct, final_energy, rerelax_steps = self.optimize_geometry(
+                    max_steps=min(100, optimization_max_steps),  # Quick re-relax
+                    fmax=optimization_fmax,
+                    relax_cell=True,
+                    trajectory_interval=trajectory_interval,
+                    show_progress=show_progress,
+                    progress_desc=f"Re-relaxing {formula}",
+                )
+                optimization_steps += rerelax_steps
+                logger.info(
+                    "Post-refinement relaxation: %d steps, energy=%.4f eV",
+                    rerelax_steps,
+                    final_energy,
+                )
 
-                    # Symmetry refinement moves atoms to ideal positions, which may
-                    # introduce strain. Do a quick re-relaxation to ensure we're at
-                    # a true local minimum with correct energy.
-                    logger.info(
-                        "Re-relaxing after symmetry refinement (%d -> %d atoms)...",
-                        original_atoms,
-                        refined_atoms,
-                    )
-                    self.set_structure(refined_struct, add_to_trajectory=False)
-                    refined_struct, final_energy, rerelax_steps = (
-                        self.optimize_geometry(
-                            max_steps=min(
-                                100, optimization_max_steps
-                            ),  # Quick re-relax
-                            fmax=optimization_fmax,
-                            relax_cell=True,
-                            trajectory_interval=trajectory_interval,
-                            show_progress=show_progress,
-                            progress_desc=f"Re-relaxing {formula}",
-                        )
-                    )
-                    optimization_steps += rerelax_steps
-                    logger.info(
-                        "Post-refinement relaxation: %d steps, energy=%.4f eV",
-                        rerelax_steps,
-                        final_energy,
-                    )
-
-                    structure = refined_struct
-                    logger.info(
-                        "Symmetry refinement successful: %s (#%d)",
-                        refined_symbol,
-                        refined_sg,
-                    )
-                else:
-                    logger.info("No higher symmetry detected after relaxation")
+                structure = refined_struct
+                logger.info(
+                    "Symmetry refinement successful: %s (#%d)",
+                    refined_symbol,
+                    refined_sg,
+                )
+            else:
+                logger.info("No higher symmetry detected after relaxation")
 
         # Final structure and analysis
         self.set_structure(structure, add_to_trajectory=not optimize_geometry)
@@ -1868,6 +1865,8 @@ class GGen:
             "filename": filename,
             "name": name,
             "description": description,
+            # Additional relaxed trials (polymorphs) - populated when optimize_geometry=True
+            "all_relaxed_trials": all_relaxed_trials,
         }
         if optimize_geometry:
             resp["optimization_steps"] = optimization_steps

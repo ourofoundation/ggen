@@ -59,7 +59,7 @@ class PhononResult:
     min_imaginary_frequency: Optional[float] = None
     frequencies: Optional[np.ndarray] = None
     band_structure_plot: Optional[str] = None
-    supercell: Tuple[int, int, int] = (2, 2, 2)
+    supercell: Tuple[int, int, int] = (3, 3, 3)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -133,7 +133,7 @@ def _structure_to_ase(structure: Structure) -> Atoms:
 def calculate_phonons(
     structure: Union[Structure, Atoms],
     calculator,
-    supercell: Tuple[int, int, int] = (2, 2, 2),
+    supercell: Tuple[int, int, int] = (3, 3, 3),
     displacement_distance: float = 0.01,
     imaginary_threshold: float = -0.3,
     generate_plot: bool = False,
@@ -150,7 +150,7 @@ def calculate_phonons(
         calculator: ASE calculator for force calculations.
         supercell: Supercell dimensions for phonon calculation.
             Larger supercells give more accurate phonons but are more expensive.
-            Default (2,2,2) is usually sufficient for stability checks.
+            Default (3,3,3) is usually sufficient for stability checks.
         displacement_distance: Atomic displacement distance in Å.
         imaginary_threshold: Frequency threshold (THz) below which modes
             are considered imaginary. Default -0.3 THz accounts for

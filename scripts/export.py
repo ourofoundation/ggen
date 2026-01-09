@@ -123,12 +123,17 @@ def export_candidates(
     if verbose:
         print(f"  Candidates in database: {len(candidates)}")
 
+    # Count untested structures (phonon stability not yet calculated)
+    untested_count = sum(1 for s in candidates if s.is_dynamically_stable is None)
+
     # Filter by dynamical stability
     if dynamically_stable_only:
         before = len(candidates)
         candidates = [s for s in candidates if s.is_dynamically_stable is True]
         if verbose:
             print(f"  Dynamically stable: {len(candidates)}/{before}")
+            if untested_count > 0:
+                print(f"  {C.YELLOW}Untested (phonons pending): {untested_count}{C.RESET}")
 
     # Filter by crystal system
     if crystal_system:
@@ -183,6 +188,9 @@ def export_candidates(
     if not candidates:
         if verbose:
             print(f"\n{C.YELLOW}No candidates match the criteria.{C.RESET}")
+            if untested_count > 0:
+                print(f"\n{C.CYAN}Tip:{C.RESET} {untested_count} structure(s) have not been tested for dynamical stability.")
+                print(f"     Run: {C.DIM}python phonons.py --system {chemsys}{C.RESET}")
         explorer.close()
         return []
 

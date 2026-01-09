@@ -100,35 +100,19 @@ On CPU, torch-sim's autobatcher doesn't work (memory estimation is GPU-specific)
 
 ## Implementation
 
-### New Parameter: `relax_all_trials`
+### Always Batch-Relax All Trials
 
-Added to `GGen.generate_crystal()`:
+All trials are now batch-relaxed and the best by final energy is selected. This is the only approach (no legacy option).
+
 ```python
 result = ggen.generate_crystal(
     formula="Fe2O3",
     num_trials=10,
-    optimize_geometry=True,
-    relax_all_trials=True,  # NEW: relax all, pick best by final energy
+    optimize_geometry=True,  # All trials get batch-relaxed
 )
 ```
 
-### Defaults
-
-| Method | Default | Rationale |
-|--------|---------|-----------|
-| `GGen.generate_crystal()` | `False` | Backward compatibility |
-| `ChemistryExplorer.explore()` | `True` | Better results for exploration |
-| `explore.py` CLI | `True` | Better phase diagrams |
-
-### CLI Usage
-
-```bash
-# New default (relax all trials)
-python scripts/explore.py Fe-Mn-Si
-
-# Legacy behavior (faster but worse)
-python scripts/explore.py Fe-Mn-Si --no-relax-all
-```
+Additionally, all relaxed trials are saved to the unified database as polymorphs, so the compute work isn't wasted.
 
 ---
 

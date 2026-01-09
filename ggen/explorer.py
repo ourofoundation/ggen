@@ -53,6 +53,7 @@ def _generate_structure_worker(args: Dict[str, Any]) -> Dict[str, Any]:
     optimize = args["optimize"]
     symmetry_bias = args["symmetry_bias"]
     crystal_systems = args["crystal_systems"]
+    space_group = args.get("space_group")
     preserve_symmetry = args["preserve_symmetry"]
     random_seed = args["random_seed"]
 
@@ -74,9 +75,10 @@ def _generate_structure_worker(args: Dict[str, Any]) -> Dict[str, Any]:
 
         result = ggen.generate_crystal(
             formula=formula,
+            space_group=space_group,
             num_trials=num_trials,
             optimize_geometry=optimize,
-            multi_spacegroup=True,
+            multi_spacegroup=space_group is None,  # Disable multi if specific SG given
             top_k_spacegroups=5,
             symmetry_bias=symmetry_bias,
             crystal_systems=crystal_systems,
@@ -108,6 +110,8 @@ def _generate_structure_worker(args: Dict[str, Any]) -> Dict[str, Any]:
             },
             "is_valid": True,
             "error_message": None,
+            # Additional relaxed trials (polymorphs) for database storage
+            "all_relaxed_trials": result.get("all_relaxed_trials", []),
         }
 
     except Exception as e:
@@ -386,20 +390,61 @@ class ChemistryExplorer:
                     stoich = {el: c for el, c in zip(subset_list, counts)}
                     stoichiometries.append(stoich)
 
-        # Remove duplicates (same reduced formula)
-        unique = {}
+        # Remove duplicates but keep scaled versions that unlock different space groups.
+        # Space groups have different minimum Wyckoff multiplicities (1, 2, 4, 8, etc.).
+        # To access high-symmetry space groups, we need stoichiometries with counts
+        # that are multiples of these multiplicities.
+        #
+        # For each unique composition ratio, keep versions at Z = 1, 2, 4, 8
+        # (the key multiplicity tiers) if they fit within max_atoms.
+        unique_by_reduced: Dict[str, List[Dict[str, int]]] = {}
+
         for stoich in stoichiometries:
             comp = Composition(stoich)
             reduced = comp.reduced_formula
-            if reduced not in unique:
-                # Store the smallest representation using reduced_composition
-                reduced_comp = comp.reduced_composition
-                reduced_stoich = {
-                    str(el): int(reduced_comp[el]) for el in reduced_comp.elements
-                }
-                unique[reduced] = reduced_stoich
+            if reduced not in unique_by_reduced:
+                unique_by_reduced[reduced] = []
+            unique_by_reduced[reduced].append(stoich)
 
-        return list(unique.values())
+        # Key Z multipliers that unlock different space group tiers:
+        # Z=1: SGs with min Wyckoff mult 1 (triclinic, most monoclinic)
+        # Z=2: SGs with min mult 2 (many tetragonal, P4_2/mnm, etc.)
+        # Z=4: SGs with min mult 4 (Fm-3m, etc.)
+        # Z=8: SGs with min mult 8 (Fd-3m, etc.)
+        key_multipliers = [1, 2, 4, 8]
+
+        result = []
+        for reduced, variants in unique_by_reduced.items():
+            # Get the reduced composition as baseline
+            comp = Composition(reduced)
+            reduced_stoich = {
+                str(el): int(comp.reduced_composition[el])
+                for el in comp.reduced_composition.elements
+            }
+            base_total = sum(reduced_stoich.values())
+
+            # Keep versions at key Z multipliers
+            kept_totals = set()
+            for z in key_multipliers:
+                target_total = base_total * z
+                if target_total > max_atoms:
+                    break  # No point checking larger Z
+
+                # Find a variant with this exact total
+                for stoich in variants:
+                    total = sum(stoich.values())
+                    if total == target_total and total not in kept_totals:
+                        result.append(stoich)
+                        kept_totals.add(total)
+                        break
+                else:
+                    # No exact match found, create the scaled version if it fits
+                    if target_total <= max_atoms and target_total not in kept_totals:
+                        scaled = {el: c * z for el, c in reduced_stoich.items()}
+                        result.append(scaled)
+                        kept_totals.add(target_total)
+
+        return result
 
     # -------------------- Database Management --------------------
 
@@ -775,9 +820,9 @@ class ChemistryExplorer:
         optimize: bool = True,
         symmetry_bias: float = 0.0,
         crystal_systems: Optional[List[str]] = None,
+        space_group: Optional[int] = None,
         preserve_symmetry: bool = False,
         show_progress: bool = False,
-        relax_all_trials: bool = True,
     ) -> CandidateResult:
         """Generate and optimize a structure for a given stoichiometry.
 
@@ -789,12 +834,10 @@ class ChemistryExplorer:
                 0.0 = uniform distribution across orthorhombic and above.
                 1.0 = strong preference for cubic/hexagonal. Default: 0.0
             crystal_systems: Optional list of crystal systems to restrict to.
+            space_group: Optional specific space group number to target.
             preserve_symmetry: If True, use symmetry-constrained relaxation to preserve
                 high symmetry during optimization.
             show_progress: If True, show tqdm progress bar during relaxation.
-            relax_all_trials: If True, relax ALL candidate structures and select the
-                one with lowest final energy. Uses torch-sim for GPU-batched parallel
-                relaxation. Default: True (recommended for best results).
 
         Returns:
             CandidateResult with structure and energy information.
@@ -818,16 +861,17 @@ class ChemistryExplorer:
             # Generate crystal
             result = ggen.generate_crystal(
                 formula=formula,
+                space_group=space_group,
                 num_trials=num_trials,
                 optimize_geometry=optimize,
-                multi_spacegroup=True,
+                multi_spacegroup=space_group
+                is None,  # Disable multi if specific SG given
                 top_k_spacegroups=5,
                 symmetry_bias=symmetry_bias,
                 crystal_systems=crystal_systems,
                 refine_symmetry=not preserve_symmetry,  # Don't need refinement if preserving
                 preserve_symmetry=preserve_symmetry,
                 show_progress=show_progress,
-                relax_all_trials=relax_all_trials,
             )
 
             structure = ggen.get_structure()
@@ -837,6 +881,46 @@ class ChemistryExplorer:
             energy = result["best_crystal_energy"]
             num_atoms = len(structure)
             energy_per_atom = energy / num_atoms
+
+            # Save additional relaxed trials (polymorphs) to unified database
+            # These are valuable structures that were fully relaxed but weren't the best
+            additional_trials = result.get("all_relaxed_trials", [])
+            if additional_trials and self.database is not None:
+                for trial in additional_trials:
+                    try:
+                        trial_struct = trial["structure"]
+                        trial_cif = trial_struct.to(fmt="cif")
+                        self.database.add_structure(
+                            formula=formula,
+                            stoichiometry=stoichiometry,
+                            energy_per_atom=float(trial["energy_per_atom"]),
+                            total_energy=float(trial["energy"]),
+                            num_atoms=int(trial["num_atoms"]),
+                            space_group_number=int(trial["space_group_number"]),
+                            space_group_symbol=trial["space_group_symbol"],
+                            cif_content=trial_cif,
+                            structure=trial_struct,
+                            is_valid=True,
+                            generation_metadata={
+                                "is_additional_trial": True,
+                                "original_space_group": trial.get(
+                                    "original_space_group"
+                                ),
+                                "optimization_steps": trial.get(
+                                    "optimization_steps", 0
+                                ),
+                            },
+                            run_id=self._unified_run_id,
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            f"Failed to save additional trial for {formula}: {e}"
+                        )
+
+                if additional_trials:
+                    logger.debug(
+                        f"Saved {len(additional_trials)} additional polymorphs for {formula}"
+                    )
 
             return CandidateResult(
                 formula=formula,
@@ -851,6 +935,7 @@ class ChemistryExplorer:
                     "generation_stats": result.get("generation_stats", {}),
                     "score_breakdown": result.get("score_breakdown", {}),
                     "optimization_steps": result.get("optimization_steps", 0),
+                    "num_additional_trials_saved": len(additional_trials),
                 },
             )
 
@@ -1145,6 +1230,7 @@ class ChemistryExplorer:
         optimize: bool,
         symmetry_bias: float,
         crystal_systems: Optional[List[str]],
+        space_group: Optional[int],
         preserve_symmetry: bool,
         num_workers: int,
         show_progress: bool,
@@ -1167,6 +1253,7 @@ class ChemistryExplorer:
                     "optimize": optimize,
                     "symmetry_bias": symmetry_bias,
                     "crystal_systems": crystal_systems,
+                    "space_group": space_group,
                     "preserve_symmetry": preserve_symmetry,
                     "random_seed": self.random_seed,
                 }
@@ -1218,6 +1305,46 @@ class ChemistryExplorer:
                         is_valid=result_dict["is_valid"],
                         error_message=result_dict["error_message"],
                     )
+
+                    # Save additional relaxed trials (polymorphs) to unified database
+                    additional_trials = result_dict.get("all_relaxed_trials", [])
+                    if additional_trials and self.database is not None:
+                        stoich = result_dict["stoichiometry"]
+                        for trial in additional_trials:
+                            try:
+                                trial_struct = trial["structure"]
+                                trial_cif = trial_struct.to(fmt="cif")
+                                self.database.add_structure(
+                                    formula=result_dict["formula"],
+                                    stoichiometry=stoich,
+                                    energy_per_atom=float(trial["energy_per_atom"]),
+                                    total_energy=float(trial["energy"]),
+                                    num_atoms=int(trial["num_atoms"]),
+                                    space_group_number=int(trial["space_group_number"]),
+                                    space_group_symbol=trial["space_group_symbol"],
+                                    cif_content=trial_cif,
+                                    structure=trial_struct,
+                                    is_valid=True,
+                                    generation_metadata={
+                                        "is_additional_trial": True,
+                                        "original_space_group": trial.get(
+                                            "original_space_group"
+                                        ),
+                                        "optimization_steps": trial.get(
+                                            "optimization_steps", 0
+                                        ),
+                                    },
+                                    run_id=self._unified_run_id,
+                                )
+                            except Exception as e:
+                                logger.debug(
+                                    f"Failed to save additional trial for {formula}: {e}"
+                                )
+
+                        if additional_trials:
+                            logger.debug(
+                                f"Saved {len(additional_trials)} additional polymorphs for {formula}"
+                            )
 
                     # If we have a previous structure and this one failed or is worse, use the previous
                     if formula in previous_structures:
@@ -1296,13 +1423,13 @@ class ChemistryExplorer:
         run_name: Optional[str] = None,
         symmetry_bias: float = 0.0,
         crystal_systems: Optional[List[str]] = None,
+        space_group: Optional[int] = None,
         load_previous_runs: Union[bool, int] = False,
         skip_existing_formulas: bool = True,
         preserve_symmetry: bool = False,
         num_workers: int = 1,
         show_progress: bool = True,
         keep_structures_in_memory: bool = False,
-        relax_all_trials: bool = True,
         use_unified_database: bool = True,
         compute_phonons: bool = False,
         phonon_supercell: Tuple[int, int, int] = (2, 2, 2),
@@ -1339,6 +1466,9 @@ class ChemistryExplorer:
                 Valid values: "triclinic", "monoclinic", "orthorhombic", "tetragonal",
                 "trigonal", "hexagonal", "cubic". If None, all systems are considered.
                 Example: ["tetragonal"] to only generate tetragonal structures.
+            space_group: Optional specific space group number (1-230) to target.
+                If provided, only this space group will be used for generation.
+                Example: 136 for P4_2/mnm (tetragonal sigma phase).
             load_previous_runs: Whether to load structures from previous runs of the
                 same chemical system. Can be:
                 - False (default): Don't load from previous runs
@@ -1358,10 +1488,6 @@ class ChemistryExplorer:
             keep_structures_in_memory: If False (default), structures are saved to CIF
                 and cleared from memory to reduce memory usage. Set True to keep all
                 structures in memory (useful for small explorations or post-processing).
-            relax_all_trials: If True (default), relax ALL candidate structures for each
-                stoichiometry and select the one with lowest final energy. Uses torch-sim
-                for GPU-batched parallel relaxation. This produces better results than
-                the legacy approach of selecting by initial (unrelaxed) energy.
             use_unified_database: If True (default) and a unified StructureDatabase is
                 configured, load existing structures from all relevant subsystems. For
                 example, when exploring Fe-Mn-Co, this will load existing Fe, Mn, Co,
@@ -1514,6 +1640,41 @@ class ChemistryExplorer:
             require_all_elements=require_all_elements,
         )
 
+        # Filter stoichiometries by space group compatibility if specified.
+        # enumerate_stoichiometries now returns versions at Z=1,2,4,8 for each
+        # composition ratio, so we just need to check exact counts.
+        if space_group is not None:
+            from pyxtal.symmetry import Group
+
+            group = Group(space_group, dim=3)
+            original_count = len(stoichiometries)
+
+            # Cache: map from tuple(counts) -> bool for already-checked counts
+            compatibility_cache: Dict[Tuple[int, ...], bool] = {}
+
+            compatible_stoichs = []
+            for stoich in stoichiometries:
+                counts = tuple(stoich[el] for el in sorted(stoich.keys()))
+
+                # Check cache first
+                if counts in compatibility_cache:
+                    if compatibility_cache[counts]:
+                        compatible_stoichs.append(stoich)
+                    continue
+
+                is_compatible, _ = group.check_compatible(list(counts))
+                compatibility_cache[counts] = is_compatible
+                if is_compatible:
+                    compatible_stoichs.append(stoich)
+
+            stoichiometries = compatible_stoichs
+            filtered_count = original_count - len(stoichiometries)
+            if filtered_count > 0:
+                logger.info(
+                    f"Filtered {filtered_count} stoichiometries incompatible with "
+                    f"space group {space_group} ({len(stoichiometries)} remaining)"
+                )
+
         if max_stoichiometries and len(stoichiometries) > max_stoichiometries:
             # Randomly sample stoichiometries
             indices = self.rng.choice(
@@ -1587,6 +1748,7 @@ class ChemistryExplorer:
                     optimize=optimize,
                     symmetry_bias=symmetry_bias,
                     crystal_systems=crystal_systems,
+                    space_group=space_group,
                     preserve_symmetry=preserve_symmetry,
                     num_workers=num_workers,
                     show_progress=show_progress,
@@ -1616,9 +1778,9 @@ class ChemistryExplorer:
                         optimize=optimize,
                         symmetry_bias=symmetry_bias,
                         crystal_systems=crystal_systems,
+                        space_group=space_group,
                         preserve_symmetry=preserve_symmetry,
                         show_progress=show_progress,
-                        relax_all_trials=relax_all_trials,
                     )
 
                     # If we have a previous structure and this one failed or is worse, use the previous

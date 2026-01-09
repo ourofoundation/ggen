@@ -243,15 +243,19 @@ class StructureDatabase:
             )
         """
         )
-        
+
         # Migration: Add dynamical stability columns if they don't exist
         # This allows existing databases to be upgraded
         try:
-            conn.execute("ALTER TABLE structures ADD COLUMN is_dynamically_stable INTEGER")
+            conn.execute(
+                "ALTER TABLE structures ADD COLUMN is_dynamically_stable INTEGER"
+            )
         except sqlite3.OperationalError:
             pass  # Column already exists
         try:
-            conn.execute("ALTER TABLE structures ADD COLUMN num_imaginary_modes INTEGER")
+            conn.execute(
+                "ALTER TABLE structures ADD COLUMN num_imaginary_modes INTEGER"
+            )
         except sqlite3.OperationalError:
             pass
         try:
@@ -523,7 +527,11 @@ class StructureDatabase:
                 1 if is_valid else 0,
                 error_message,
                 json.dumps(generation_metadata) if generation_metadata else None,
-                1 if is_dynamically_stable else (0 if is_dynamically_stable is False else None),
+                (
+                    1
+                    if is_dynamically_stable
+                    else (0 if is_dynamically_stable is False else None)
+                ),
                 num_imaginary_modes,
                 min_phonon_frequency,
                 max_phonon_frequency,
@@ -562,8 +570,23 @@ class StructureDatabase:
         min_phonon_frequency: Optional[float] = None,
         max_phonon_frequency: Optional[float] = None,
         phonon_supercell: Optional[Tuple[int, int, int]] = None,
+        clear_phonon_data: bool = False,
     ) -> None:
-        """Update an existing structure with better data."""
+        """Update an existing structure with better data.
+
+        Args:
+            structure_id: ID of structure to update
+            energy_per_atom: New energy per atom value
+            total_energy: New total energy value
+            cif_content: New CIF content
+            generation_metadata: New metadata dict
+            is_dynamically_stable: Phonon stability (True/False)
+            num_imaginary_modes: Number of imaginary phonon modes
+            min_phonon_frequency: Minimum phonon frequency
+            max_phonon_frequency: Maximum phonon frequency
+            phonon_supercell: Supercell used for phonon calculation
+            clear_phonon_data: If True, set all phonon fields to NULL
+        """
         updates = []
         values = []
 
@@ -579,21 +602,30 @@ class StructureDatabase:
         if generation_metadata is not None:
             updates.append("generation_metadata = ?")
             values.append(json.dumps(generation_metadata))
-        if is_dynamically_stable is not None:
-            updates.append("is_dynamically_stable = ?")
-            values.append(1 if is_dynamically_stable else 0)
-        if num_imaginary_modes is not None:
-            updates.append("num_imaginary_modes = ?")
-            values.append(num_imaginary_modes)
-        if min_phonon_frequency is not None:
-            updates.append("min_phonon_frequency = ?")
-            values.append(min_phonon_frequency)
-        if max_phonon_frequency is not None:
-            updates.append("max_phonon_frequency = ?")
-            values.append(max_phonon_frequency)
-        if phonon_supercell is not None:
-            updates.append("phonon_supercell = ?")
-            values.append(json.dumps(phonon_supercell))
+
+        # Handle phonon data - either clear all or update individually
+        if clear_phonon_data:
+            updates.append("is_dynamically_stable = NULL")
+            updates.append("num_imaginary_modes = NULL")
+            updates.append("min_phonon_frequency = NULL")
+            updates.append("max_phonon_frequency = NULL")
+            updates.append("phonon_supercell = NULL")
+        else:
+            if is_dynamically_stable is not None:
+                updates.append("is_dynamically_stable = ?")
+                values.append(1 if is_dynamically_stable else 0)
+            if num_imaginary_modes is not None:
+                updates.append("num_imaginary_modes = ?")
+                values.append(num_imaginary_modes)
+            if min_phonon_frequency is not None:
+                updates.append("min_phonon_frequency = ?")
+                values.append(min_phonon_frequency)
+            if max_phonon_frequency is not None:
+                updates.append("max_phonon_frequency = ?")
+                values.append(max_phonon_frequency)
+            if phonon_supercell is not None:
+                updates.append("phonon_supercell = ?")
+                values.append(json.dumps(phonon_supercell))
 
         updates.append("updated_at = ?")
         values.append(datetime.now().isoformat())
@@ -697,13 +729,22 @@ class StructureDatabase:
         # Extract phonon fields (may not exist in older databases)
         row_keys = row.keys()
         is_dynamically_stable = None
-        if "is_dynamically_stable" in row_keys and row["is_dynamically_stable"] is not None:
+        if (
+            "is_dynamically_stable" in row_keys
+            and row["is_dynamically_stable"] is not None
+        ):
             is_dynamically_stable = bool(row["is_dynamically_stable"])
-        
-        num_imaginary_modes = row["num_imaginary_modes"] if "num_imaginary_modes" in row_keys else None
-        min_phonon_frequency = row["min_phonon_frequency"] if "min_phonon_frequency" in row_keys else None
-        max_phonon_frequency = row["max_phonon_frequency"] if "max_phonon_frequency" in row_keys else None
-        
+
+        num_imaginary_modes = (
+            row["num_imaginary_modes"] if "num_imaginary_modes" in row_keys else None
+        )
+        min_phonon_frequency = (
+            row["min_phonon_frequency"] if "min_phonon_frequency" in row_keys else None
+        )
+        max_phonon_frequency = (
+            row["max_phonon_frequency"] if "max_phonon_frequency" in row_keys else None
+        )
+
         phonon_supercell = None
         if "phonon_supercell" in row_keys and row["phonon_supercell"]:
             phonon_supercell = row["phonon_supercell"]  # Already JSON string
@@ -777,9 +818,11 @@ class StructureDatabase:
             comp = Composition(formula)
             # Use energy per atom * num atoms in reduced formula
             energy = structure.energy_per_atom * comp.num_atoms
-            # Use space group as entry_id for phase diagram labels
+            # Use true formula + space group as entry_id for phase diagram labels
+            # This shows the actual stoichiometry instead of reduced formula
             sg = structure.space_group_symbol or "?"
-            entry = ComputedEntry(comp, energy, entry_id=sg)
+            sg_label = sg.replace("/", "-")
+            entry = ComputedEntry(comp, energy, entry_id=f"{formula} ({sg_label})")
             entries.append(entry)
             # Key by reduced_formula to match lookup later
             structure_map[comp.reduced_formula] = structure

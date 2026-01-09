@@ -56,12 +56,36 @@ def get_system_stats(db: StructureDatabase, chemsys: str) -> dict:
     # Count unique formulas
     formulas = set(s.formula for s in structures)
 
+    # Count unary, binary, and ternary compounds
+    from pymatgen.core import Composition
+
+    unary_count = 0
+    binary_count = 0
+    ternary_count = 0
+
+    for formula in formulas:
+        try:
+            composition = Composition(formula)
+            num_elements = len(composition.elements)
+            if num_elements == 1:
+                unary_count += 1
+            elif num_elements == 2:
+                binary_count += 1
+            elif num_elements == 3:
+                ternary_count += 1
+        except Exception:
+            # Skip formulas that can't be parsed
+            pass
+
     return {
         "total_structures": len(structures),
         "unique_formulas": len(formulas),
         "on_hull": len(hull_entries),
         "near_hull": len(near_hull),
         "formulas": formulas,
+        "unary_count": unary_count,
+        "binary_count": binary_count,
+        "ternary_count": ternary_count,
     }
 
 
@@ -106,6 +130,12 @@ def main():
         help="Crystal systems to explore (default: all)",
     )
     parser.add_argument(
+        "--space-group",
+        type=str,
+        default=None,
+        help="Specific space group to target (number or symbol, e.g. '136' or 'P4_2/mnm')",
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default="./runs",
@@ -134,12 +164,6 @@ def main():
         action="store_true",
         default=True,
         help="Preserve symmetry during optimization (default: True)",
-    )
-    parser.add_argument(
-        "--no-relax-all",
-        action="store_true",
-        default=False,
-        help="Disable relaxing all trials (use legacy initial-energy selection)",
     )
     parser.add_argument(
         "--e-above-hull",
@@ -238,6 +262,15 @@ def main():
     logger.info(
         f"  Unique formulas:        {C.WHITE}{system_stats_before['unique_formulas']}{C.RESET}"
     )
+    logger.info(
+        f"  Unary compounds:        {C.WHITE}{system_stats_before['unary_count']}{C.RESET}"
+    )
+    logger.info(
+        f"  Binary compounds:       {C.WHITE}{system_stats_before['binary_count']}{C.RESET}"
+    )
+    logger.info(
+        f"  Ternary compounds:      {C.WHITE}{system_stats_before['ternary_count']}{C.RESET}"
+    )
     if system_stats_before["on_hull"] > 0:
         logger.info(
             f"  Phases on hull:         {C.WHITE}{system_stats_before['on_hull']}{C.RESET}"
@@ -253,6 +286,25 @@ def main():
     logger.info("")
     logger.info(f"{C.CYAN}Starting exploration...{C.RESET}")
 
+    # Parse space group argument (can be number or symbol)
+    space_group = None
+    if args.space_group:
+        try:
+            space_group = int(args.space_group)
+        except ValueError:
+            # It's a symbol, need to convert to number
+            from pyxtal.symmetry import Group
+
+            try:
+                g = Group(args.space_group, dim=3)
+                space_group = g.number
+                logger.info(
+                    f"Resolved space group {args.space_group} to number {space_group}"
+                )
+            except Exception as e:
+                logger.error(f"Invalid space group '{args.space_group}': {e}")
+                sys.exit(1)
+
     # Run exploration (uses unified database for cross-system structure sharing)
     result = explorer.explore(
         chemical_system=args.system,
@@ -264,12 +316,12 @@ def main():
         include_ternaries=True,
         max_stoichiometries=args.max_stoichiometries,
         crystal_systems=args.crystal_systems,
+        space_group=space_group,
         skip_existing_formulas=args.skip_existing,
         preserve_symmetry=args.preserve_symmetry,
         num_workers=args.workers,
         show_progress=not args.no_progress,
         keep_structures_in_memory=args.keep_in_memory,
-        relax_all_trials=not args.no_relax_all,
         use_unified_database=True,
         compute_phonons=args.compute_phonons,
     )
