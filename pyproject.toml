@@ -7,7 +7,7 @@ name = "ggen"
 version = "0.1.0"
 description = "Crystal generation and mutation library for evolutionary structure optimization"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "Matt Moderwell", email = "matt@ouro.foundation" }]
 maintainers = [{ name = "Matt Moderwell", email = "matt@ouro.foundation" }]
 keywords = [
@@ -26,7 +26,6 @@ keywords = [
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
@@ -74,9 +73,6 @@ Documentation = "https://ggen.readthedocs.io"
 Repository = "https://github.com/ourofoundation/ggen.git"
 "Bug Tracker" = "https://github.com/ourofoundation/ggen/issues"
 Changelog = "https://github.com/ourofoundation/ggen/blob/main/CHANGELOG.md"
-
-[project.scripts]
-ggen = "ggen.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
