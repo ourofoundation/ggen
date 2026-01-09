@@ -35,9 +35,6 @@ python scripts/explore.py Fe-Mn-Si --max-atoms 24 --num-trials 25
 
 # Focus on specific crystal systems
 python scripts/explore.py Li-Co-O --crystal-systems hexagonal trigonal
-
-# Faster exploration with parallel workers
-python scripts/explore.py Fe-Sn-B -j 4
 ```
 
 **What happens:** GGen enumerates all stoichiometries up to `--max-atoms` (default: 20), generates `--num-trials` candidate structures per stoichiometry (default: 15), and relaxes each using the ORB force field. Results are stored in a unified SQLite database that persists across runs—structures from Fe-Mn explored in one run are automatically reused when you explore Fe-Mn-Co later.
@@ -80,6 +77,7 @@ python scripts/explore.py --help
 | `--num-trials` | 15 | Generation attempts per stoichiometry |
 | `--max-stoichiometries` | 100 | Cap on stoichiometries to explore |
 | `--crystal-systems` | all | Filter: `cubic`, `hexagonal`, `tetragonal`, etc. |
+| `--require-all-elements` | off | Only generate formulas containing all elements (skip subsystems) |
 | `-j`, `--workers` | 1 | Parallel workers for generation |
 | `--e-above-hull` | 0.15 | Energy cutoff (eV) for "stable" phases |
 | `--compute-phonons` | off | Run phonon calculations during exploration |

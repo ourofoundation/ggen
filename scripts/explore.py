@@ -182,6 +182,11 @@ def main():
         help="Compute phonon stability during exploration (expensive, off by default)",
     )
     parser.add_argument(
+        "--require-all-elements",
+        action="store_true",
+        help="Only generate formulas containing all elements of the system (e.g., for Fe-Co-Bi, only Fe-Co-Bi formulas, not Fe-Co)",
+    )
+    parser.add_argument(
         "--seed", type=int, default=None, help="Random seed for reproducibility"
     )
     parser.add_argument(
@@ -314,6 +319,7 @@ def main():
         optimize=not args.no_optimize,
         include_binaries=True,
         include_ternaries=True,
+        require_all_elements=args.require_all_elements,
         max_stoichiometries=args.max_stoichiometries,
         crystal_systems=args.crystal_systems,
         space_group=space_group,
