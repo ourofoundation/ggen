@@ -1222,9 +1222,19 @@ class GGen:
 
                 structure = _atoms_to_structure_wrapped(atoms)
                 energy = float(energies[i])
-                # torch-sim doesn't track steps per structure easily, estimate
-                steps = max_steps  # Conservative estimate
+                # torch-sim batched optimization doesn't track per-structure steps
+                # Use max_steps as upper bound estimate
+                steps = max_steps
                 results.append((structure, energy, steps, final_fmax))
+
+                # Log if didn't converge
+                if final_fmax > fmax:
+                    # In batched mode we don't know exact steps or why it stopped
+                    msg = f"Trial {i + 1}/{len(final_atoms_list)} did not converge (batched): fmax={final_fmax:.4f}"
+                    if show_progress:
+                        tqdm.write(msg)
+                    else:
+                        logger.info(msg)
 
             logger.debug(
                 "Batched relaxation complete. Energies: min=%.4f, max=%.4f eV",
@@ -1342,7 +1352,10 @@ class GGen:
 
                     # Log if didn't converge
                     if final_fmax > fmax:
-                        msg = f"Trial {trial_idx + 1}/{len(candidates)} did not converge: fmax={final_fmax:.4f} after {total_steps} steps"
+                        # Determine reason: hit max steps or optimizer stalled
+                        hit_max = (opt.nsteps >= max_steps) or (stage2_steps >= max_steps)
+                        reason = "reached max steps" if hit_max else "optimizer stalled"
+                        msg = f"Trial {trial_idx + 1}/{len(candidates)} did not converge ({reason}): fmax={final_fmax:.4f} after {total_steps} steps"
                         if pbar is not None:
                             tqdm.write(msg)
                         else:
@@ -1361,7 +1374,9 @@ class GGen:
 
                     # Log if didn't converge
                     if final_fmax > fmax:
-                        msg = f"Trial {trial_idx + 1}/{len(candidates)} did not converge: fmax={final_fmax:.4f} after {total_steps} steps"
+                        # Determine reason: hit max steps or optimizer stalled
+                        reason = "reached max steps" if opt.nsteps >= max_steps else "optimizer stalled"
+                        msg = f"Trial {trial_idx + 1}/{len(candidates)} did not converge ({reason}): fmax={final_fmax:.4f} after {total_steps} steps"
                         if pbar is not None:
                             tqdm.write(msg)
                         else:
