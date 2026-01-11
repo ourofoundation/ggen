@@ -222,3 +222,6 @@ __marimo__/
 
 exploration_runs/*
 runs/*
+
+*.html
+*.png

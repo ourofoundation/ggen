@@ -176,7 +176,7 @@ exports/Co-Fe-Mn-cubic-100meV/         # combined filters
 Query the database for statistics and structure lists:
 
 ```bash
-# Summary report for a system
+# Summary report for a system (includes phase diagram)
 python scripts/report.py Co-Fe-Mn
 
 # List all explored systems with stats
@@ -198,9 +198,6 @@ python scripts/report.py Co-Fe-Mn -s 225
 # Show stability breakdown
 python scripts/report.py Co-Fe-Mn --breakdown
 
-# Find structures needing phonon calculations
-python scripts/report.py Co-Fe-Mn --untested phonon
-
 # Export as JSON
 python scripts/report.py Co-Fe-Mn --json > report.json
 ```
@@ -209,19 +206,55 @@ python scripts/report.py Co-Fe-Mn --json > report.json
 ```
 Co-Fe-Mn
 ──────────────────────────────────────────────────
-  1052 structures, 847 unique formulas
+1052 structures, 847 unique formulas
 
-Stability (near = within 150 meV)
-  Hull:    42 on hull, 215 near, 795 far, 0 untested
-  Phonon:  377 stable, 412 unstable (263 untested)
-  → 38 fully stable (hull + phonon), 127 near-hull stable
+Thermodynamic Stability (per formula)
+  42 on hull, 215 within 150 meV, 590 above
+
+Dynamical Stability (phonon)
+  377 stable, 412 unstable, 263 untested
+  → 38 fully stable (on hull + phonon stable)
 
 Crystal Systems
   cubic        ████       156 (14.8%)
   tetragonal   ███        102 ( 9.7%)
   orthorhombic ████████   298 (28.3%)
   ...
+
+Phase diagram: Co-Fe-Mn_phase_diagram.html
 ```
+
+### Phase Diagrams
+
+Every report automatically generates an interactive phase diagram as an HTML file (and PNG if kaleido is installed). The phase diagram shows all explored structures plotted by composition and energy above hull.
+
+```bash
+# Default: report + phase diagram
+python scripts/report.py Co-Fe-Mn
+# → Generates: Co-Fe-Mn_phase_diagram.html
+
+# Exclude P1 structures (often low-symmetry noise)
+python scripts/report.py Co-Fe-Mn --exclude-p1
+# → Generates: Co-Fe-Mn_phase_diagram_noP1.html
+
+# Only include phonon-tested structures
+python scripts/report.py Co-Fe-Mn --tested-only
+# → Generates: Co-Fe-Mn_phase_diagram_tested.html
+
+# Include all polymorphs (not just lowest-energy per formula)
+python scripts/report.py Co-Fe-Mn --all-polymorphs
+# → Generates: Co-Fe-Mn_phase_diagram_allpoly.html
+
+# Custom energy cutoff for display (default: 150 meV)
+python scripts/report.py Co-Fe-Mn --energy-cutoff 0.2
+# → Generates: Co-Fe-Mn_phase_diagram_cutoff200.html
+
+# Combine filters
+python scripts/report.py Co-Fe-Mn --exclude-p1 --tested-only
+# → Generates: Co-Fe-Mn_phase_diagram_noP1_tested.html
+```
+
+The phase diagram filename automatically reflects the filters applied, making it easy to compare different views of the same system.
 
 | Option | Description |
 |--------|-------------|
@@ -231,9 +264,11 @@ Crystal Systems
 | `-c`, `--crystal-system` | Filter by crystal system |
 | `-s`, `--space-group` | Filter by space group (number or symbol) |
 | `--breakdown` | Show stability category breakdown |
-| `--untested` | Show structures missing `phonon` or `hull` tests |
 | `--json`, `-j` | Output full report as JSON |
-| `--near-hull-cutoff` | Energy cutoff for "near hull" (default: 0.15 eV) |
+| `--energy-cutoff` | Energy above hull cutoff in eV/atom (default: 0.150) |
+| `--exclude-p1` | Exclude P1 structures from phase diagram |
+| `--tested-only` | Only include phonon-tested structures in phase diagram |
+| `--all-polymorphs` | Include all polymorphs, not just lowest-energy per formula |
 
 ### Running Multiple Systems
 
@@ -337,10 +372,10 @@ runs/exploration_Fe-Mn-Si_20260105_143500/
 │   ├── Fe2Mn_Im-3m.cif
 │   ├── FeMnSi_P63-mmc.cif
 │   └── ...
-├── phase_diagram.html    # Interactive phase diagram
-├── phase_diagram.png     # Static image (if kaleido installed)
 └── summary.json          # JSON summary of results
 ```
+
+Use `python scripts/report.py Fe-Mn-Si` to generate reports and phase diagram visualizations.
 
 The unified database (`ggen.db` by default) stores all structures across all runs.
 

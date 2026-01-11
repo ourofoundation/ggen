@@ -6,6 +6,7 @@ structures across different stoichiometries and analyzing their thermodynamic st
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import signal
@@ -964,7 +965,7 @@ class ChemistryExplorer:
                             space_group_number=int(trial["space_group_number"]),
                             space_group_symbol=trial["space_group_symbol"],
                             cif_content=trial_cif,
-                            structure=trial_struct,
+                            structure=None,  # Don't store structure object to save memory
                             is_valid=True,
                             generation_metadata={
                                 "is_additional_trial": True,
@@ -977,6 +978,8 @@ class ChemistryExplorer:
                             },
                             run_id=self._unified_run_id,
                         )
+                        # Clear structure from trial dict to free memory
+                        trial["structure"] = None
                     except Exception as e:
                         logger.debug(
                             f"Failed to save additional trial for {formula}: {e}"
@@ -1392,7 +1395,7 @@ class ChemistryExplorer:
                                     space_group_number=int(trial["space_group_number"]),
                                     space_group_symbol=trial["space_group_symbol"],
                                     cif_content=trial_cif,
-                                    structure=trial_struct,
+                                    structure=None,  # Don't store structure object to save memory
                                     is_valid=True,
                                     generation_metadata={
                                         "is_additional_trial": True,
@@ -1405,6 +1408,8 @@ class ChemistryExplorer:
                                     },
                                     run_id=self._unified_run_id,
                                 )
+                                # Clear structure from trial dict to free memory
+                                trial["structure"] = None
                             except Exception as e:
                                 logger.debug(
                                     f"Failed to save additional trial for {formula}: {e}"
@@ -1414,6 +1419,9 @@ class ChemistryExplorer:
                             logger.debug(
                                 f"Saved {len(additional_trials)} additional polymorphs for {formula}"
                             )
+                    
+                    # Clear the trials list from result dict to free memory
+                    result_dict["all_relaxed_trials"] = None
 
                     # If we have a previous structure and this one failed or is worse, use the previous
                     if formula in previous_structures:
@@ -1452,6 +1460,10 @@ class ChemistryExplorer:
                     # Save to database
                     self._save_candidate(conn, candidate)
                     candidates.append(candidate)
+
+                    # Periodic garbage collection to prevent memory accumulation
+                    if len(candidates) % 10 == 0:
+                        gc.collect()
 
                 except Exception as e:
                     logger.warning(f"Worker failed for {formula}: {e}")
@@ -1928,6 +1940,10 @@ class ChemistryExplorer:
                     self._save_candidate(conn, candidate)
                     candidates.append(candidate)
 
+                    # Periodic garbage collection to prevent memory accumulation
+                    if (i + 1) % 10 == 0:
+                        gc.collect()
+
         # Add remaining structures from previous runs that weren't in our enumeration
         if load_previous_runs:
             # Find formulas we already have from this run
@@ -1964,6 +1980,10 @@ class ChemistryExplorer:
                 f"Included {len(candidates)} total candidates "
                 f"({num_reused} from previous runs)"
             )
+
+        # Clear previous_structures to free memory now that all processing is complete
+        previous_structures.clear()
+        gc.collect()
 
         # Generate terminal element structures for phase diagram (unless interrupted)
         # Always generate fresh terminals and compare with previous runs to get the best

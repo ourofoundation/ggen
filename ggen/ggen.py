@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import gc
 import io
 import json
 import logging
@@ -1353,7 +1354,9 @@ class GGen:
                     # Log if didn't converge
                     if final_fmax > fmax:
                         # Determine reason: hit max steps or optimizer stalled
-                        hit_max = (opt.nsteps >= max_steps) or (stage2_steps >= max_steps)
+                        hit_max = (opt.nsteps >= max_steps) or (
+                            stage2_steps >= max_steps
+                        )
                         reason = "reached max steps" if hit_max else "optimizer stalled"
                         msg = f"Trial {trial_idx + 1}/{len(candidates)} did not converge ({reason}): fmax={final_fmax:.4f} after {total_steps} steps"
                         if pbar is not None:
@@ -1375,7 +1378,11 @@ class GGen:
                     # Log if didn't converge
                     if final_fmax > fmax:
                         # Determine reason: hit max steps or optimizer stalled
-                        reason = "reached max steps" if opt.nsteps >= max_steps else "optimizer stalled"
+                        reason = (
+                            "reached max steps"
+                            if opt.nsteps >= max_steps
+                            else "optimizer stalled"
+                        )
                         msg = f"Trial {trial_idx + 1}/{len(candidates)} did not converge ({reason}): fmax={final_fmax:.4f} after {total_steps} steps"
                         if pbar is not None:
                             tqdm.write(msg)
@@ -1913,6 +1920,10 @@ class GGen:
                     }
                 )
 
+            # Clear relaxed_results to free memory (structures are now in all_relaxed_trials)
+            del relaxed_results
+            del candidate_crystals
+
         else:
             # No geometry optimization - just pick best by initial energy score
             all_candidates.sort(key=lambda x: x[1])
@@ -1928,6 +1939,10 @@ class GGen:
                 final_energy,
                 best_score,
             )
+
+        # Clear all_candidates to free memory (we've selected the best)
+        del all_candidates
+        del candidate_sgs
 
         # Post-relaxation symmetry refinement
         if optimize_geometry and refine_symmetry and not preserve_symmetry:

@@ -10,7 +10,10 @@ from __future__ import annotations
 import json
 from collections import Counter
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+from pymatgen.analysis.phase_diagram import PhaseDiagram
 
 from .colors import Colors
 from .database import StructureDatabase, StoredStructure
@@ -43,11 +46,10 @@ class StabilityStats:
 
     total: int = 0
 
-    # Thermodynamic stability (convex hull)
+    # Thermodynamic stability (convex hull) - for best structure per formula
     on_hull: int = 0
-    near_hull: int = 0  # within cutoff (default 150meV), excluding on_hull
-    above_hull: int = 0  # beyond cutoff
-    hull_untested: int = 0
+    within_cutoff: int = 0  # within energy cutoff, excluding on_hull
+    above_cutoff: int = 0  # beyond cutoff
 
     # Dynamical stability (phonons)
     dynamically_stable: int = 0
@@ -56,11 +58,6 @@ class StabilityStats:
 
     # Combined stability
     fully_stable: int = 0  # on_hull AND dynamically_stable
-    near_hull_stable: int = 0  # near_hull AND dynamically_stable
-
-    @property
-    def hull_tested(self) -> int:
-        return self.on_hull + self.near_hull + self.above_hull
 
     @property
     def dynamically_tested(self) -> int:
@@ -102,11 +99,15 @@ class SystemReport:
     max_energy_per_atom: Optional[float] = None
     avg_energy_per_atom: Optional[float] = None
 
-    # Hull cutoff used
-    near_hull_cutoff: float = 0.15
+    # Energy cutoff used
+    energy_cutoff: float = 0.150
 
     # Best structures
     hull_structures: List[StoredStructure] = field(default_factory=list)
+
+    # Filter information (for display)
+    p1_filtered: int = 0
+    polymorphs_filtered: int = 0
 
     def summary(self) -> str:
         """Generate a text summary of the report."""
@@ -117,36 +118,52 @@ class SystemReport:
         lines.append(f"{C.BOLD}{C.CYAN}{self.chemical_system}{C.RESET}")
         lines.append(f"{C.DIM}{'─' * 50}{C.RESET}")
         lines.append(
-            f"  {self.total_structures} structures, {self.unique_formulas} unique formulas"
+            f"{self.total_structures} structures, {self.unique_formulas} unique formulas"
         )
+
+        # Show filtering information right after counts
+        if self.p1_filtered > 0 or self.polymorphs_filtered > 0:
+            filter_lines = []
+            if self.p1_filtered > 0:
+                filter_lines.append(
+                    f"  {C.DIM}{self.p1_filtered} filtered by --exclude-p1{C.RESET}"
+                )
+            if self.polymorphs_filtered > 0:
+                filter_lines.append(
+                    f"  {C.DIM}{self.polymorphs_filtered} additional polymorphs filtered "
+                    f"(use --all-polymorphs to include){C.RESET}"
+                )
+            for line in filter_lines:
+                lines.append(line)
+
         lines.append("")
 
         # Stability section
-        cutoff_mev = int(self.near_hull_cutoff * 1000)
+        cutoff_mev = int(self.energy_cutoff * 1000)
         lines.append(
-            f"{C.BOLD}Stability{C.RESET} {C.DIM}(near = within {cutoff_mev} meV){C.RESET}"
+            f"{C.BOLD}Thermodynamic Stability{C.RESET} {C.DIM}(per formula){C.RESET}"
         )
-
-        # Thermodynamic - show on hull, near hull, and far above
         lines.append(
-            f"  {C.DIM}Hull:{C.RESET}    {C.GREEN}{self.stability.on_hull} on hull{C.RESET}, "
-            f"{C.YELLOW}{self.stability.near_hull} near{C.RESET}, "
-            f"{C.DIM}{self.stability.above_hull} far, {self.stability.hull_untested} untested{C.RESET}"
+            f"  {C.GREEN}{self.stability.on_hull} on hull{C.RESET}, "
+            f"{C.YELLOW}{self.stability.within_cutoff} within {cutoff_mev} meV{C.RESET}, "
+            f"{C.DIM}{self.stability.above_cutoff} above{C.RESET}"
         )
+        lines.append("")
 
         # Dynamical
+        lines.append(f"{C.BOLD}Dynamical Stability{C.RESET} {C.DIM}(phonon){C.RESET}")
         lines.append(
-            f"  {C.DIM}Phonon:{C.RESET}  {C.GREEN}{self.stability.dynamically_stable} stable{C.RESET}, "
-            f"{C.RED}{self.stability.dynamically_unstable} unstable{C.RESET}"
-            f"{C.DIM} ({self.stability.dynamically_untested} untested){C.RESET}"
+            f"  {C.GREEN}{self.stability.dynamically_stable} stable{C.RESET}, "
+            f"{C.RED}{self.stability.dynamically_unstable} unstable{C.RESET}, "
+            f"{C.DIM}{self.stability.dynamically_untested} untested{C.RESET}"
         )
 
         # Fully stable summary
-        lines.append(
-            f"  {C.BOLD}{C.GREEN}→ {self.stability.fully_stable} fully stable{C.RESET} "
-            f"{C.DIM}(hull + phonon){C.RESET}"
-            f"{C.DIM}, {self.stability.near_hull_stable} near-hull stable{C.RESET}"
-        )
+        if self.stability.fully_stable > 0:
+            lines.append(
+                f"  {C.BOLD}{C.GREEN}→ {self.stability.fully_stable} fully stable{C.RESET} "
+                f"{C.DIM}(on hull + phonon stable){C.RESET}"
+            )
         lines.append("")
 
         # Space groups section
@@ -195,17 +212,16 @@ class SystemReport:
             "elements": self.elements,
             "total_structures": self.total_structures,
             "unique_formulas": self.unique_formulas,
+            "energy_cutoff": self.energy_cutoff,
             "stability": {
                 "total": self.stability.total,
                 "on_hull": self.stability.on_hull,
-                "near_hull": self.stability.near_hull,
-                "above_hull": self.stability.above_hull,
-                "hull_untested": self.stability.hull_untested,
+                "within_cutoff": self.stability.within_cutoff,
+                "above_cutoff": self.stability.above_cutoff,
                 "dynamically_stable": self.stability.dynamically_stable,
                 "dynamically_unstable": self.stability.dynamically_unstable,
                 "dynamically_untested": self.stability.dynamically_untested,
                 "fully_stable": self.stability.fully_stable,
-                "near_hull_stable": self.stability.near_hull_stable,
             },
             "space_groups": {
                 "by_crystal_system": dict(self.space_groups.by_crystal_system),
@@ -254,15 +270,13 @@ class SystemExplorer:
         """List all chemical systems in the database."""
         return self.db.list_explored_systems()
 
-    def report(
-        self, chemical_system: str, near_hull_cutoff: float = 0.15
-    ) -> SystemReport:
+    def report(self, chemical_system: str, energy_cutoff: float = 0.5) -> SystemReport:
         """
         Generate a comprehensive report for a chemical system.
 
         Args:
             chemical_system: Chemical system (e.g., "Co-Fe-Mn")
-            near_hull_cutoff: Energy cutoff in eV/atom for "near hull" (default 150meV)
+            energy_cutoff: Energy cutoff in eV/atom for stability classification
 
         Returns:
             SystemReport with all statistics
@@ -277,12 +291,15 @@ class SystemExplorer:
             return SystemReport(
                 chemical_system=chemsys,
                 elements=elements,
-                near_hull_cutoff=near_hull_cutoff,
+                energy_cutoff=energy_cutoff,
             )
 
-        # Get hull entries
+        # Get hull entries (on hull)
         hull_structures = self.db.get_hull_entries(chemsys, e_above_hull_cutoff=0.0)
         hull_ids = {s.id for s in hull_structures}
+
+        # Get best structure per formula for hull stats
+        best_by_formula = self.db.get_best_structures_for_subsystem(chemsys)
 
         # Calculate statistics
         stability = StabilityStats(total=len(structures))
@@ -293,30 +310,27 @@ class SystemExplorer:
         energies = []
         unique_formulas = set()
 
+        # Count hull stats from best structures per formula
+        for formula, s in best_by_formula.items():
+            is_on_hull = s.id in hull_ids
+            if is_on_hull:
+                stability.on_hull += 1
+            elif s.e_above_hull is not None and s.e_above_hull <= energy_cutoff:
+                stability.within_cutoff += 1
+            else:
+                stability.above_cutoff += 1
+
+            # Fully stable = on hull AND dynamically stable
+            if is_on_hull and s.is_dynamically_stable:
+                stability.fully_stable += 1
+
+        # Count all structures for other stats
         for s in structures:
             unique_formulas.add(s.formula)
 
             # Energy stats
             if s.energy_per_atom is not None:
                 energies.append(s.energy_per_atom)
-
-            # Hull stability - use hull_ids for this specific chemsys
-            is_on_hull = s.id in hull_ids
-            is_near_hull = (
-                not is_on_hull
-                and s.e_above_hull is not None
-                and s.e_above_hull <= near_hull_cutoff
-            )
-
-            if s.e_above_hull is not None or is_on_hull:
-                if is_on_hull:
-                    stability.on_hull += 1
-                elif is_near_hull:
-                    stability.near_hull += 1
-                else:
-                    stability.above_hull += 1
-            else:
-                stability.hull_untested += 1
 
             # Dynamical stability
             if s.is_dynamically_stable is not None:
@@ -326,13 +340,6 @@ class SystemExplorer:
                     stability.dynamically_unstable += 1
             else:
                 stability.dynamically_untested += 1
-
-            # Fully stable = on hull AND dynamically stable
-            if is_on_hull and s.is_dynamically_stable:
-                stability.fully_stable += 1
-            # Near hull stable
-            if is_near_hull and s.is_dynamically_stable:
-                stability.near_hull_stable += 1
 
             # Space group stats
             if s.space_group_number:
@@ -384,14 +391,14 @@ class SystemExplorer:
             max_energy_per_atom=max_e,
             avg_energy_per_atom=avg_e,
             hull_structures=hull_structures,
-            near_hull_cutoff=near_hull_cutoff,
+            energy_cutoff=energy_cutoff,
         )
 
     def get_stable_structures(
         self,
         chemical_system: str,
         include_near_hull: bool = False,
-        e_above_hull_cutoff: float = 0.025,
+        e_above_hull_cutoff: float = 0.150,
     ) -> List[StoredStructure]:
         """
         Get thermodynamically stable structures (on or near hull).
@@ -600,6 +607,129 @@ class SystemExplorer:
                 result["unstable"].append(s)
 
         return result
+
+    def get_phase_diagram(
+        self,
+        chemical_system: str,
+        update_database: bool = True,
+        exclude_space_groups: Optional[List[str]] = None,
+        tested_only: bool = False,
+        all_polymorphs: bool = False,
+    ) -> Tuple[Optional[PhaseDiagram], Dict[str, float], Dict[str, int]]:
+        """
+        Compute the phase diagram for a chemical system.
+
+        Args:
+            chemical_system: Chemical system (e.g., "Co-Fe-Mn")
+            update_database: If True, update hull entries in database
+            exclude_space_groups: List of space group symbols to exclude (e.g., ["P1"])
+            tested_only: If True, only include phonon-tested structures
+            all_polymorphs: If True, include all structures not just best per formula
+
+        Returns:
+            Tuple of (PhaseDiagram, e_above_hull dict, filter_counts dict).
+            PhaseDiagram is None if insufficient data.
+        """
+        return self.db.compute_hull(
+            chemical_system,
+            update_database=update_database,
+            exclude_space_groups=exclude_space_groups,
+            tested_only=tested_only,
+            all_polymorphs=all_polymorphs,
+        )
+
+    def plot_phase_diagram(
+        self,
+        chemical_system: str,
+        show_unstable: float = 0.1,
+        update_database: bool = True,
+        exclude_space_groups: Optional[List[str]] = None,
+        tested_only: bool = False,
+        all_polymorphs: bool = False,
+    ) -> Tuple[Any, Dict[str, int]]:
+        """
+        Generate a phase diagram plot for a chemical system.
+
+        Args:
+            chemical_system: Chemical system (e.g., "Co-Fe-Mn")
+            show_unstable: Energy cutoff for showing unstable phases (eV/atom)
+            update_database: If True, update hull entries in database
+            exclude_space_groups: List of space group symbols to exclude (e.g., ["P1"])
+            tested_only: If True, only include phonon-tested structures
+            all_polymorphs: If True, include all structures not just best per formula
+
+        Returns:
+            Tuple of (Plotly figure, filter_counts dict), or (None, {}) if insufficient data
+        """
+        pd, _, filter_counts = self.get_phase_diagram(
+            chemical_system,
+            update_database=update_database,
+            exclude_space_groups=exclude_space_groups,
+            tested_only=tested_only,
+            all_polymorphs=all_polymorphs,
+        )
+        if pd is None:
+            return None, filter_counts
+        return pd.get_plot(show_unstable=show_unstable), filter_counts
+
+    def save_phase_diagram(
+        self,
+        chemical_system: str,
+        output_path: Optional[Union[str, Path]] = None,
+        show_unstable: float = 0.1,
+        save_png: bool = True,
+        update_database: bool = True,
+        exclude_space_groups: Optional[List[str]] = None,
+        tested_only: bool = False,
+        all_polymorphs: bool = False,
+    ) -> Tuple[Optional[Path], Dict[str, int]]:
+        """
+        Generate and save a phase diagram for a chemical system.
+
+        Args:
+            chemical_system: Chemical system (e.g., "Co-Fe-Mn")
+            output_path: Path to save HTML file. If None, uses
+                         "{chemsys}_phase_diagram.html" in current directory.
+            show_unstable: Energy cutoff for showing unstable phases (eV/atom)
+            save_png: If True, also save PNG (requires kaleido)
+            update_database: If True, update hull entries in database
+            exclude_space_groups: List of space group symbols to exclude (e.g., ["P1"])
+            tested_only: If True, only include phonon-tested structures
+            all_polymorphs: If True, include all structures not just best per formula
+
+        Returns:
+            Tuple of (Path to saved HTML, filter_counts dict), or (None, {}) if insufficient data
+        """
+        fig, filter_counts = self.plot_phase_diagram(
+            chemical_system,
+            show_unstable=show_unstable,
+            update_database=update_database,
+            exclude_space_groups=exclude_space_groups,
+            tested_only=tested_only,
+            all_polymorphs=all_polymorphs,
+        )
+        if fig is None:
+            return None, filter_counts
+
+        chemsys = self.db.normalize_chemsys(chemical_system)
+
+        if output_path is None:
+            output_path = Path(f"{chemsys}_phase_diagram.html")
+        else:
+            output_path = Path(output_path)
+
+        # Save HTML
+        fig.write_html(str(output_path))
+
+        # Try to save PNG if requested
+        if save_png:
+            try:
+                png_path = output_path.with_suffix(".png")
+                fig.write_image(str(png_path), scale=2)
+            except Exception:
+                pass  # kaleido not installed
+
+        return output_path, filter_counts
 
     def close(self):
         """Close the database connection."""

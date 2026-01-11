@@ -783,60 +783,113 @@ class StructureDatabase:
     # -------------------- Hull Computation --------------------
 
     def compute_hull(
-        self, chemical_system: str, update_database: bool = True
-    ) -> Tuple[Optional[PhaseDiagram], Dict[str, float]]:
+        self,
+        chemical_system: str,
+        update_database: bool = True,
+        exclude_space_groups: Optional[List[str]] = None,
+        tested_only: bool = False,
+        all_polymorphs: bool = False,
+    ) -> Tuple[Optional[PhaseDiagram], Dict[str, float], Dict[str, int]]:
         """
         Compute the convex hull for a chemical system using all known structures.
 
         Args:
             chemical_system: Chemical system (e.g., "Fe-Mn-Co")
             update_database: If True, update hull_entries table with results
+            exclude_space_groups: List of space group symbols to exclude (e.g., ["P1"])
+            tested_only: If True, only include structures that have been phonon-tested
+            all_polymorphs: If True, include all structures not just the best per formula
 
         Returns:
-            Tuple of (PhaseDiagram, dict mapping formula -> e_above_hull)
+            Tuple of (PhaseDiagram, dict mapping structure_id -> e_above_hull, filter_counts)
+            filter_counts has keys like 'excluded_p1', 'excluded_untested'
         """
         chemsys = self.normalize_chemsys(chemical_system)
         elements = chemsys.split("-")
+        filter_counts: Dict[str, int] = {}
 
-        # Get best structure for each formula in this system
-        best_structures = self.get_best_structures_for_subsystem(chemsys)
+        # Get structures for this system
+        if all_polymorphs:
+            all_structures = self.get_structures_for_subsystem(chemsys, valid_only=True)
+            # Convert to dict keyed by id for consistent handling
+            structures_dict = {s.id: s for s in all_structures}
+        else:
+            # Just best per formula
+            structures_dict = {
+                s.id: s
+                for s in self.get_best_structures_for_subsystem(chemsys).values()
+            }
 
-        if not best_structures:
+        if not structures_dict:
             logger.warning(f"No structures found for {chemsys}")
-            return None, {}
+            return None, {}, filter_counts
+
+        # Filter out excluded space groups
+        if exclude_space_groups:
+            exclude_set = set(exclude_space_groups)
+            filtered = {
+                sid: s
+                for sid, s in structures_dict.items()
+                if s.space_group_symbol not in exclude_set
+            }
+            excluded_count = len(structures_dict) - len(filtered)
+            if excluded_count > 0:
+                filter_counts["excluded_space_groups"] = excluded_count
+                logger.info(
+                    f"Excluded {excluded_count} structures with space groups: {exclude_space_groups}"
+                )
+            structures_dict = filtered
+
+        # Filter out phonon-untested structures
+        if tested_only:
+            filtered = {
+                sid: s
+                for sid, s in structures_dict.items()
+                if s.is_dynamically_stable is not None
+            }
+            excluded_count = len(structures_dict) - len(filtered)
+            if excluded_count > 0:
+                filter_counts["excluded_untested"] = excluded_count
+                logger.info(f"Excluded {excluded_count} phonon-untested structures")
+            structures_dict = filtered
+
+        if not structures_dict:
+            logger.warning(f"No structures found for {chemsys} after filtering")
+            return None, {}, filter_counts
 
         logger.info(
-            f"Computing hull for {chemsys} with {len(best_structures)} formulas"
+            f"Computing hull for {chemsys} with {len(structures_dict)} structures"
         )
 
         # Build phase diagram entries using ComputedEntry
         # (pymatgen's plotter shows labels as "Formula (entry_id)")
         entries = []
-        structure_map: Dict[str, StoredStructure] = {}  # reduced_formula -> structure
+        structure_map: Dict[str, StoredStructure] = {}  # entry_id -> structure
 
-        for formula, structure in best_structures.items():
-            comp = Composition(formula)
+        for structure in structures_dict.values():
+            comp = Composition(structure.formula)
             # Use energy per atom * num atoms in reduced formula
             energy = structure.energy_per_atom * comp.num_atoms
             # Use true formula + space group as entry_id for phase diagram labels
             # This shows the actual stoichiometry instead of reduced formula
             sg = structure.space_group_symbol or "?"
             sg_label = sg.replace("/", "-")
-            entry = ComputedEntry(comp, energy, entry_id=f"{formula} ({sg_label})")
+            # Use structure.id as entry_id for unique lookup (important when all_polymorphs=True)
+            entry_id = f"{structure.formula} ({sg_label})"
+            entry = ComputedEntry(comp, energy, entry_id=entry_id)
             entries.append(entry)
-            # Key by reduced_formula to match lookup later
-            structure_map[comp.reduced_formula] = structure
+            structure_map[entry_id] = structure
 
         if len(entries) < 2:
             logger.warning(f"Need at least 2 entries for hull, got {len(entries)}")
-            return None, {}
+            return None, {}, filter_counts
 
         # Build phase diagram
         try:
             pd = PhaseDiagram(entries)
         except Exception as e:
             logger.error(f"Failed to build phase diagram for {chemsys}: {e}")
-            return None, {}
+            return None, {}, filter_counts
 
         # Compute e_above_hull for each structure
         e_above_hull_map: Dict[str, float] = {}
@@ -844,22 +897,21 @@ class StructureDatabase:
 
         for entry in entries:
             e_hull = pd.get_e_above_hull(entry)
-            formula = entry.composition.reduced_formula
-            e_above_hull_map[formula] = e_hull
+            entry_id = entry.entry_id
+            structure = structure_map[entry_id]
+            e_above_hull_map[structure.id] = e_hull
 
             if e_hull < 1e-6:  # On hull
-                hull_structure_ids.append(structure_map[formula].id)
+                hull_structure_ids.append(structure.id)
 
-        # Update database
-        if update_database:
+        # Update database (only when using best-per-formula, not all polymorphs)
+        if update_database and not all_polymorphs:
             now = datetime.now().isoformat()
 
             # Clear old hull entries for this chemsys to avoid duplicates
-            # (e.g., if a different structure for the same formula was previously "best")
             self.conn.execute("DELETE FROM hull_entries WHERE chemsys = ?", (chemsys,))
 
-            for formula, e_hull in e_above_hull_map.items():
-                structure = structure_map[formula]
+            for structure_id, e_hull in e_above_hull_map.items():
                 is_on_hull = e_hull < 1e-6
 
                 self.conn.execute(
@@ -868,7 +920,7 @@ class StructureDatabase:
                     (chemsys, structure_id, e_above_hull, is_on_hull, computed_at)
                     VALUES (?, ?, ?, ?, ?)
                     """,
-                    (chemsys, structure.id, e_hull, 1 if is_on_hull else 0, now),
+                    (chemsys, structure_id, e_hull, 1 if is_on_hull else 0, now),
                 )
 
             # Save hull snapshot
@@ -894,7 +946,7 @@ class StructureDatabase:
                 f"Updated hull for {chemsys}: {len(hull_structure_ids)} entries on hull"
             )
 
-        return pd, e_above_hull_map
+        return pd, e_above_hull_map, filter_counts
 
     def get_hull_entries(
         self, chemical_system: str, e_above_hull_cutoff: float = 0.0

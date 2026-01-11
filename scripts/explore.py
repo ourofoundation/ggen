@@ -524,39 +524,9 @@ def main():
                 f"{C.DIM}{marker}{C.RESET}"
             )
 
-    # Generate and save phase diagram using ALL entries from the database
-    # (not just what was found in this run)
-    try:
-        # Build the full phase diagram from all database entries for this system
-        full_pd, e_above_hull_map = db.compute_hull(chemsys, update_database=True)
-
-        if full_pd is not None:
-            # Use pymatgen's plotter to create the figure
-            fig = full_pd.get_plot(show_unstable=args.e_above_hull)
-
-            # Save the figure
-            pd_path_html = result.run_directory / "phase_diagram.html"
-            fig.write_html(str(pd_path_html))
-            logger.info("")
-            logger.info(f"{C.BOLD}Output Files{C.RESET}")
-            logger.info(f"  Phase diagram: {C.DIM}{pd_path_html}{C.RESET}")
-
-            # Also try to save as PNG if kaleido is installed
-            try:
-                pd_path_png = result.run_directory / "phase_diagram.png"
-                fig.write_image(str(pd_path_png), scale=2)
-                logger.info(f"  Phase diagram: {C.DIM}{pd_path_png}{C.RESET}")
-            except Exception:
-                pass
-        else:
-            logger.info("")
-            logger.warning(
-                "No phase diagram available (need at least 2 valid candidates)"
-            )
-    except Exception as e:
-        logger.warning(f"Could not generate phase diagram: {e}")
-
     # Export summary
+    logger.info("")
+    logger.info(f"{C.BOLD}Output Files{C.RESET}")
     summary_path = result.run_directory / "summary.json"
     explorer.export_summary(result, output_path=summary_path)
     logger.info(f"  Summary:       {C.DIM}{summary_path}{C.RESET}")
