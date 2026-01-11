@@ -204,6 +204,9 @@ def export_candidates(
                     f"\n{C.CYAN}Tip:{C.RESET} {untested_count} structure(s) have not been tested for dynamical stability."
                 )
                 print(f"     Run: {C.DIM}python phonons.py --system {chemsys}{C.RESET}")
+                print(
+                    f"     Or:  {C.DIM}python export.py {chemsys} --include-unstable{C.RESET}"
+                )
         explorer.close()
         return []
 
@@ -264,11 +267,12 @@ def export_candidates(
                     if structure.e_above_hull is not None
                     else "?"
                 )
-                stable_str = (
-                    f"{C.GREEN}✓{C.RESET}"
-                    if structure.is_dynamically_stable
-                    else f"{C.RED}✗{C.RESET}"
-                )
+                if structure.is_dynamically_stable is True:
+                    stable_str = f"{C.GREEN}✓{C.RESET}"
+                elif structure.is_dynamically_stable is False:
+                    stable_str = f"{C.RED}✗{C.RESET}"
+                else:
+                    stable_str = f"{C.DIM}?{C.RESET}"
                 print(f"  {i:2d}. {C.CYAN}{filepath.name}{C.RESET}")
                 print(
                     f"      {structure.formula} | {crystal_sys} | E_hull: {ehull_str} | Stable: {stable_str}"

@@ -19,6 +19,7 @@ from itertools import combinations_with_replacement
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import torch
 import numpy as np
 from tqdm import tqdm
 from pymatgen.analysis.phase_diagram import PhaseDiagram
@@ -97,24 +98,36 @@ def _generate_structure_worker(args: Dict[str, Any]) -> Dict[str, Any]:
         num_atoms = len(structure)
         energy_per_atom = energy / num_atoms
 
+        # Extract data before cleanup
+        all_relaxed_trials = result.get("all_relaxed_trials", [])
+        final_space_group = result["final_space_group"]
+        final_space_group_symbol = result["final_space_group_symbol"]
+        generation_stats = result.get("generation_stats", {})
+        score_breakdown = result.get("score_breakdown", {})
+        optimization_steps = result.get("optimization_steps", 0)
+
+        # Clean up to free memory in this worker process
+        ggen.cleanup()
+        del result
+
         return {
             "formula": formula,
             "stoichiometry": stoichiometry,
             "energy_per_atom": energy_per_atom,
             "total_energy": energy,
             "num_atoms": num_atoms,
-            "space_group_number": result["final_space_group"],
-            "space_group_symbol": result["final_space_group_symbol"],
+            "space_group_number": final_space_group,
+            "space_group_symbol": final_space_group_symbol,
             "structure": structure,
             "generation_metadata": {
-                "generation_stats": result.get("generation_stats", {}),
-                "score_breakdown": result.get("score_breakdown", {}),
-                "optimization_steps": result.get("optimization_steps", 0),
+                "generation_stats": generation_stats,
+                "score_breakdown": score_breakdown,
+                "optimization_steps": optimization_steps,
             },
             "is_valid": True,
             "error_message": None,
             # Additional relaxed trials (polymorphs) for database storage
-            "all_relaxed_trials": result.get("all_relaxed_trials", []),
+            "all_relaxed_trials": all_relaxed_trials,
         }
 
     except Exception as e:
@@ -990,6 +1003,17 @@ class ChemistryExplorer:
                         f"Saved {len(additional_trials)} additional polymorphs for {formula}"
                     )
 
+            # Track count before clearing
+            num_trials_saved = len(additional_trials)
+
+            # Clear all_relaxed_trials from result to free memory
+            # (we've already saved them to the database and set structures to None)
+            result["all_relaxed_trials"] = None
+            del additional_trials
+
+            # Clean up the GGen instance to free memory
+            ggen.cleanup()
+
             return CandidateResult(
                 formula=formula,
                 stoichiometry=stoichiometry,
@@ -1003,7 +1027,7 @@ class ChemistryExplorer:
                     "generation_stats": result.get("generation_stats", {}),
                     "score_breakdown": result.get("score_breakdown", {}),
                     "optimization_steps": result.get("optimization_steps", 0),
-                    "num_additional_trials_saved": len(additional_trials),
+                    "num_additional_trials_saved": num_trials_saved,
                 },
             )
 
@@ -1419,7 +1443,7 @@ class ChemistryExplorer:
                             logger.debug(
                                 f"Saved {len(additional_trials)} additional polymorphs for {formula}"
                             )
-                    
+
                     # Clear the trials list from result dict to free memory
                     result_dict["all_relaxed_trials"] = None
 
@@ -1461,9 +1485,11 @@ class ChemistryExplorer:
                     self._save_candidate(conn, candidate)
                     candidates.append(candidate)
 
-                    # Periodic garbage collection to prevent memory accumulation
-                    if len(candidates) % 10 == 0:
-                        gc.collect()
+                    # Aggressive memory cleanup after each stoichiometry
+                    # to prevent memory accumulation during long runs
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
                 except Exception as e:
                     logger.warning(f"Worker failed for {formula}: {e}")
@@ -1940,9 +1966,11 @@ class ChemistryExplorer:
                     self._save_candidate(conn, candidate)
                     candidates.append(candidate)
 
-                    # Periodic garbage collection to prevent memory accumulation
-                    if (i + 1) % 10 == 0:
-                        gc.collect()
+                    # Aggressive memory cleanup after each stoichiometry
+                    # to prevent memory accumulation during long runs
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
         # Add remaining structures from previous runs that weren't in our enumeration
         if load_previous_runs:

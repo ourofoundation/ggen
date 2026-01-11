@@ -344,6 +344,23 @@ class GGen:
             "total_frames": 0,
         }
 
+    def cleanup(self) -> None:
+        """Clean up internal state to free memory.
+
+        Call this after processing each structure to prevent memory accumulation
+        during long exploration runs. Clears trajectory data and internal structure
+        references.
+        """
+        self._current_structure = None
+        self._current_pyxtal = None
+        self._trajectory_structures.clear()
+        self._trajectory_metadata.clear()
+        self._trajectory_info["total_frames"] = 0
+        gc.collect()
+        # Clear torch GPU cache if available
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     # -------------------- Space-group utilities --------------------
 
     def get_compatible_space_groups(
