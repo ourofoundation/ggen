@@ -29,6 +29,10 @@ warnings.filterwarnings(
 warnings.filterwarnings("ignore", category=UserWarning, module="pymatgen.io.cif")
 # Suppress orb_models torch dtype warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="orb_models.utils")
+# Suppress ASE FixSymmetry adjust_cell warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="ase.constraints")
+# Suppress scipy logm accuracy warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="scipy._lib._util")
 
 
 class ColoredFormatter(logging.Formatter):
@@ -160,10 +164,16 @@ def main():
         help="Skip structure optimization (default: False)",
     )
     parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=400,
+        help="Maximum optimization steps per structure (default: 400)",
+    )
+    parser.add_argument(
         "--preserve-symmetry",
         action="store_true",
-        default=True,
-        help="Preserve symmetry during optimization (default: True)",
+        default=False,
+        help="Preserve symmetry during optimization using ASE sequential relaxation with FixSymmetry (default: False, uses fast batched torch-sim)",
     )
     parser.add_argument(
         "--e-above-hull",
@@ -185,6 +195,20 @@ def main():
         "--require-all-elements",
         action="store_true",
         help="Only generate formulas containing all elements of the system (e.g., for Fe-Co-Bi, only Fe-Co-Bi formulas, not Fe-Co)",
+    )
+    parser.add_argument(
+        "--min-fraction",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Minimum element fraction constraints. Format: 'Fe:0.4 Co:0.2' means Fe >= 40%%, Co >= 20%%",
+    )
+    parser.add_argument(
+        "--max-fraction",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Maximum element fraction constraints. Format: 'Bi:0.2' means Bi <= 20%%",
     )
     parser.add_argument(
         "--seed", type=int, default=None, help="Random seed for reproducibility"
@@ -230,8 +254,11 @@ def main():
     logger.setLevel(log_level)
     logger.propagate = False
 
-    # Suppress other loggers
-    # logging.getLogger("ggen").setLevel(logging.WARNING)
+    # Also configure ggen module logger to show INFO messages
+    ggen_logger = logging.getLogger("ggen.ggen")
+    ggen_logger.handlers = [handler]
+    ggen_logger.setLevel(log_level)
+    ggen_logger.propagate = False
 
     # Initialize unified database
     db = StructureDatabase(args.db_path)
@@ -291,6 +318,54 @@ def main():
     logger.info("")
     logger.info(f"{C.CYAN}Starting exploration...{C.RESET}")
 
+    # Parse fraction constraint arguments (format: "Fe:0.4 Co:0.2")
+    def parse_fraction_constraints(constraints_list):
+        """Parse fraction constraints from CLI format to dict."""
+        if not constraints_list:
+            return None
+        result = {}
+        for item in constraints_list:
+            if ":" not in item:
+                logger.error(
+                    f"Invalid fraction constraint format: '{item}'. Use 'Element:fraction' (e.g., 'Fe:0.4')"
+                )
+                sys.exit(1)
+            element, fraction_str = item.split(":", 1)
+            try:
+                fraction = float(fraction_str)
+                if not 0.0 <= fraction <= 1.0:
+                    raise ValueError("Fraction must be between 0.0 and 1.0")
+                result[element] = fraction
+            except ValueError as e:
+                logger.error(
+                    f"Invalid fraction value for {element}: {fraction_str}. {e}"
+                )
+                sys.exit(1)
+        return result
+
+    min_fraction = parse_fraction_constraints(args.min_fraction)
+    max_fraction = parse_fraction_constraints(args.max_fraction)
+
+    # Log composition constraints if set
+    if min_fraction or max_fraction:
+        constraints = []
+        if min_fraction:
+            for el, frac in min_fraction.items():
+                constraints.append(f"{el} ≥ {frac*100:.1f}%")
+        if max_fraction:
+            for el, frac in max_fraction.items():
+                constraints.append(f"{el} ≤ {frac*100:.1f}%")
+        logger.info(
+            f"{C.YELLOW}Composition constraints: {', '.join(constraints)}{C.RESET}"
+        )
+
+    # Log crystal system constraints if set
+    if args.crystal_systems:
+        crystal_systems_str = ", ".join(args.crystal_systems)
+        logger.info(
+            f"{C.YELLOW}Crystal system constraints: {crystal_systems_str}{C.RESET}"
+        )
+
     # Parse space group argument (can be number or symbol)
     space_group = None
     if args.space_group:
@@ -330,6 +405,9 @@ def main():
         keep_structures_in_memory=args.keep_in_memory,
         use_unified_database=True,
         compute_phonons=args.compute_phonons,
+        min_fraction=min_fraction,
+        max_fraction=max_fraction,
+        optimization_max_steps=args.max_steps,
     )
 
     # Get stats AFTER exploration

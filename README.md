@@ -35,6 +35,12 @@ python scripts/explore.py Fe-Mn-Si --max-atoms 24 --num-trials 25
 
 # Focus on specific crystal systems
 python scripts/explore.py Li-Co-O --crystal-systems hexagonal trigonal
+
+# Bias towards Fe-rich compositions (Fe must be ≥40% of atoms)
+python scripts/explore.py Fe-Co-Bi --min-fraction Fe:0.4
+
+# Combined constraints: high Fe, low Bi
+python scripts/explore.py Fe-Co-Bi --min-fraction Fe:0.3 --max-fraction Bi:0.2
 ```
 
 **What happens:** GGen enumerates all stoichiometries up to `--max-atoms` (default: 20), generates `--num-trials` candidate structures per stoichiometry (default: 15), and relaxes each using the ORB force field. Results are stored in a unified SQLite database that persists across runs—structures from Fe-Mn explored in one run are automatically reused when you explore Fe-Mn-Co later.
@@ -78,6 +84,8 @@ python scripts/explore.py --help
 | `--max-stoichiometries` | 100 | Cap on stoichiometries to explore |
 | `--crystal-systems` | all | Filter: `cubic`, `hexagonal`, `tetragonal`, etc. |
 | `--require-all-elements` | off | Only generate formulas containing all elements (skip subsystems) |
+| `--min-fraction` | none | Minimum element fractions, e.g. `Fe:0.4 Co:0.2` |
+| `--max-fraction` | none | Maximum element fractions, e.g. `Bi:0.2` |
 | `-j`, `--workers` | 1 | Parallel workers for generation |
 | `--e-above-hull` | 0.15 | Energy cutoff (eV) for "stable" phases |
 | `--compute-phonons` | off | Run phonon calculations during exploration |
@@ -280,7 +288,10 @@ result = explorer.explore(
     max_atoms=16,
     num_trials=15,
     optimize=True,
-    preserve_symmetry=True
+    preserve_symmetry=True,
+    # Bias towards Fe-rich compositions
+    min_fraction={"Fe": 0.4},
+    max_fraction={"Si": 0.3},
 )
 
 print(f"Found {len(result.hull_entries)} phases on the convex hull")

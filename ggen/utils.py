@@ -1,4 +1,33 @@
-from typing import Tuple
+from typing import Literal, Tuple
+
+import numpy as np
+
+
+def compute_fmax(
+    forces: np.ndarray,
+    mode: Literal["norm", "component"] = "norm",
+) -> float:
+    """Compute the maximum force from a forces array.
+
+    Args:
+        forces: Array of shape (n_atoms, 3) containing force vectors.
+        mode: How to compute fmax:
+            - "norm": Max magnitude of force vectors (sqrt of sum of squares).
+              This is what ASE optimizers use for convergence.
+            - "component": Max absolute value of any force component.
+              Simpler but stricter metric.
+
+    Returns:
+        Maximum force value.
+    """
+    if mode == "norm":
+        # Max vector magnitude (ASE optimizer style)
+        return float(np.sqrt((forces**2).sum(axis=1).max()))
+    elif mode == "component":
+        # Max absolute component
+        return float(np.max(np.abs(forces)))
+    else:
+        raise ValueError(f"Unknown fmax mode: {mode}")
 
 
 def parse_chemical_formula(formula: str) -> Tuple[list[str], list[int]]:

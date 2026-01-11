@@ -10,7 +10,7 @@ from .calculator import get_orb_calculator
 from .colors import Colors
 from .database import ExplorationRun, StoredStructure, StructureDatabase
 from .explorer import CandidateResult, ChemistryExplorer, ExplorationResult
-from .ggen import GGen
+from .ggen import GGen, get_space_group_cache_info, clear_space_group_cache
 from .operations import MutationError, Operations
 from .phonons import (
     PhononResult,
@@ -57,4 +57,7 @@ __all__ = [
     "Colors",
     "get_orb_calculator",
     "parse_chemical_formula",
+    # Cache management
+    "get_space_group_cache_info",
+    "clear_space_group_cache",
 ]

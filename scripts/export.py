@@ -7,7 +7,7 @@ with filters for dynamical stability and crystal system.
 
 Usage:
     python scripts/export.py Co-Fe-Mn -n 10 -o ./export/
-    python scripts/export.py Co-Fe-Mn -n 5 --crystal-system tetragonal
+    python scripts/export.py Co-Fe-Mn -n 5 --crystal-systems tetragonal
     python scripts/export.py Co-Fe-Mn --max-ehull 0.05 --include-unstable
 """
 
@@ -54,7 +54,9 @@ def format_ehull(e_above_hull: Optional[float]) -> str:
     return f"{mev:.0f}meV"
 
 
-def generate_cif_filename(structure: StoredStructure, include_ehull: bool = True) -> str:
+def generate_cif_filename(
+    structure: StoredStructure, include_ehull: bool = True
+) -> str:
     """
     Generate a descriptive CIF filename.
 
@@ -82,7 +84,7 @@ def export_candidates(
     output_dir: Path,
     n: int = 10,
     db_path: str = "./ggen.db",
-    crystal_system: Optional[str] = None,
+    crystal_systems: Optional[List[str]] = None,
     dynamically_stable_only: bool = True,
     max_e_above_hull: Optional[float] = None,
     include_metadata: bool = True,
@@ -96,7 +98,7 @@ def export_candidates(
         output_dir: Directory to export CIF files to
         n: Number of candidates to export
         db_path: Path to the ggen database
-        crystal_system: Filter by crystal system (e.g., "tetragonal", "cubic")
+        crystal_systems: Filter by crystal systems (e.g., ["tetragonal", "cubic"])
         dynamically_stable_only: Only export dynamically stable structures
         max_e_above_hull: Maximum energy above hull in eV/atom
         include_metadata: Write metadata JSON file
@@ -133,11 +135,12 @@ def export_candidates(
         if verbose:
             print(f"  Dynamically stable: {len(candidates)}/{before}")
             if untested_count > 0:
-                print(f"  {C.YELLOW}Untested (phonons pending): {untested_count}{C.RESET}")
+                print(
+                    f"  {C.YELLOW}Untested (phonons pending): {untested_count}{C.RESET}"
+                )
 
-    # Filter by crystal system
-    if crystal_system:
-        crystal_system = crystal_system.lower()
+    # Filter by crystal systems
+    if crystal_systems:
         valid_systems = {
             "triclinic",
             "monoclinic",
@@ -147,21 +150,27 @@ def export_candidates(
             "hexagonal",
             "cubic",
         }
-        if crystal_system not in valid_systems:
-            print(f"{C.RED}Error: Invalid crystal system '{crystal_system}'{C.RESET}")
+        crystal_systems_lower = [cs.lower() for cs in crystal_systems]
+        invalid = [cs for cs in crystal_systems_lower if cs not in valid_systems]
+        if invalid:
+            print(
+                f"{C.RED}Error: Invalid crystal system(s): {', '.join(invalid)}{C.RESET}"
+            )
             print(f"Valid options: {', '.join(sorted(valid_systems))}")
             explorer.close()
             return []
 
         before = len(candidates)
+        valid_systems_set = set(crystal_systems_lower)
         candidates = [
             s
             for s in candidates
             if s.space_group_number
-            and get_crystal_system(s.space_group_number) == crystal_system
+            and get_crystal_system(s.space_group_number) in valid_systems_set
         ]
         if verbose:
-            print(f"  {crystal_system.capitalize()} structures: {len(candidates)}/{before}")
+            systems_str = ", ".join(cs.capitalize() for cs in crystal_systems_lower)
+            print(f"  {systems_str} structures: {len(candidates)}/{before}")
 
     # Filter by max e_above_hull
     if max_e_above_hull is not None:
@@ -172,7 +181,9 @@ def export_candidates(
             if s.e_above_hull is not None and s.e_above_hull <= max_e_above_hull
         ]
         if verbose:
-            print(f"  Within {max_e_above_hull*1000:.0f} meV of hull: {len(candidates)}/{before}")
+            print(
+                f"  Within {max_e_above_hull*1000:.0f} meV of hull: {len(candidates)}/{before}"
+            )
 
     # Sort by e_above_hull, then by energy_per_atom
     candidates.sort(
@@ -189,7 +200,9 @@ def export_candidates(
         if verbose:
             print(f"\n{C.YELLOW}No candidates match the criteria.{C.RESET}")
             if untested_count > 0:
-                print(f"\n{C.CYAN}Tip:{C.RESET} {untested_count} structure(s) have not been tested for dynamical stability.")
+                print(
+                    f"\n{C.CYAN}Tip:{C.RESET} {untested_count} structure(s) have not been tested for dynamical stability."
+                )
                 print(f"     Run: {C.DIM}python phonons.py --system {chemsys}{C.RESET}")
         explorer.close()
         return []
@@ -273,7 +286,7 @@ def export_candidates(
             "export_date": datetime.now().isoformat(),
             "filters": {
                 "dynamically_stable_only": dynamically_stable_only,
-                "crystal_system": crystal_system,
+                "crystal_systems": crystal_systems,
                 "max_e_above_hull_eV": max_e_above_hull,
                 "top_n": n,
             },
@@ -290,22 +303,24 @@ def export_candidates(
     explorer.close()
 
     if verbose:
-        print(f"\n{C.GREEN}✓ Exported {len(exported)} structures to {output_dir}{C.RESET}\n")
+        print(
+            f"\n{C.GREEN}✓ Exported {len(exported)} structures to {output_dir}{C.RESET}\n"
+        )
 
     return exported
 
 
 def generate_output_dirname(
     chemical_system: str,
-    crystal_system: Optional[str] = None,
+    crystal_systems: Optional[List[str]] = None,
     max_e_above_hull: Optional[float] = None,
     dynamically_stable_only: bool = True,
 ) -> str:
     """Generate a descriptive output directory name based on filters."""
     parts = [chemical_system]
 
-    if crystal_system:
-        parts.append(crystal_system)
+    if crystal_systems:
+        parts.append("-".join(crystal_systems))
 
     if max_e_above_hull is not None:
         mev = int(max_e_above_hull * 1000)
@@ -324,14 +339,15 @@ def main():
         epilog="""
 Examples:
   %(prog)s Co-Fe-Mn -n 10
-  %(prog)s Co-Fe-Mn -n 5 --crystal-system tetragonal
+  %(prog)s Co-Fe-Mn -n 5 --crystal-systems tetragonal
+  %(prog)s Co-Fe-Mn -n 5 --crystal-systems tetragonal cubic
   %(prog)s Co-Fe-Mn --max-ehull 0.05 --include-unstable
-  %(prog)s Co-Fe-Mn -n 20 -o ./my_export/ -c tetragonal
 
 Output directories are auto-generated in exports/ based on filters:
-  Co-Fe-Mn                    -> exports/Co-Fe-Mn/
-  Co-Fe-Mn -c tetragonal      -> exports/Co-Fe-Mn-tetragonal/
-  Co-Fe-Mn --max-ehull 0.05   -> exports/Co-Fe-Mn-50meV/
+  Co-Fe-Mn                          -> exports/Co-Fe-Mn/
+  Co-Fe-Mn --crystal-systems tetragonal -> exports/Co-Fe-Mn-tetragonal/
+  Co-Fe-Mn --crystal-systems tetragonal cubic -> exports/Co-Fe-Mn-tetragonal-cubic/
+  Co-Fe-Mn --max-ehull 0.05         -> exports/Co-Fe-Mn-50meV/
         """,
     )
 
@@ -363,8 +379,9 @@ Output directories are auto-generated in exports/ based on filters:
     )
 
     parser.add_argument(
-        "-c",
-        "--crystal-system",
+        "--crystal-systems",
+        type=str,
+        nargs="+",
         choices=[
             "triclinic",
             "monoclinic",
@@ -374,7 +391,7 @@ Output directories are auto-generated in exports/ based on filters:
             "hexagonal",
             "cubic",
         ],
-        help="Filter by crystal system",
+        help="Filter by crystal system(s)",
     )
 
     parser.add_argument(
@@ -417,7 +434,10 @@ Output directories are auto-generated in exports/ based on filters:
     # Check database exists
     db_path = Path(args.db)
     if not db_path.exists():
-        print(f"{Colors.RED}Error:{Colors.RESET} Database not found: {db_path}", file=sys.stderr)
+        print(
+            f"{Colors.RED}Error:{Colors.RESET} Database not found: {db_path}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     # Determine output directory
@@ -426,7 +446,7 @@ Output directories are auto-generated in exports/ based on filters:
     else:
         dirname = generate_output_dirname(
             chemical_system=args.system,
-            crystal_system=args.crystal_system,
+            crystal_systems=args.crystal_systems,
             max_e_above_hull=args.max_ehull,
             dynamically_stable_only=not args.include_unstable,
         )
@@ -438,7 +458,7 @@ Output directories are auto-generated in exports/ based on filters:
             output_dir=output_dir,
             n=args.top,
             db_path=str(args.db),
-            crystal_system=args.crystal_system,
+            crystal_systems=args.crystal_systems,
             dynamically_stable_only=not args.include_unstable,
             max_e_above_hull=args.max_ehull,
             include_metadata=not args.no_metadata,
@@ -448,10 +468,10 @@ Output directories are auto-generated in exports/ based on filters:
     except Exception as e:
         print(f"{Colors.RED}Error: {e}{Colors.RESET}", file=sys.stderr)
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
-

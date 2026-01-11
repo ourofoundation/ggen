@@ -56,6 +56,7 @@ def _generate_structure_worker(args: Dict[str, Any]) -> Dict[str, Any]:
     space_group = args.get("space_group")
     preserve_symmetry = args["preserve_symmetry"]
     random_seed = args["random_seed"]
+    optimization_max_steps = args.get("optimization_max_steps", 400)
 
     # Build formula string
     formula = "".join(
@@ -84,6 +85,7 @@ def _generate_structure_worker(args: Dict[str, Any]) -> Dict[str, Any]:
             crystal_systems=crystal_systems,
             refine_symmetry=not preserve_symmetry,
             preserve_symmetry=preserve_symmetry,
+            optimization_max_steps=optimization_max_steps,
         )
 
         structure = ggen.get_structure()
@@ -445,6 +447,67 @@ class ChemistryExplorer:
                         kept_totals.add(target_total)
 
         return result
+
+    def filter_stoichiometries_by_fraction(
+        self,
+        stoichiometries: List[Dict[str, int]],
+        min_fraction: Optional[Dict[str, float]] = None,
+        max_fraction: Optional[Dict[str, float]] = None,
+    ) -> List[Dict[str, int]]:
+        """Filter stoichiometries based on element fraction constraints.
+
+        Args:
+            stoichiometries: List of stoichiometry dictionaries.
+            min_fraction: Minimum fraction constraints, e.g., {"Fe": 0.4} means
+                Fe must be at least 40% of atoms.
+            max_fraction: Maximum fraction constraints, e.g., {"Bi": 0.2} means
+                Bi must be at most 20% of atoms.
+
+        Returns:
+            Filtered list of stoichiometries satisfying all constraints.
+
+        Example:
+            >>> stoichs = [{"Fe": 3, "Co": 1, "Bi": 1}, {"Fe": 1, "Co": 1, "Bi": 3}]
+            >>> filtered = explorer.filter_stoichiometries_by_fraction(
+            ...     stoichs, min_fraction={"Fe": 0.4}
+            ... )
+            >>> # Returns [{"Fe": 3, "Co": 1, "Bi": 1}] since Fe=3/5=60% >= 40%
+        """
+        if not min_fraction and not max_fraction:
+            return stoichiometries
+
+        min_fraction = min_fraction or {}
+        max_fraction = max_fraction or {}
+
+        filtered = []
+        for stoich in stoichiometries:
+            total_atoms = sum(stoich.values())
+            if total_atoms == 0:
+                continue
+
+            passes = True
+
+            # Check min_fraction constraints
+            for element, min_frac in min_fraction.items():
+                count = stoich.get(element, 0)
+                actual_frac = count / total_atoms
+                if actual_frac < min_frac:
+                    passes = False
+                    break
+
+            # Check max_fraction constraints
+            if passes:
+                for element, max_frac in max_fraction.items():
+                    count = stoich.get(element, 0)
+                    actual_frac = count / total_atoms
+                    if actual_frac > max_frac:
+                        passes = False
+                        break
+
+            if passes:
+                filtered.append(stoich)
+
+        return filtered
 
     # -------------------- Database Management --------------------
 
@@ -823,6 +886,7 @@ class ChemistryExplorer:
         space_group: Optional[int] = None,
         preserve_symmetry: bool = False,
         show_progress: bool = False,
+        optimization_max_steps: int = 400,
     ) -> CandidateResult:
         """Generate and optimize a structure for a given stoichiometry.
 
@@ -872,6 +936,7 @@ class ChemistryExplorer:
                 refine_symmetry=not preserve_symmetry,  # Don't need refinement if preserving
                 preserve_symmetry=preserve_symmetry,
                 show_progress=show_progress,
+                optimization_max_steps=optimization_max_steps,
             )
 
             structure = ggen.get_structure()
@@ -1008,6 +1073,7 @@ class ChemistryExplorer:
         symmetry_bias: float = 0.0,
         preserve_symmetry: bool = False,
         show_progress: bool = False,
+        optimization_max_steps: int = 400,
     ) -> List[CandidateResult]:
         """Generate structures for pure elements (terminal entries for phase diagram).
 
@@ -1060,6 +1126,7 @@ class ChemistryExplorer:
                         refine_symmetry=not preserve_symmetry,
                         preserve_symmetry=preserve_symmetry,
                         show_progress=show_progress,
+                        optimization_max_steps=optimization_max_steps,
                     )
 
                     structure = ggen.get_structure()
@@ -1238,6 +1305,7 @@ class ChemistryExplorer:
         interrupted_flag,
         compute_phonons: bool = False,
         phonon_supercell: Tuple[int, int, int] = (2, 2, 2),
+        optimization_max_steps: int = 400,
     ) -> Tuple[List[CandidateResult], int, int]:
         """Generate structures in parallel using ProcessPoolExecutor.
 
@@ -1256,6 +1324,7 @@ class ChemistryExplorer:
                     "space_group": space_group,
                     "preserve_symmetry": preserve_symmetry,
                     "random_seed": self.random_seed,
+                    "optimization_max_steps": optimization_max_steps,
                 }
             )
 
@@ -1433,6 +1502,9 @@ class ChemistryExplorer:
         use_unified_database: bool = True,
         compute_phonons: bool = False,
         phonon_supercell: Tuple[int, int, int] = (2, 2, 2),
+        min_fraction: Optional[Dict[str, float]] = None,
+        max_fraction: Optional[Dict[str, float]] = None,
+        optimization_max_steps: int = 400,
     ) -> ExplorationResult:
         """Explore a chemical system by generating candidate structures.
 
@@ -1498,6 +1570,13 @@ class ChemistryExplorer:
                 using the phonons.py script for structures of interest.
             phonon_supercell: Supercell dimensions for phonon calculations (if enabled).
                 Default (2,2,2).
+            min_fraction: Minimum element fraction constraints. Dict mapping element symbols
+                to minimum fractions (0.0-1.0). E.g., {"Fe": 0.4} means Fe must be at least
+                40% of atoms in each stoichiometry. Useful for biasing exploration toward
+                compositions rich in specific elements.
+            max_fraction: Maximum element fraction constraints. Dict mapping element symbols
+                to maximum fractions (0.0-1.0). E.g., {"Bi": 0.2} means Bi can be at most
+                20% of atoms. Can be combined with min_fraction.
 
         Returns:
             ExplorationResult with all candidates, phase diagram, and stable phases.
@@ -1640,6 +1719,30 @@ class ChemistryExplorer:
             require_all_elements=require_all_elements,
         )
 
+        # Filter stoichiometries by element fraction constraints if specified
+        if min_fraction or max_fraction:
+            original_count = len(stoichiometries)
+            stoichiometries = self.filter_stoichiometries_by_fraction(
+                stoichiometries,
+                min_fraction=min_fraction,
+                max_fraction=max_fraction,
+            )
+            filtered_count = original_count - len(stoichiometries)
+            if filtered_count > 0:
+                # Build constraint description for logging
+                constraints = []
+                if min_fraction:
+                    for el, frac in min_fraction.items():
+                        constraints.append(f"{el} ≥ {frac*100:.1f}%")
+                if max_fraction:
+                    for el, frac in max_fraction.items():
+                        constraints.append(f"{el} ≤ {frac*100:.1f}%")
+                logger.info(
+                    f"Filtered {filtered_count} stoichiometries not matching "
+                    f"composition constraints ({', '.join(constraints)}). "
+                    f"{len(stoichiometries)} remaining."
+                )
+
         # Filter stoichiometries by space group compatibility if specified.
         # enumerate_stoichiometries now returns versions at Z=1,2,4,8 for each
         # composition ratio, so we just need to check exact counts.
@@ -1756,6 +1859,7 @@ class ChemistryExplorer:
                     interrupted_flag=lambda: interrupted,
                     compute_phonons=compute_phonons,
                     phonon_supercell=phonon_supercell,
+                    optimization_max_steps=optimization_max_steps,
                 )
             else:
                 # Sequential generation - show relaxation progress for each structure
@@ -1781,6 +1885,7 @@ class ChemistryExplorer:
                         space_group=space_group,
                         preserve_symmetry=preserve_symmetry,
                         show_progress=show_progress,
+                        optimization_max_steps=optimization_max_steps,
                     )
 
                     # If we have a previous structure and this one failed or is worse, use the previous
@@ -1882,6 +1987,7 @@ class ChemistryExplorer:
                 symmetry_bias=symmetry_bias,
                 preserve_symmetry=preserve_symmetry,
                 show_progress=show_progress,
+                optimization_max_steps=optimization_max_steps,
             )
 
             # Compare with previous runs and keep the better terminal

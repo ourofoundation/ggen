@@ -8,6 +8,7 @@ import math
 import warnings
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -33,7 +34,7 @@ from scipy.spatial.distance import cosine
 from .calculator import get_orb_calculator
 from .colors import Colors
 from .operations import Operations
-from .utils import parse_chemical_formula
+from .utils import compute_fmax, parse_chemical_formula
 
 # ===================== TorchSim Integration =====================
 
@@ -54,6 +55,66 @@ if not logger.handlers:
 
 
 # ===================== Helper utilities =====================
+
+
+@lru_cache(maxsize=8192)
+def _get_compatible_space_groups_cached(
+    counts_tuple: Tuple[int, ...],
+) -> Tuple[Dict[str, Any], ...]:
+    """Get space groups compatible with a given stoichiometry (cached).
+
+    Compatibility depends only on atom counts, not elements, so we cache by counts.
+    This provides significant speedup when exploring multiple formulas with the
+    same stoichiometry pattern.
+
+    Args:
+        counts_tuple: Tuple of stoichiometric coefficients (must be tuple for hashing).
+
+    Returns:
+        Tuple of dictionaries containing compatible space-group info.
+    """
+    compatible_groups = []
+    counts = list(counts_tuple)
+
+    for sg_number in range(1, 231):  # International space groups 1–230
+        try:
+            group = Group(sg_number, dim=3)
+            is_compatible, _ = group.check_compatible(counts)
+            if is_compatible:
+                wyckoff_positions = group.Wyckoff_positions
+                compatible_groups.append(
+                    {
+                        "number": sg_number,
+                        "symbol": group.symbol,
+                        "wyckoff_positions": len(wyckoff_positions),
+                        "chiral": group.chiral,
+                        "polar": group.polar,
+                        "inversion": group.inversion,
+                        "lattice_type": getattr(group, "lattice_type", None),
+                    }
+                )
+        except Exception:
+            continue
+
+    # Return as tuple for immutability (lru_cache requirement for return value stability)
+    return tuple(compatible_groups)
+
+
+def get_space_group_cache_info():
+    """Get cache statistics for space group compatibility checks.
+
+    Returns:
+        Named tuple with hits, misses, maxsize, currsize.
+    """
+    return _get_compatible_space_groups_cached.cache_info()
+
+
+def clear_space_group_cache():
+    """Clear the space group compatibility cache.
+
+    Useful for testing or when memory needs to be freed.
+    """
+    _get_compatible_space_groups_cached.cache_clear()
 
 
 def _angles_to_radians(
@@ -290,6 +351,7 @@ class GGen:
         """Get space groups compatible with a given stoichiometry.
 
         Note: Compatibility is based on the multiplicities / Wyckoff partitioning of `counts` only.
+        Results are cached by counts tuple for significant speedup on repeated calls.
 
         Args:
             elements: List of element symbols (not used in the compatibility check).
@@ -298,29 +360,10 @@ class GGen:
         Returns:
             List of dictionaries containing compatible space-group info.
         """
-        compatible_groups: List[Dict[str, Any]] = []
-
-        for sg_number in range(1, 231):  # International space groups 1–230
-            try:
-                group = Group(sg_number, dim=3)
-                is_compatible, _ = group.check_compatible(counts)
-                if is_compatible:
-                    wyckoff_positions = group.Wyckoff_positions
-                    compatible_groups.append(
-                        {
-                            "number": sg_number,
-                            "symbol": group.symbol,
-                            "wyckoff_positions": len(wyckoff_positions),
-                            "chiral": group.chiral,
-                            "polar": group.polar,
-                            "inversion": group.inversion,
-                            "lattice_type": getattr(group, "lattice_type", None),
-                        }
-                    )
-            except Exception:
-                continue
-
-        return compatible_groups
+        # Use cached function - convert counts to tuple for hashing
+        cached_result = _get_compatible_space_groups_cached(tuple(counts))
+        # Return as list (copy) to allow caller modification without affecting cache
+        return list(cached_result)
 
     def select_random_space_group_with_symmetry_preference(
         self,
@@ -1087,13 +1130,13 @@ class GGen:
 
     # -------------------- Batched relaxation (torch-sim) --------------------
 
-    def _batch_relax_candidates_torchsim(
+    def _relax_candidates_batched(
         self,
         candidates: List[pyxtal],
         max_steps: int = 400,
         fmax: float = 0.02,
         show_progress: bool = False,
-    ) -> List[Tuple[Structure, float, int]]:
+    ) -> List[Tuple[Structure, float, int, float]]:
         """Relax multiple candidates in parallel using torch-sim.
 
         This method uses torch-sim's batched GPU optimization to relax all
@@ -1107,7 +1150,14 @@ class GGen:
             show_progress: Whether to show progress bar.
 
         Returns:
-            List of (relaxed_structure, final_energy, steps) tuples.
+            List of (relaxed_structure, final_energy, steps, final_fmax) tuples.
+
+            Note: We return final_fmax from relaxation rather than recomputing it later
+            because the pymatgen<->ASE round-trip conversion can introduce numerical
+            differences. In some cases we observed fmax changing from <0.01 to >0.02
+            after structure format conversion, likely due to coordinate wrapping and
+            floating-point precision differences affecting force calculations near
+            shallow energy minima.
         """
         if not candidates:
             return []
@@ -1164,11 +1214,17 @@ class GGen:
             energies = final_state.energy.detach().cpu().numpy()
 
             for i, atoms in enumerate(final_atoms_list):
+                # Compute fmax BEFORE structure conversion to avoid numerical drift
+                # from pymatgen<->ASE round-trip (see docstring)
+                atoms.calc = self.calculator
+                filtered = FrechetCellFilter(atoms)
+                final_fmax = compute_fmax(filtered.get_forces())
+
                 structure = _atoms_to_structure_wrapped(atoms)
                 energy = float(energies[i])
                 # torch-sim doesn't track steps per structure easily, estimate
                 steps = max_steps  # Conservative estimate
-                results.append((structure, energy, steps))
+                results.append((structure, energy, steps, final_fmax))
 
             logger.debug(
                 "Batched relaxation complete. Energies: min=%.4f, max=%.4f eV",
@@ -1183,85 +1239,195 @@ class GGen:
                 "Batched relaxation failed: %s. Falling back to sequential.", e
             )
             # Fall back to sequential relaxation
-            return self._batch_relax_candidates_sequential(
+            return self._relax_candidates_sequential(
                 candidates, max_steps, fmax, show_progress
             )
 
-    def _batch_relax_candidates_sequential(
+    def _relax_candidates_sequential(
         self,
         candidates: List[pyxtal],
         max_steps: int = 400,
         fmax: float = 0.02,
         show_progress: bool = False,
-    ) -> List[Tuple[Structure, float, int]]:
+        preserve_symmetry: bool = False,
+        symmetry_symprec: float = 0.01,
+    ) -> List[Tuple[Structure, float, int, float]]:
         """Relax candidates sequentially (fallback when torch-sim unavailable).
+
+        When preserve_symmetry=True, uses a two-stage approach:
+        1. Symmetry-constrained relaxation with FixSymmetry to keep Wyckoff positions
+        2. Unconstrained fine-tuning to check if structure is truly stable in that
+           symmetry (uses conservative maxstep to avoid escaping high-symmetry basin)
 
         Args:
             candidates: List of PyXtal crystal objects to relax.
-            max_steps: Maximum optimization steps per structure.
+            max_steps: Maximum optimization steps per structure (per stage if
+                preserve_symmetry=True).
             fmax: Force convergence criterion (eV/Å).
             show_progress: Whether to show progress bar.
+            preserve_symmetry: If True, use two-stage symmetry-preserving relaxation.
+            symmetry_symprec: Tolerance for symmetry detection when
+                preserve_symmetry=True. Default: 0.01 Å.
 
         Returns:
-            List of (relaxed_structure, final_energy, steps) tuples.
+            List of (relaxed_structure, final_energy, steps, final_fmax) tuples.
+
+            Note: We return final_fmax from relaxation rather than recomputing it later
+            because the pymatgen<->ASE round-trip conversion can introduce numerical
+            differences. In some cases we observed fmax changing from <0.01 to >0.02
+            after structure format conversion, likely due to coordinate wrapping and
+            floating-point precision differences affecting force calculations near
+            shallow energy minima.
         """
         results = []
 
-        iterator = candidates
+        desc = "Relaxing (symmetry)" if preserve_symmetry else "Relaxing candidates"
+        pbar = None
         if show_progress:
-            iterator = tqdm(candidates, desc="Relaxing candidates", unit="struct")
+            pbar = tqdm(candidates, desc=desc, unit="struct", leave=False)
+            iterator = enumerate(pbar)
+        else:
+            iterator = enumerate(candidates)
 
-        for c in iterator:
+        for trial_idx, c in iterator:
             try:
                 atoms = c.to_ase()
                 atoms.calc = self.calculator
+                total_steps = 0
 
-                filtered = FrechetCellFilter(atoms)
-                opt = LBFGS(filtered, logfile=None, maxstep=0.2)
-                opt.run(fmax=fmax, steps=max_steps)
+                if preserve_symmetry:
+                    # Stage 1: Symmetry-constrained relaxation
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.filterwarnings(
+                                "ignore",
+                                message="FixSymmetry adjust_cell may be ill behaved",
+                                category=UserWarning,
+                            )
+                            sym_constraint = FixSymmetry(
+                                atoms,
+                                symprec=symmetry_symprec,
+                                adjust_positions=True,
+                                adjust_cell=True,
+                            )
+                        atoms.set_constraint(sym_constraint)
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to apply symmetry constraint: %s. "
+                            "Proceeding without.",
+                            e,
+                        )
 
-                structure = _atoms_to_structure_wrapped(atoms)
-                energy = float(atoms.get_potential_energy())
-                steps = opt.nsteps
+                    filtered = FrechetCellFilter(atoms)
+                    opt = LBFGS(filtered, logfile=None, maxstep=0.2)
+                    opt.run(fmax=fmax, steps=max_steps)
+                    total_steps += opt.nsteps
 
-                results.append((structure, energy, steps))
+                    # Stage 2: Unconstrained fine-tuning to check true stability
+                    # Use conservative maxstep to avoid escaping high-symmetry basin
+                    stage1_structure = _atoms_to_structure_wrapped(atoms)
+                    atoms2 = _atoms_from_structure(stage1_structure)
+                    atoms2.calc = self.calculator
+
+                    filtered2 = FrechetCellFilter(atoms2)
+                    opt2 = LBFGS(filtered2, logfile=None, maxstep=0.05)
+                    opt2.run(fmax=fmax, steps=max_steps)
+                    stage2_steps = opt2.nsteps
+                    total_steps += stage2_steps
+
+                    structure = _atoms_to_structure_wrapped(atoms2)
+                    energy = float(atoms2.get_potential_energy())
+                    # Compute fmax on filtered system (includes cell stress) to match optimizer
+                    final_fmax = compute_fmax(filtered2.get_forces())
+
+                    # Log if didn't converge
+                    if final_fmax > fmax:
+                        msg = f"Trial {trial_idx + 1}/{len(candidates)} did not converge: fmax={final_fmax:.4f} after {total_steps} steps"
+                        if pbar is not None:
+                            tqdm.write(msg)
+                        else:
+                            logger.info(msg)
+                else:
+                    # Standard unconstrained relaxation
+                    filtered = FrechetCellFilter(atoms)
+                    opt = LBFGS(filtered, logfile=None, maxstep=0.2)
+                    opt.run(fmax=fmax, steps=max_steps)
+
+                    structure = _atoms_to_structure_wrapped(atoms)
+                    energy = float(atoms.get_potential_energy())
+                    total_steps = opt.nsteps
+                    # Compute fmax on filtered system (includes cell stress) to match optimizer
+                    final_fmax = compute_fmax(filtered.get_forces())
+
+                    # Log if didn't converge
+                    if final_fmax > fmax:
+                        msg = f"Trial {trial_idx + 1}/{len(candidates)} did not converge: fmax={final_fmax:.4f} after {total_steps} steps"
+                        if pbar is not None:
+                            tqdm.write(msg)
+                        else:
+                            logger.info(msg)
+
+                results.append((structure, energy, total_steps, final_fmax))
 
             except Exception as e:
                 logger.warning("Sequential relaxation failed for candidate: %s", e)
-                # Return unrelaxed with high energy
+                # Return unrelaxed with high energy and high fmax
                 try:
                     structure = c.to_pymatgen()
                     atoms = c.to_ase()
                     atoms.calc = self.calculator
                     energy = float(atoms.get_potential_energy())
-                    results.append((structure, energy, 0))
+                    # Compute fmax on unrelaxed structure
+                    filtered = FrechetCellFilter(atoms)
+                    final_fmax = compute_fmax(filtered.get_forces())
+                    results.append((structure, energy, 0, final_fmax))
                 except Exception:
                     pass
 
+        if pbar is not None:
+            pbar.close()
+
         return results
 
-    def _batch_relax_candidates(
+    def _relax_candidates(
         self,
         candidates: List[pyxtal],
         max_steps: int = 200,
         fmax: float = 0.02,
         show_progress: bool = False,
-    ) -> List[Tuple[Structure, float, int]]:
-        """Relax multiple candidates in parallel using torch-sim.
+        preserve_symmetry: bool = False,
+    ) -> List[Tuple[Structure, float, int, float]]:
+        """Relax multiple candidates using torch-sim or sequential ASE.
 
         Uses torch-sim's batched GPU optimization for significant speedup.
-        Falls back to sequential relaxation if batched fails.
+        Falls back to sequential relaxation if batched fails or if
+        preserve_symmetry=True (torch-sim doesn't support symmetry constraints).
 
         Args:
             candidates: List of PyXtal crystal objects to relax.
             max_steps: Maximum optimization steps per structure.
             fmax: Force convergence criterion (eV/Å).
             show_progress: Whether to show progress bar.
+            preserve_symmetry: If True, use sequential ASE relaxation with
+                FixSymmetry constraint to preserve Wyckoff positions. This is
+                slower than batched torch-sim but maintains crystallographic
+                symmetry during optimization. Default: False.
 
         Returns:
-            List of (relaxed_structure, final_energy, steps) tuples.
+            List of (relaxed_structure, final_energy, steps, final_fmax) tuples.
+
+            Note: We return final_fmax computed on the ASE atoms BEFORE converting
+            to pymatgen Structure. This avoids numerical drift from the pymatgen<->ASE
+            round-trip that can cause fmax to change significantly (we observed cases
+            where fmax jumped from <0.01 to >0.02 after conversion, likely due to
+            coordinate wrapping and floating-point precision near shallow minima).
         """
-        return self._batch_relax_candidates_torchsim(
+        if preserve_symmetry:
+            # torch-sim doesn't support symmetry constraints, use sequential ASE
+            return self._relax_candidates_sequential(
+                candidates, max_steps, fmax, show_progress, preserve_symmetry=True
+            )
+        return self._relax_candidates_batched(
             candidates, max_steps, fmax, show_progress
         )
 
@@ -1632,11 +1798,12 @@ class GGen:
 
         if optimize_geometry:
             # Batch relax ALL candidates and pick the best by final energy
-            relaxed_results = self._batch_relax_candidates(
+            relaxed_results = self._relax_candidates(
                 candidate_crystals,
                 max_steps=optimization_max_steps,
                 fmax=optimization_fmax,
                 show_progress=show_progress,
+                preserve_symmetry=preserve_symmetry,
             )
 
             # Find the best by final relaxed energy
@@ -1646,7 +1813,9 @@ class GGen:
             best_idx = min(
                 range(len(relaxed_results)), key=lambda i: relaxed_results[i][1]
             )
-            structure, final_energy, optimization_steps = relaxed_results[best_idx]
+            structure, final_energy, optimization_steps, best_fmax = relaxed_results[
+                best_idx
+            ]
             best_sg = candidate_sgs[best_idx]
             best_crystal = candidate_crystals[best_idx]
             best_score = final_energy
@@ -1700,7 +1869,7 @@ class GGen:
 
             # Collect all relaxed trials (excluding the best, which is returned separately)
             # These are valuable polymorphs that can be saved to the database
-            for idx, (trial_struct, trial_energy, trial_steps) in enumerate(
+            for idx, (trial_struct, trial_energy, trial_steps, trial_fmax) in enumerate(
                 relaxed_results
             ):
                 if idx == best_idx:
@@ -1725,6 +1894,7 @@ class GGen:
                         "space_group_symbol": trial_sg_sym,
                         "original_space_group": candidate_sgs[idx],
                         "optimization_steps": trial_steps,
+                        "final_fmax": trial_fmax,
                     }
                 )
 
@@ -1735,6 +1905,7 @@ class GGen:
             structure = best_crystal.to_pymatgen()
             final_energy = best_breakdown["energy"]
             optimization_steps = 0
+            best_fmax = None  # No optimization = no fmax
 
             logger.info(
                 "Selected best candidate by initial score: SG %d, energy=%.4f eV, score=%.4f",
@@ -1771,6 +1942,16 @@ class GGen:
                     progress_desc=f"Re-relaxing {formula}",
                 )
                 optimization_steps += rerelax_steps
+
+                # Recompute fmax on the re-relaxed structure (structure changed)
+                try:
+                    rerelax_atoms = _atoms_from_structure(refined_struct)
+                    rerelax_atoms.calc = self.calculator
+                    rerelax_filtered = FrechetCellFilter(rerelax_atoms)
+                    best_fmax = compute_fmax(rerelax_filtered.get_forces())
+                except Exception:
+                    pass  # Keep original best_fmax if this fails
+
                 logger.info(
                     "Post-refinement relaxation: %d steps, energy=%.4f eV",
                     rerelax_steps,
@@ -1826,21 +2007,34 @@ class GGen:
         cif64 = base64.b64encode(cif_text.encode("utf-8")).decode("utf-8")
 
         # Final summary
+        num_atoms = len(structure)
+        energy_per_atom = final_energy / num_atoms
         if show_progress:
             C = Colors
+            # Use fmax from relaxation (not recomputed) to avoid numerical drift from
+            # pymatgen<->ASE structure conversion. See _relax_candidates docstring.
+            converged_str = ""
+            if optimize_geometry and best_fmax is not None:
+                is_converged = best_fmax < optimization_fmax
+                if is_converged:
+                    converged_str = f" {C.GREEN}converged{C.RESET}"
+                else:
+                    converged_str = f" {C.YELLOW}fmax={best_fmax:.3f}{C.RESET}"
             print(
                 f"  {C.DIM}Result:{C.RESET} {C.GREEN}{formula}{C.RESET} "
                 f"SG={C.CYAN}{final_sg_sym}{C.RESET} ({final_sg_num}) "
-                f"E={C.WHITE}{final_energy:.4f}{C.RESET} eV",
+                f"E={C.WHITE}{final_energy:.4f}{C.RESET} eV "
+                f"E/atom={C.WHITE}{energy_per_atom:.4f}{C.RESET} eV/atom{converged_str}",
                 flush=True,
             )
         else:
             logger.info(
-                "Crystal generation complete: %s, SG=%s (#%d), energy=%.4f eV",
+                "Crystal generation complete: %s, SG=%s (#%d), energy=%.4f eV, E/atom=%.4f eV/atom",
                 formula,
                 final_sg_sym,
                 final_sg_num,
                 final_energy,
+                energy_per_atom,
             )
 
         resp: Dict[str, Any] = {
@@ -1870,6 +2064,7 @@ class GGen:
         }
         if optimize_geometry:
             resp["optimization_steps"] = optimization_steps
+            resp["final_fmax"] = best_fmax
         return resp
 
     def _generate_crystal_iterative(
