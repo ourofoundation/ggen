@@ -184,6 +184,14 @@ class CandidateResult:
                 return self.structure
             except Exception:
                 return None
+        # Lazy load from stored structure (unified database) if available
+        stored = self.generation_metadata.get("_stored_structure")
+        if stored is not None:
+            try:
+                self.structure = stored.get_structure()
+                return self.structure
+            except Exception:
+                return None
         return None
 
     def clear_structure(self) -> None:
@@ -1710,7 +1718,9 @@ class ChemistryExplorer:
         # Load structures from unified database if available
         previous_structures: Dict[str, CandidateResult] = {}
         if use_unified_database and self.database is not None:
-            unified_structures = self._load_from_unified_database(chemsys)
+            unified_structures = self._load_from_unified_database(
+                chemsys, keep_structures_in_memory=keep_structures_in_memory
+            )
             if unified_structures:
                 previous_structures.update(unified_structures)
                 logger.info(
@@ -1942,23 +1952,30 @@ class ChemistryExplorer:
                             candidate = prev_candidate
                             candidate.generation_metadata["reused_from_previous"] = True
 
-                    if candidate.is_valid and candidate.structure is not None:
-                        # Save CIF
-                        cif_path = self._save_structure_cif(candidate, structures_dir)
-                        candidate.cif_path = cif_path
-                        num_successful += 1
+                    if candidate.is_valid:
+                        # Load structure if needed (lazy loading from database)
+                        structure = candidate.get_structure()
+                        if structure is not None:
+                            # Save CIF
+                            cif_path = self._save_structure_cif(candidate, structures_dir)
+                            candidate.cif_path = cif_path
+                            num_successful += 1
 
-                        # Calculate phonon stability if enabled
-                        if compute_phonons:
-                            self._calculate_phonon_stability(
-                                candidate,
-                                supercell=phonon_supercell,
-                                show_progress=show_progress,
-                            )
+                            # Calculate phonon stability if enabled
+                            if compute_phonons:
+                                self._calculate_phonon_stability(
+                                    candidate,
+                                    supercell=phonon_supercell,
+                                    show_progress=show_progress,
+                                )
 
-                        # Clear structure from memory if not needed
-                        if not keep_structures_in_memory:
-                            candidate.clear_structure()
+                            # Clear structure from memory if not needed
+                            if not keep_structures_in_memory:
+                                candidate.clear_structure()
+                            # Remove stored structure reference to free memory
+                            candidate.generation_metadata.pop("_stored_structure", None)
+                        else:
+                            num_failed += 1
                     else:
                         num_failed += 1
 
@@ -1997,6 +2014,8 @@ class ChemistryExplorer:
                         prev_candidate.cif_path = cif_path
                         if not keep_structures_in_memory:
                             prev_candidate.clear_structure()
+                        # Remove stored structure reference to free memory
+                        prev_candidate.generation_metadata.pop("_stored_structure", None)
 
                     prev_candidate.generation_metadata["reused_from_previous"] = True
                     self._save_candidate(conn, prev_candidate)
@@ -2457,12 +2476,14 @@ class ChemistryExplorer:
         return best_by_formula
 
     def _load_from_unified_database(
-        self, chemical_system: str
+        self, chemical_system: str, keep_structures_in_memory: bool = False
     ) -> Dict[str, CandidateResult]:
         """Load structures from unified database for a chemical system and all subsystems.
 
         Args:
             chemical_system: Chemical system to load (e.g., "Fe-Mn-Co")
+            keep_structures_in_memory: If False, structures are not loaded into memory
+                to save memory. They will be loaded lazily when needed.
 
         Returns:
             Dictionary mapping formula -> CandidateResult with best structures
@@ -2478,9 +2499,14 @@ class ChemistryExplorer:
         # Convert StoredStructure to CandidateResult
         results: Dict[str, CandidateResult] = {}
         for formula, stored in best_structures.items():
-            # Load structure from CIF content
-            structure = stored.get_structure()
-
+            # Only load structure into memory if explicitly requested
+            # Otherwise, store CIF content reference for lazy loading
+            structure = None
+            if keep_structures_in_memory:
+                structure = stored.get_structure()
+            
+            # Create a wrapper that can lazily load the structure when needed
+            # Store the StoredStructure reference for lazy loading
             candidate = CandidateResult(
                 formula=stored.formula,
                 stoichiometry=stored.stoichiometry,
@@ -2499,6 +2525,7 @@ class ChemistryExplorer:
                     "unified_db_id": stored.id,
                     "e_above_hull": stored.e_above_hull,
                     "is_on_hull": stored.is_on_hull,
+                    "_stored_structure": stored,  # Store reference for lazy loading
                 },
             )
             results[formula] = candidate
