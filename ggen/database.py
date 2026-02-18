@@ -95,6 +95,10 @@ class StoredStructure:
     error_message: Optional[str] = None
     generation_metadata: Dict[str, Any] = field(default_factory=dict)
 
+    # Provenance tracking
+    source: str = "ggen"  # 'ggen', 'mp', etc.
+    source_id: Optional[str] = None  # Original identifier, e.g. 'mp-1234'
+
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -231,6 +235,10 @@ class StructureDatabase:
                 error_message TEXT,
                 generation_metadata TEXT,
                 
+                -- Provenance tracking
+                source TEXT DEFAULT 'ggen',
+                source_id TEXT,
+                
                 -- Dynamical stability (phonon) fields
                 is_dynamically_stable INTEGER,
                 num_imaginary_modes INTEGER,
@@ -268,6 +276,18 @@ class StructureDatabase:
             pass
         try:
             conn.execute("ALTER TABLE structures ADD COLUMN phonon_supercell TEXT")
+        except sqlite3.OperationalError:
+            pass
+
+        # Migration: Add provenance columns if they don't exist
+        try:
+            conn.execute(
+                "ALTER TABLE structures ADD COLUMN source TEXT DEFAULT 'ggen'"
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE structures ADD COLUMN source_id TEXT")
         except sqlite3.OperationalError:
             pass
 
@@ -359,6 +379,12 @@ class StructureDatabase:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_hull_chemsys ON hull_entries(chemsys)"
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_source ON structures(source)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_source_id ON structures(source_id)"
+        )
 
         conn.commit()
         logger.info(f"Initialized database at {self.db_path}")
@@ -399,10 +425,22 @@ class StructureDatabase:
 
     @staticmethod
     def compute_structure_hash(
-        formula: str, energy_per_atom: float, space_group: Optional[int] = None
+        formula: str,
+        energy_per_atom: float,
+        space_group: Optional[int] = None,
+        source: str = "ggen",
+        source_id: Optional[str] = None,
     ) -> str:
-        """Compute a hash for structure deduplication."""
-        key = f"{formula}:{energy_per_atom:.6f}:{space_group or 'unknown'}"
+        """Compute a hash for structure deduplication.
+
+        Includes source so that structures from different origins
+        (e.g. ggen-generated vs Materials Project) are kept separate.
+        When source_id is provided (external imports), it is included
+        so that distinct structures sharing formula/SG/energy don't collide.
+        """
+        key = f"{source}:{formula}:{energy_per_atom:.6f}:{space_group or 'unknown'}"
+        if source_id:
+            key = f"{key}:{source_id}"
         return hashlib.md5(key.encode()).hexdigest()[:16]
 
     # -------------------- Structure Operations --------------------
@@ -411,8 +449,8 @@ class StructureDatabase:
         self,
         formula: str,
         stoichiometry: Dict[str, int],
-        energy_per_atom: float,
-        total_energy: float,
+        energy_per_atom: Optional[float],
+        total_energy: Optional[float],
         num_atoms: int,
         space_group_number: Optional[int] = None,
         space_group_symbol: Optional[str] = None,
@@ -422,12 +460,17 @@ class StructureDatabase:
         error_message: Optional[str] = None,
         generation_metadata: Optional[Dict[str, Any]] = None,
         run_id: Optional[str] = None,
+        # Provenance
+        source: str = "ggen",
+        source_id: Optional[str] = None,
         # Phonon stability fields
         is_dynamically_stable: Optional[bool] = None,
         num_imaginary_modes: Optional[int] = None,
         min_phonon_frequency: Optional[float] = None,
         max_phonon_frequency: Optional[float] = None,
         phonon_supercell: Optional[Tuple[int, int, int]] = None,
+        # Commit control
+        defer_commit: bool = False,
     ) -> str:
         """
         Add a structure to the database.
@@ -435,8 +478,8 @@ class StructureDatabase:
         Args:
             formula: Chemical formula (e.g., "Fe3Mn")
             stoichiometry: Element counts {"Fe": 3, "Mn": 1}
-            energy_per_atom: Energy per atom in eV
-            total_energy: Total energy in eV
+            energy_per_atom: Energy per atom in eV (None for unrelaxed imports)
+            total_energy: Total energy in eV (None for unrelaxed imports)
             num_atoms: Number of atoms
             space_group_number: International space group number
             space_group_symbol: Space group symbol
@@ -446,11 +489,16 @@ class StructureDatabase:
             error_message: Error message if invalid
             generation_metadata: Additional metadata dict
             run_id: Optional run ID to link this structure to
+            source: Data source ('ggen', 'mp', etc.)
+            source_id: Original identifier from the source (e.g., 'mp-1234')
             is_dynamically_stable: Whether structure is dynamically stable (no imaginary phonon modes)
             num_imaginary_modes: Number of imaginary phonon modes
             min_phonon_frequency: Minimum phonon frequency in THz
             max_phonon_frequency: Maximum phonon frequency in THz
             phonon_supercell: Supercell dimensions used for phonon calculation
+            defer_commit: If True, skip the automatic commit after insertion.
+                Caller is responsible for calling db.conn.commit() periodically.
+                Useful for batch imports where per-row commits are too slow.
 
         Returns:
             Structure ID (UUID)
@@ -465,9 +513,21 @@ class StructureDatabase:
             except Exception as e:
                 logger.warning(f"Failed to generate CIF for {formula}: {e}")
 
+        # For MP imports with source_id, check for existing by source_id first
+        if source_id:
+            existing_by_source = self.conn.execute(
+                "SELECT id FROM structures WHERE source_id = ?",
+                (source_id,),
+            ).fetchone()
+            if existing_by_source:
+                logger.debug(
+                    f"Structure {source_id} already imported, skipping"
+                )
+                return existing_by_source["id"]
+
         # Compute hash for deduplication
         structure_hash = self.compute_structure_hash(
-            formula, energy_per_atom, space_group_number
+            formula, energy_per_atom or 0.0, space_group_number, source, source_id
         )
 
         # Check for existing structure with same hash
@@ -478,7 +538,12 @@ class StructureDatabase:
 
         if existing:
             # Structure already exists - update if this one is better
-            if energy_per_atom < existing["energy_per_atom"]:
+            existing_energy = existing["energy_per_atom"]
+            if (
+                energy_per_atom is not None
+                and existing_energy is not None
+                and energy_per_atom < existing_energy
+            ):
                 self._update_structure(
                     existing["id"],
                     energy_per_atom=energy_per_atom,
@@ -506,10 +571,11 @@ class StructureDatabase:
                 space_group_number, space_group_symbol,
                 structure_hash, cif_content,
                 is_valid, error_message, generation_metadata,
+                source, source_id,
                 is_dynamically_stable, num_imaginary_modes,
                 min_phonon_frequency, max_phonon_frequency, phonon_supercell,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 structure_id,
@@ -527,6 +593,8 @@ class StructureDatabase:
                 1 if is_valid else 0,
                 error_message,
                 json.dumps(generation_metadata) if generation_metadata else None,
+                source,
+                source_id,
                 (
                     1
                     if is_dynamically_stable
@@ -549,7 +617,8 @@ class StructureDatabase:
                 (structure_id, subsystem),
             )
 
-        self._commit()
+        if not defer_commit:
+            self._commit()
 
         # Link to run if provided
         if run_id:
@@ -668,12 +737,20 @@ class StructureDatabase:
         return structures[0] if structures else None
 
     def get_structures_for_subsystem(
-        self, subsystem: str, valid_only: bool = True
+        self,
+        subsystem: str,
+        valid_only: bool = True,
+        source: Optional[str] = None,
     ) -> List[StoredStructure]:
         """
         Get all structures that belong to a chemical subsystem.
 
         For "Fe-Mn", returns Fe, Mn, and all Fe-Mn structures.
+
+        Args:
+            subsystem: Chemical system string (e.g., "Fe-Mn")
+            valid_only: If True, only return valid structures
+            source: Optional source filter ('ggen', 'mp', etc.)
         """
         subsystem = self.normalize_chemsys(subsystem)
         elements = subsystem.split("-")
@@ -688,26 +765,42 @@ class StructureDatabase:
             SELECT * FROM structures
             WHERE chemsys IN ({placeholders})
         """
+        params: List[Any] = list(valid_chemsys)
         if valid_only:
             query += " AND is_valid = 1"
+        if source:
+            query += " AND source = ?"
+            params.append(source)
         query += " ORDER BY formula, energy_per_atom"
 
-        rows = self.conn.execute(query, valid_chemsys).fetchall()
+        rows = self.conn.execute(query, params).fetchall()
         return [self._row_to_structure(row) for row in rows]
 
     def get_best_structures_for_subsystem(
-        self, subsystem: str, valid_only: bool = True
+        self,
+        subsystem: str,
+        valid_only: bool = True,
+        source: Optional[str] = None,
     ) -> Dict[str, StoredStructure]:
         """
         Get the best (lowest energy) structure for each formula in a subsystem.
 
+        Args:
+            subsystem: Chemical system string (e.g., "Fe-Mn")
+            valid_only: If True, only return valid structures
+            source: Optional source filter ('ggen', 'mp', etc.)
+
         Returns:
             Dict mapping formula -> best StoredStructure
         """
-        structures = self.get_structures_for_subsystem(subsystem, valid_only)
+        structures = self.get_structures_for_subsystem(
+            subsystem, valid_only, source=source
+        )
 
         best_by_formula: Dict[str, StoredStructure] = {}
         for s in structures:
+            if s.energy_per_atom is None:
+                continue  # Skip unrelaxed structures
             if s.formula not in best_by_formula:
                 best_by_formula[s.formula] = s
             elif s.energy_per_atom < best_by_formula[s.formula].energy_per_atom:
@@ -749,6 +842,10 @@ class StructureDatabase:
         if "phonon_supercell" in row_keys and row["phonon_supercell"]:
             phonon_supercell = row["phonon_supercell"]  # Already JSON string
 
+        # Extract provenance fields (may not exist in older databases)
+        source = row["source"] if "source" in row_keys else "ggen"
+        source_id = row["source_id"] if "source_id" in row_keys else None
+
         return StoredStructure(
             id=row["id"],
             formula=row["formula"],
@@ -769,6 +866,8 @@ class StructureDatabase:
                 if row["generation_metadata"]
                 else {}
             ),
+            source=source or "ggen",
+            source_id=source_id,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             e_above_hull=hull_row["e_above_hull"] if hull_row else None,
@@ -808,13 +907,16 @@ class StructureDatabase:
         elements = chemsys.split("-")
         filter_counts: Dict[str, int] = {}
 
-        # Get structures for this system
+        # Get structures for this system (only those with energies)
         if all_polymorphs:
             all_structures = self.get_structures_for_subsystem(chemsys, valid_only=True)
             # Convert to dict keyed by id for consistent handling
-            structures_dict = {s.id: s for s in all_structures}
+            # Skip unrelaxed structures (energy_per_atom is None)
+            structures_dict = {
+                s.id: s for s in all_structures if s.energy_per_atom is not None
+            }
         else:
-            # Just best per formula
+            # Just best per formula (already skips None energies)
             structures_dict = {
                 s.id: s
                 for s in self.get_best_structures_for_subsystem(chemsys).values()
@@ -864,21 +966,21 @@ class StructureDatabase:
         # Build phase diagram entries using ComputedEntry
         # (pymatgen's plotter shows labels as "Formula (entry_id)")
         entries = []
-        structure_map: Dict[str, StoredStructure] = {}  # entry_id -> structure
+        entry_structure_pairs: List[Tuple[ComputedEntry, StoredStructure]] = []
 
         for structure in structures_dict.values():
             comp = Composition(structure.formula)
             # Use energy per atom * num atoms in reduced formula
             energy = structure.energy_per_atom * comp.num_atoms
-            # Use true formula + space group as entry_id for phase diagram labels
+            # Use true formula + space group + source as entry_id for phase diagram labels
             # This shows the actual stoichiometry instead of reduced formula
             sg = structure.space_group_symbol or "?"
             sg_label = sg.replace("/", "-")
-            # Use structure.id as entry_id for unique lookup (important when all_polymorphs=True)
-            entry_id = f"{structure.formula} ({sg_label})"
+            source_label = (structure.source or "ggen").lower()
+            entry_id = f"{structure.formula} ({sg_label}, {source_label})"
             entry = ComputedEntry(comp, energy, entry_id=entry_id)
             entries.append(entry)
-            structure_map[entry_id] = structure
+            entry_structure_pairs.append((entry, structure))
 
         if len(entries) < 2:
             logger.warning(f"Need at least 2 entries for hull, got {len(entries)}")
@@ -895,10 +997,8 @@ class StructureDatabase:
         e_above_hull_map: Dict[str, float] = {}
         hull_structure_ids: List[str] = []
 
-        for entry in entries:
+        for entry, structure in entry_structure_pairs:
             e_hull = pd.get_e_above_hull(entry)
-            entry_id = entry.entry_id
-            structure = structure_map[entry_id]
             e_above_hull_map[structure.id] = e_hull
 
             if e_hull < 1e-6:  # On hull
@@ -1110,7 +1210,7 @@ class StructureDatabase:
     # -------------------- Statistics & Queries --------------------
 
     def get_statistics(self) -> Dict[str, Any]:
-        """Get database statistics."""
+        """Get database statistics, including breakdown by source."""
         stats = {}
 
         stats["total_structures"] = self.conn.execute(
@@ -1131,6 +1231,21 @@ class StructureDatabase:
 
         stats["unique_chemsys"] = self.conn.execute(
             "SELECT COUNT(DISTINCT chemsys) FROM structures WHERE is_valid = 1"
+        ).fetchone()[0]
+
+        # Breakdown by source
+        source_rows = self.conn.execute(
+            """
+            SELECT COALESCE(source, 'ggen') as src, COUNT(*) as cnt
+            FROM structures WHERE is_valid = 1
+            GROUP BY src ORDER BY cnt DESC
+            """
+        ).fetchall()
+        stats["by_source"] = {row[0]: row[1] for row in source_rows}
+
+        # Count unrelaxed structures (imported but no ORB energy)
+        stats["unrelaxed"] = self.conn.execute(
+            "SELECT COUNT(*) FROM structures WHERE energy_per_atom IS NULL AND is_valid = 1"
         ).fetchone()[0]
 
         # Get list of explored systems
@@ -1172,6 +1287,7 @@ class StructureDatabase:
         elements: Optional[List[str]] = None,
         max_energy_per_atom: Optional[float] = None,
         space_group: Optional[int] = None,
+        source: Optional[str] = None,
         limit: int = 100,
     ) -> List[StoredStructure]:
         """
@@ -1182,6 +1298,7 @@ class StructureDatabase:
             elements: List of elements that must all be present
             max_energy_per_atom: Maximum energy per atom
             space_group: Required space group number
+            source: Optional source filter ('ggen', 'mp', etc.)
             limit: Maximum results to return
 
         Returns:
@@ -1201,6 +1318,10 @@ class StructureDatabase:
         if space_group is not None:
             conditions.append("space_group_number = ?")
             params.append(space_group)
+
+        if source is not None:
+            conditions.append("source = ?")
+            params.append(source)
 
         query = f"""
             SELECT * FROM structures
