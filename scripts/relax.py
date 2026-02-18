@@ -5,6 +5,9 @@ Re-relax structures in the database using torch-sim batched GPU relaxation.
 Useful for fixing structures that may have been insufficiently relaxed
 (e.g., due to torch-sim FIRE not using force convergence criterion).
 
+Also supports initial relaxation of imported structures (e.g. from Materials
+Project) that have geometry but no ORB energies yet.
+
 Usage:
     # Re-relax unstable structures within 150 meV of hull
     python relax.py --unstable-only
@@ -20,6 +23,12 @@ Usage:
 
     # Sequential relaxation (no batching, for debugging)
     python relax.py --unstable-only --sequential
+
+    # Relax freshly imported MP structures (no ORB energy yet)
+    python relax.py --source mp --unrelaxed --batch-size 32
+
+    # Re-relax only MP-sourced structures
+    python relax.py --source mp --all
 """
 
 import argparse
@@ -53,6 +62,7 @@ def get_entries_for_relaxation(
     max_structures: Optional[int] = None,
     unstable_only: bool = False,
     all_structures: bool = False,
+    source: Optional[str] = None,
 ) -> List[StoredStructure]:
     """
     Get database entries that should be re-relaxed.
@@ -64,6 +74,7 @@ def get_entries_for_relaxation(
         max_structures: Optional limit on number of structures
         unstable_only: If True, only get structures marked as dynamically unstable
         all_structures: If True, get all structures (ignores e_above_hull_cutoff)
+        source: Optional source filter (e.g., 'mp', 'ggen')
 
     Returns:
         List of StoredStructure objects to re-relax
@@ -81,6 +92,10 @@ def get_entries_for_relaxation(
 
     if unstable_only:
         where_clauses.append("s.is_dynamically_stable = 0")
+
+    if source:
+        where_clauses.append("s.source = ?")
+        params.append(source)
 
     if not all_structures:
         where_clauses.append("h.e_above_hull <= ?")
@@ -116,6 +131,66 @@ def get_entries_for_relaxation(
         s = db._row_to_structure(row)
         s.e_above_hull = row["e_above_hull"]
         s.is_on_hull = bool(row["is_on_hull"])
+        structures.append(s)
+
+    return structures
+
+
+def get_unrelaxed_entries(
+    db: StructureDatabase,
+    source: Optional[str] = None,
+    chemical_system: Optional[str] = None,
+    max_structures: Optional[int] = None,
+) -> List[StoredStructure]:
+    """
+    Get structures that have geometry (CIF) but no ORB energy yet.
+
+    These are typically freshly imported structures (e.g., from Materials Project)
+    that need their first ORB relaxation.
+
+    Args:
+        db: Database connection
+        source: Optional source filter (e.g., 'mp')
+        chemical_system: Optional chemical system filter
+        max_structures: Optional limit on number of structures
+
+    Returns:
+        List of StoredStructure objects to relax
+    """
+    conn = db.conn
+
+    where_clauses = [
+        "s.cif_content IS NOT NULL",
+        "s.energy_per_atom IS NULL",
+        "s.is_valid = 1",
+    ]
+    params: List = []
+
+    if source:
+        where_clauses.append("s.source = ?")
+        params.append(source)
+
+    if chemical_system:
+        chemsys = db.normalize_chemsys(chemical_system)
+        where_clauses.append("s.chemsys = ?")
+        params.append(chemsys)
+
+    where_sql = " AND ".join(where_clauses)
+
+    query = f"""
+        SELECT s.* FROM structures s
+        WHERE {where_sql}
+        ORDER BY s.formula ASC
+    """
+
+    if max_structures:
+        query += f" LIMIT {max_structures}"
+
+    rows = conn.execute(query, params).fetchall()
+
+    structures = []
+    for row in rows:
+        s = db._row_to_structure(row)
         structures.append(s)
 
     return structures
@@ -257,6 +332,7 @@ def relax_structure_sequential(
     calculator,
     max_steps: int = 200,
     fmax: float = 0.02,
+    is_first_relaxation: bool = False,
 ) -> dict:
     """
     Re-relax a structure using ASE LBFGS (sequential fallback).
@@ -275,7 +351,7 @@ def relax_structure_sequential(
         atoms = adaptor.get_atoms(pymatgen_structure)
         atoms.calc = calculator
 
-        # Get initial energy
+        # Get initial energy (may not exist for first-time relaxations)
         initial_energy = atoms.get_potential_energy()
         initial_energy_per_atom = initial_energy / len(atoms)
 
@@ -328,6 +404,7 @@ def process_result(
     min_energy_change: float,
     clear_phonons: bool,
     C: Any,
+    is_first_relaxation: bool = False,
 ) -> tuple:
     """Process a single relaxation result and update database if needed.
 
@@ -336,6 +413,50 @@ def process_result(
     if "error" in result:
         logger.info(f"  {C.YELLOW}⚠ Failed: {result['error']}{C.RESET}")
         return False, 0.0, True
+
+    # For first-time relaxations (imported structures), always save the energy
+    if is_first_relaxation:
+        # Preserve the original (pre-relaxation) CIF and space group in metadata
+        # so we can compare the MLIP-relaxed structure against the original
+        metadata = dict(entry.generation_metadata) if entry.generation_metadata else {}
+        if entry.cif_content and "mp_original_cif" not in metadata:
+            metadata["mp_original_cif"] = entry.cif_content
+            metadata["mp_original_space_group_number"] = entry.space_group_number
+            metadata["mp_original_space_group_symbol"] = entry.space_group_symbol
+
+        db._update_structure(
+            structure_id=entry.id,
+            energy_per_atom=result["final_energy_per_atom"],
+            total_energy=result["final_total_energy"],
+            cif_content=result["cif_content"],
+            generation_metadata=metadata,
+            clear_phonon_data=clear_phonons,
+        )
+        # Also update space group if changed
+        sg_num = result.get("space_group_number")
+        sg_sym = result.get("space_group_symbol")
+        if sg_num or sg_sym:
+            updates = []
+            values = []
+            if sg_num:
+                updates.append("space_group_number = ?")
+                values.append(sg_num)
+            if sg_sym:
+                updates.append("space_group_symbol = ?")
+                values.append(sg_sym)
+            values.append(entry.id)
+            db.conn.execute(
+                f"UPDATE structures SET {', '.join(updates)} WHERE id = ?",
+                values,
+            )
+            db.conn.commit()
+
+        logger.info(
+            f"  {C.GREEN}✓ Relaxed{C.RESET} "
+            f"E={result['final_energy_per_atom']:.4f} eV/atom  "
+            f"SG={result.get('space_group_symbol', '?')}"
+        )
+        return True, 0.0, False
 
     energy_change = result["energy_change"]
 
@@ -425,6 +546,17 @@ def main():
         help="Re-relax ALL structures (ignores --e-above-hull)",
     )
     parser.add_argument(
+        "--source",
+        type=str,
+        default=None,
+        help="Filter by data source (e.g., 'mp' for Materials Project, 'ggen' for generated)",
+    )
+    parser.add_argument(
+        "--unrelaxed",
+        action="store_true",
+        help="Only process structures with no ORB energy (e.g., freshly imported from MP)",
+    )
+    parser.add_argument(
         "--database",
         type=str,
         default="ggen.db",
@@ -461,24 +593,41 @@ def main():
         logger.error(f"{C.RED}Failed to open database: {e}{C.RESET}")
         sys.exit(1)
 
-    # Get structures to re-relax
+    # Determine mode: unrelaxed imports vs re-relaxation
+    is_unrelaxed_mode = args.unrelaxed
+
+    # Get structures to process
     filter_desc = []
-    if args.unstable_only:
-        filter_desc.append("dynamically unstable")
-    if not args.all:
-        filter_desc.append(f"E_hull ≤ {args.e_above_hull * 1000:.0f} meV")
+    if args.source:
+        filter_desc.append(f"source={args.source}")
+    if is_unrelaxed_mode:
+        filter_desc.append("unrelaxed (no ORB energy)")
+    else:
+        if args.unstable_only:
+            filter_desc.append("dynamically unstable")
+        if not args.all:
+            filter_desc.append(f"E_hull ≤ {args.e_above_hull * 1000:.0f} meV")
     filter_str = " AND ".join(filter_desc) if filter_desc else "all structures"
 
     logger.info(f"Finding entries: {filter_str}...")
 
-    entries = get_entries_for_relaxation(
-        db=db,
-        chemical_system=args.system,
-        e_above_hull_cutoff=args.e_above_hull,
-        max_structures=args.max_structures,
-        unstable_only=args.unstable_only,
-        all_structures=args.all,
-    )
+    if is_unrelaxed_mode:
+        entries = get_unrelaxed_entries(
+            db=db,
+            source=args.source,
+            chemical_system=args.system,
+            max_structures=args.max_structures,
+        )
+    else:
+        entries = get_entries_for_relaxation(
+            db=db,
+            chemical_system=args.system,
+            e_above_hull_cutoff=args.e_above_hull,
+            max_structures=args.max_structures,
+            unstable_only=args.unstable_only,
+            all_structures=args.all,
+            source=args.source,
+        )
 
     if not entries:
         logger.info(f"{C.GREEN}No entries match the criteria!{C.RESET}")
@@ -495,11 +644,17 @@ def main():
             stable_str = ""
             if s.is_dynamically_stable is not None:
                 stable_str = f"  {'stable' if s.is_dynamically_stable else 'UNSTABLE'}"
+            energy_str = (
+                f"E={s.energy_per_atom:.4f} eV/atom"
+                if s.energy_per_atom is not None
+                else "E=unrelaxed"
+            )
+            source_str = f"  [{s.source}]" if hasattr(s, "source") and s.source != "ggen" else ""
             logger.info(
                 f"  {i + 1:3d}. {s.formula:12s}  "
-                f"E={s.energy_per_atom:.4f} eV/atom  "
-                f"SG={s.space_group_symbol:10s}  "
-                f"E_hull={e_hull * 1000:.1f} meV{stable_str}"
+                f"{energy_str}  "
+                f"SG={s.space_group_symbol or '?':10s}  "
+                f"E_hull={e_hull * 1000:.1f} meV{stable_str}{source_str}"
             )
         db.close()
         return
@@ -543,12 +698,18 @@ def main():
                 stable_str = (
                     f" ({'stable' if entry.is_dynamically_stable else 'unstable'})"
                 )
+            energy_str = (
+                f"E={entry.energy_per_atom:.4f}"
+                if entry.energy_per_atom is not None
+                else "unrelaxed"
+            )
+            source_str = f" [{entry.source}]" if entry.source != "ggen" else ""
 
             logger.info(
                 f"{C.CYAN}[{i + 1}/{len(entries)}]{C.RESET} "
                 f"{C.BOLD}{entry.formula:12s}{C.RESET}  "
-                f"E_hull={e_hull * 1000:.1f} meV  "
-                f"SG={entry.space_group_symbol}{stable_str}"
+                f"{energy_str}  "
+                f"SG={entry.space_group_symbol or '?'}{stable_str}{source_str}"
             )
 
             result = relax_structure_sequential(
@@ -556,10 +717,12 @@ def main():
                 calculator=calculator,
                 max_steps=args.max_steps,
                 fmax=args.fmax,
+                is_first_relaxation=is_unrelaxed_mode,
             )
 
             improved, energy_saved, failed = process_result(
-                entry, result, db, args.min_energy_change, not args.keep_phonons, C
+                entry, result, db, args.min_energy_change, not args.keep_phonons, C,
+                is_first_relaxation=is_unrelaxed_mode,
             )
             if improved:
                 num_improved += 1
@@ -590,9 +753,15 @@ def main():
                     stable_str = (
                         f" ({'stable' if entry.is_dynamically_stable else 'unstable'})"
                     )
+                energy_str = (
+                    f"E={entry.energy_per_atom:.4f}"
+                    if entry.energy_per_atom is not None
+                    else "unrelaxed"
+                )
+                source_str = f" [{entry.source}]" if entry.source != "ggen" else ""
                 logger.info(
-                    f"  • {entry.formula:12s} E_hull={e_hull * 1000:.1f} meV "
-                    f"SG={entry.space_group_symbol}{stable_str}"
+                    f"  • {entry.formula:12s} {energy_str} "
+                    f"SG={entry.space_group_symbol or '?'}{stable_str}{source_str}"
                 )
 
             # Run batch relaxation
@@ -619,31 +788,74 @@ def main():
                     num_failed += 1
                     continue
 
-                energy_change = result["energy_change"]
+                # For first-time relaxations, always save
+                if is_unrelaxed_mode:
+                    # Preserve original CIF and space group in metadata
+                    metadata = dict(entry.generation_metadata) if entry.generation_metadata else {}
+                    if entry.cif_content and "mp_original_cif" not in metadata:
+                        metadata["mp_original_cif"] = entry.cif_content
+                        metadata["mp_original_space_group_number"] = entry.space_group_number
+                        metadata["mp_original_space_group_symbol"] = entry.space_group_symbol
 
-                if energy_change < -args.min_energy_change:
-                    # Update database
                     db._update_structure(
                         structure_id=entry.id,
                         energy_per_atom=result["final_energy_per_atom"],
                         total_energy=result["final_total_energy"],
                         cif_content=result["cif_content"],
+                        generation_metadata=metadata,
                         clear_phonon_data=not args.keep_phonons,
                     )
+                    # Update space group
+                    sg_num = result.get("space_group_number")
+                    sg_sym = result.get("space_group_symbol")
+                    if sg_num or sg_sym:
+                        updates = []
+                        values = []
+                        if sg_num:
+                            updates.append("space_group_number = ?")
+                            values.append(sg_num)
+                        if sg_sym:
+                            updates.append("space_group_symbol = ?")
+                            values.append(sg_sym)
+                        values.append(entry.id)
+                        db.conn.execute(
+                            f"UPDATE structures SET {', '.join(updates)} WHERE id = ?",
+                            values,
+                        )
+                        db.conn.commit()
 
                     logger.info(
-                        f"  {formula} {C.GREEN}✓ Improved{C.RESET} "
-                        f"ΔE={energy_change * 1000:.1f} meV/atom "
-                        f"({entry.energy_per_atom:.4f} → {result['final_energy_per_atom']:.4f})"
+                        f"  {formula} {C.GREEN}✓ Relaxed{C.RESET} "
+                        f"E={result['final_energy_per_atom']:.4f} eV/atom  "
+                        f"SG={result.get('space_group_symbol', '?')}"
                     )
                     num_improved += 1
-                    total_energy_saved += abs(energy_change)
                 else:
-                    logger.info(
-                        f"  {formula} {C.DIM}– No change{C.RESET} "
-                        f"(ΔE={energy_change * 1000:+.1f} meV/atom)"
-                    )
-                    num_unchanged += 1
+                    energy_change = result["energy_change"]
+
+                    if energy_change < -args.min_energy_change:
+                        # Update database
+                        db._update_structure(
+                            structure_id=entry.id,
+                            energy_per_atom=result["final_energy_per_atom"],
+                            total_energy=result["final_total_energy"],
+                            cif_content=result["cif_content"],
+                            clear_phonon_data=not args.keep_phonons,
+                        )
+
+                        logger.info(
+                            f"  {formula} {C.GREEN}✓ Improved{C.RESET} "
+                            f"ΔE={energy_change * 1000:.1f} meV/atom "
+                            f"({entry.energy_per_atom:.4f} → {result['final_energy_per_atom']:.4f})"
+                        )
+                        num_improved += 1
+                        total_energy_saved += abs(energy_change)
+                    else:
+                        logger.info(
+                            f"  {formula} {C.DIM}– No change{C.RESET} "
+                            f"(ΔE={energy_change * 1000:+.1f} meV/atom)"
+                        )
+                        num_unchanged += 1
 
             logger.info("")
 
@@ -652,11 +864,14 @@ def main():
     logger.info(f"{C.BOLD}Summary{C.RESET}")
     logger.info(f"{C.DIM}{'-' * 50}{C.RESET}")
     logger.info(f"  Processed:  {len(entries)}")
-    logger.info(f"  Improved:   {C.GREEN}{num_improved}{C.RESET}")
-    logger.info(f"  Unchanged:  {num_unchanged}")
+    if is_unrelaxed_mode:
+        logger.info(f"  Relaxed:    {C.GREEN}{num_improved}{C.RESET}")
+    else:
+        logger.info(f"  Improved:   {C.GREEN}{num_improved}{C.RESET}")
+        logger.info(f"  Unchanged:  {num_unchanged}")
     if num_failed:
         logger.info(f"  Failed:     {C.YELLOW}{num_failed}{C.RESET}")
-    if num_improved > 0:
+    if num_improved > 0 and total_energy_saved > 0:
         logger.info(
             f"  Total energy saved: {C.GREEN}{total_energy_saved * 1000:.1f} meV/atom{C.RESET} "
             f"(avg {total_energy_saved / num_improved * 1000:.1f} meV/atom)"
@@ -668,7 +883,7 @@ def main():
         logger.info(
             f"{C.YELLOW}Note: Run hull recomputation to update E_above_hull values.{C.RESET}"
         )
-        if not args.keep_phonons:
+        if not args.keep_phonons and not is_unrelaxed_mode:
             logger.info(
                 f"{C.YELLOW}Phonon data cleared for {num_improved} structures - "
                 f"run phonons.py to recalculate.{C.RESET}"
