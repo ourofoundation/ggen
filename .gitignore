@@ -225,3 +225,6 @@ runs/*
 
 *.html
 *.png
+
+discoveries.json
+alexandria_pbe_*
