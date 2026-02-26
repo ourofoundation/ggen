@@ -281,9 +281,7 @@ class StructureDatabase:
 
         # Migration: Add provenance columns if they don't exist
         try:
-            conn.execute(
-                "ALTER TABLE structures ADD COLUMN source TEXT DEFAULT 'ggen'"
-            )
+            conn.execute("ALTER TABLE structures ADD COLUMN source TEXT DEFAULT 'ggen'")
         except sqlite3.OperationalError:
             pass
         try:
@@ -379,9 +377,7 @@ class StructureDatabase:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_hull_chemsys ON hull_entries(chemsys)"
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_source ON structures(source)"
-        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_source ON structures(source)")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_source_id ON structures(source_id)"
         )
@@ -470,6 +466,7 @@ class StructureDatabase:
         max_phonon_frequency: Optional[float] = None,
         phonon_supercell: Optional[Tuple[int, int, int]] = None,
         # Commit control
+        check_existing: bool = True,
         defer_commit: bool = False,
     ) -> str:
         """
@@ -496,6 +493,8 @@ class StructureDatabase:
             min_phonon_frequency: Minimum phonon frequency in THz
             max_phonon_frequency: Maximum phonon frequency in THz
             phonon_supercell: Supercell dimensions used for phonon calculation
+            check_existing: If True, run dedupe checks (source_id/hash) before insert.
+                Set to False only when caller already guarantees uniqueness.
             defer_commit: If True, skip the automatic commit after insertion.
                 Caller is responsible for calling db.conn.commit() periodically.
                 Useful for batch imports where per-row commits are too slow.
@@ -514,15 +513,13 @@ class StructureDatabase:
                 logger.warning(f"Failed to generate CIF for {formula}: {e}")
 
         # For MP imports with source_id, check for existing by source_id first
-        if source_id:
+        if check_existing and source_id:
             existing_by_source = self.conn.execute(
                 "SELECT id FROM structures WHERE source_id = ?",
                 (source_id,),
             ).fetchone()
             if existing_by_source:
-                logger.debug(
-                    f"Structure {source_id} already imported, skipping"
-                )
+                logger.debug(f"Structure {source_id} already imported, skipping")
                 return existing_by_source["id"]
 
         # Compute hash for deduplication
@@ -531,33 +528,34 @@ class StructureDatabase:
         )
 
         # Check for existing structure with same hash
-        existing = self.conn.execute(
-            "SELECT id, energy_per_atom FROM structures WHERE structure_hash = ?",
-            (structure_hash,),
-        ).fetchone()
+        if check_existing:
+            existing = self.conn.execute(
+                "SELECT id, energy_per_atom FROM structures WHERE structure_hash = ?",
+                (structure_hash,),
+            ).fetchone()
 
-        if existing:
-            # Structure already exists - update if this one is better
-            existing_energy = existing["energy_per_atom"]
-            if (
-                energy_per_atom is not None
-                and existing_energy is not None
-                and energy_per_atom < existing_energy
-            ):
-                self._update_structure(
-                    existing["id"],
-                    energy_per_atom=energy_per_atom,
-                    total_energy=total_energy,
-                    cif_content=cif_content,
-                    generation_metadata=generation_metadata,
-                    is_dynamically_stable=is_dynamically_stable,
-                    num_imaginary_modes=num_imaginary_modes,
-                    min_phonon_frequency=min_phonon_frequency,
-                    max_phonon_frequency=max_phonon_frequency,
-                    phonon_supercell=phonon_supercell,
-                )
-                logger.debug(f"Updated existing structure {formula} with lower energy")
-            return existing["id"]
+            if existing:
+                # Structure already exists - update if this one is better
+                existing_energy = existing["energy_per_atom"]
+                if (
+                    energy_per_atom is not None
+                    and existing_energy is not None
+                    and energy_per_atom < existing_energy
+                ):
+                    self._update_structure(
+                        existing["id"],
+                        energy_per_atom=energy_per_atom,
+                        total_energy=total_energy,
+                        cif_content=cif_content,
+                        generation_metadata=generation_metadata,
+                        is_dynamically_stable=is_dynamically_stable,
+                        num_imaginary_modes=num_imaginary_modes,
+                        min_phonon_frequency=min_phonon_frequency,
+                        max_phonon_frequency=max_phonon_frequency,
+                        phonon_supercell=phonon_supercell,
+                    )
+                    logger.debug(f"Updated existing structure {formula} with lower energy")
+                return existing["id"]
 
         # Create new structure
         structure_id = str(uuid.uuid4())
@@ -705,6 +703,30 @@ class StructureDatabase:
             values,
         )
         self._commit()
+
+    def update_structure_space_group(
+        self,
+        structure_id: str,
+        space_group_number: Optional[int] = None,
+        space_group_symbol: Optional[str] = None,
+        defer_commit: bool = False,
+    ) -> None:
+        """Update space group fields for an existing structure."""
+        updates = ["updated_at = ?"]
+        values: List[Any] = [datetime.now().isoformat()]
+        if space_group_number is not None:
+            updates.append("space_group_number = ?")
+            values.append(space_group_number)
+        if space_group_symbol is not None:
+            updates.append("space_group_symbol = ?")
+            values.append(space_group_symbol)
+        values.append(structure_id)
+        self.conn.execute(
+            f"UPDATE structures SET {', '.join(updates)} WHERE id = ?",
+            values,
+        )
+        if not defer_commit:
+            self._commit()
 
     def get_structure(self, structure_id: str) -> Optional[StoredStructure]:
         """Get a structure by ID."""

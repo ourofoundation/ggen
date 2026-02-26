@@ -73,7 +73,7 @@ To make relaxing all candidates computationally feasible, we integrated [torch-s
 - **Batched GPU relaxation**: Relax multiple structures simultaneously
 - **Automatic memory management**: Handles GPU memory efficiently
 - **ORB model support**: Native wrapper for ORB models
-- **FIRE optimizer**: Fast convergence with cell relaxation
+- **LBFGS optimizer**: Robust convergence with cell relaxation
 
 ```python
 import torch_sim as ts
@@ -86,7 +86,7 @@ ts_model = OrbModel(raw_orb_model, compute_stress=True, device="cuda")
 final_state = ts.optimize(
     system=list_of_atoms,
     model=ts_model,
-    optimizer=ts.Optimizer.fire,
+    optimizer=ts.Optimizer.lbfgs,
     autobatcher=True,  # Automatic GPU memory management
     init_kwargs={"cell_filter": ts.CellFilter.frechet},
 )

@@ -490,3 +490,15 @@ MIT License — see [LICENSE](LICENSE)
 ## Acknowledgments
 
 Built on [PyXtal](https://github.com/qzhu2017/PyXtal), [pymatgen](https://github.com/materialsproject/pymatgen), [ASE](https://wiki.fysik.dtu.dk/ase/), [orb-models](https://github.com/orbital-materials/orb-models), [phonopy](https://github.com/phonopy/phonopy), and [torch-sim](https://github.com/torchsim/torch-sim).
+
+
+
+
+# 1. Import external structures (MP by default)
+python scripts/import.py --database ggen.db --provider mp
+
+# 2. Relax with ORB (consistent energy domain)
+python scripts/relax.py --source mp --unrelaxed --batch-size 32
+
+# 3. Recompute hulls (now all energies are from ORB)
+python scripts/report.py  # or your hull recomputation workflow

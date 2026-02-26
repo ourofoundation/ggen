@@ -59,6 +59,7 @@ def _generate_structure_worker(args: Dict[str, Any]) -> Dict[str, Any]:
     preserve_symmetry = args["preserve_symmetry"]
     random_seed = args["random_seed"]
     optimization_max_steps = args.get("optimization_max_steps", 400)
+    optimization_optimizer = args.get("optimization_optimizer", "fire")
 
     # Build formula string
     formula = "".join(
@@ -88,6 +89,7 @@ def _generate_structure_worker(args: Dict[str, Any]) -> Dict[str, Any]:
             refine_symmetry=not preserve_symmetry,
             preserve_symmetry=preserve_symmetry,
             optimization_max_steps=optimization_max_steps,
+            optimization_optimizer=optimization_optimizer,
         )
 
         structure = ggen.get_structure()
@@ -909,6 +911,7 @@ class ChemistryExplorer:
         preserve_symmetry: bool = False,
         show_progress: bool = False,
         optimization_max_steps: int = 400,
+        optimization_optimizer: str = "fire",
     ) -> CandidateResult:
         """Generate and optimize a structure for a given stoichiometry.
 
@@ -959,6 +962,7 @@ class ChemistryExplorer:
                 preserve_symmetry=preserve_symmetry,
                 show_progress=show_progress,
                 optimization_max_steps=optimization_max_steps,
+                optimization_optimizer=optimization_optimizer,
             )
 
             structure = ggen.get_structure()
@@ -1109,6 +1113,7 @@ class ChemistryExplorer:
         preserve_symmetry: bool = False,
         show_progress: bool = False,
         optimization_max_steps: int = 400,
+        optimization_optimizer: str = "fire",
     ) -> List[CandidateResult]:
         """Generate structures for pure elements (terminal entries for phase diagram).
 
@@ -1162,6 +1167,7 @@ class ChemistryExplorer:
                         preserve_symmetry=preserve_symmetry,
                         show_progress=show_progress,
                         optimization_max_steps=optimization_max_steps,
+                        optimization_optimizer=optimization_optimizer,
                     )
 
                     structure = ggen.get_structure()
@@ -1341,6 +1347,7 @@ class ChemistryExplorer:
         compute_phonons: bool = False,
         phonon_supercell: Tuple[int, int, int] = (2, 2, 2),
         optimization_max_steps: int = 400,
+        optimization_optimizer: str = "fire",
     ) -> Tuple[List[CandidateResult], int, int]:
         """Generate structures in parallel using ProcessPoolExecutor.
 
@@ -1360,6 +1367,7 @@ class ChemistryExplorer:
                     "preserve_symmetry": preserve_symmetry,
                     "random_seed": self.random_seed,
                     "optimization_max_steps": optimization_max_steps,
+                    "optimization_optimizer": optimization_optimizer,
                 }
             )
 
@@ -1551,6 +1559,7 @@ class ChemistryExplorer:
         min_fraction: Optional[Dict[str, float]] = None,
         max_fraction: Optional[Dict[str, float]] = None,
         optimization_max_steps: int = 400,
+        optimization_optimizer: str = "fire",
     ) -> ExplorationResult:
         """Explore a chemical system by generating candidate structures.
 
@@ -1623,6 +1632,9 @@ class ChemistryExplorer:
             max_fraction: Maximum element fraction constraints. Dict mapping element symbols
                 to maximum fractions (0.0-1.0). E.g., {"Bi": 0.2} means Bi can be at most
                 20% of atoms. Can be combined with min_fraction.
+            optimization_max_steps: Max steps for geometry optimization. Default: 400.
+            optimization_optimizer: Optimizer used for torch-sim batched relaxation.
+                Common values: "fire", "lbfgs". Default: "fire".
 
         Returns:
             ExplorationResult with all candidates, phase diagram, and stable phases.
@@ -1908,6 +1920,7 @@ class ChemistryExplorer:
                     compute_phonons=compute_phonons,
                     phonon_supercell=phonon_supercell,
                     optimization_max_steps=optimization_max_steps,
+                    optimization_optimizer=optimization_optimizer,
                 )
             else:
                 # Sequential generation - show relaxation progress for each structure
@@ -1934,6 +1947,7 @@ class ChemistryExplorer:
                         preserve_symmetry=preserve_symmetry,
                         show_progress=show_progress,
                         optimization_max_steps=optimization_max_steps,
+                        optimization_optimizer=optimization_optimizer,
                     )
 
                     # If we have a previous structure and this one failed or is worse, use the previous
@@ -2055,6 +2069,7 @@ class ChemistryExplorer:
                 preserve_symmetry=preserve_symmetry,
                 show_progress=show_progress,
                 optimization_max_steps=optimization_max_steps,
+                optimization_optimizer=optimization_optimizer,
             )
 
             # Compare with previous runs and keep the better terminal

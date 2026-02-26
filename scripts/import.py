@@ -4,7 +4,7 @@ Import external crystal datasets into the ggen database.
 
 Supports importing from:
   - Materials Project (provider='mp')
-  - Alexandria OPTIMADE (provider='alexandria')
+  - Alexandria local .json.bz2 chunks (provider='alexandria')
 
 Imported structures are stored with CIF geometry and source metadata, but
 without ORB energies -- run relax.py afterwards to populate energies in a
@@ -16,9 +16,6 @@ automatically skipped.
 Usage:
     # Import all Materials Project structures
     python import.py --database ggen.db --provider mp
-
-    # Import Alexandria structures
-    python import.py --database ggen.db --provider alexandria
 
     # Import Alexandria from local .json.bz2 chunk files
     python import.py --database ggen.db --provider alexandria \
@@ -42,14 +39,13 @@ import gc
 import json
 import logging
 import os
+import resource
 import sys
-import time
 import warnings
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
 
-import requests
-from requests.exceptions import ConnectionError, Timeout
 from tqdm import tqdm
 
 from ggen import Colors, StructureDatabase
@@ -60,6 +56,11 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module="spglib")
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
+
+
+def _rss_mb() -> float:
+    """Current process RSS in MiB."""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
 
 def build_source_id(source: str, material_id: str) -> str:
@@ -78,18 +79,8 @@ def count_already_imported(db: StructureDatabase, source: str) -> int:
     return int(row[0]) if row else 0
 
 
-def is_already_imported(db: StructureDatabase, source: str, material_id: str) -> bool:
-    """Check if a material_id already exists in the DB."""
-    source_id = build_source_id(source, material_id)
-    row = db.conn.execute(
-        "SELECT 1 FROM structures WHERE source = ? AND source_id = ? LIMIT 1",
-        (source, source_id),
-    ).fetchone()
-    return row is not None
-
-
 def load_existing_source_ids(db: StructureDatabase, source: str) -> set[str]:
-    """Load existing source_ids for fast membership checks."""
+    """Load existing source_ids for fast in-memory membership checks."""
     rows = db.conn.execute(
         "SELECT source_id FROM structures WHERE source = ? AND source_id IS NOT NULL",
         (source,),
@@ -146,168 +137,17 @@ def fetch_mp_summaries(
     return docs
 
 
-def _request_with_retry(
-    url: str,
-    params: Optional[Dict[str, Any]] = None,
-    timeout: int = 60,
-    max_retries: int = 5,
-    base_delay: float = 2.0,
-) -> requests.Response:
-    """
-    GET with exponential backoff on transient errors (429, 5xx, timeouts).
-
-    Reduces page_limit on 403 (Alexandria rejects oversized pages).
-    """
-    retries = 0
-    while True:
-        try:
-            response = requests.get(url, params=params, timeout=timeout)
-            if response.status_code == 403 and params is not None:
-                page_limit = int(params.get("page_limit", 0))
-                if page_limit > 1:
-                    next_limit = max(1, page_limit // 2)
-                    logger.warning(
-                        f"  Received 403 with page_limit={page_limit}; "
-                        f"retrying with page_limit={next_limit}"
-                    )
-                    params = dict(params)
-                    params["page_limit"] = next_limit
-                    continue
-            if response.status_code in (429, 500, 502, 503, 504):
-                if retries >= max_retries:
-                    response.raise_for_status()
-                delay = base_delay * (2 ** retries)
-                logger.warning(
-                    f"  HTTP {response.status_code}; retrying in {delay:.0f}s "
-                    f"({retries + 1}/{max_retries})"
-                )
-                time.sleep(delay)
-                retries += 1
-                continue
-            response.raise_for_status()
-            return response
-        except (ConnectionError, Timeout) as exc:
-            if retries >= max_retries:
-                raise
-            delay = base_delay * (2 ** retries)
-            logger.warning(
-                f"  {type(exc).__name__}; retrying in {delay:.0f}s "
-                f"({retries + 1}/{max_retries})"
-            )
-            time.sleep(delay)
-            retries += 1
-
-
-class AlexandriaStream:
-    """
-    Streaming iterator over Alexandria OPTIMADE structures.
-
-    Fetches page-by-page so only one page is in memory at a time.
-    Exposes ``total_available`` (set after the first page is received)
-    and ``fetched_count`` for progress tracking.
-    """
-
-    RESPONSE_FIELDS = [
-        "chemical_formula_reduced",
-        "elements",
-        "nsites",
-        "lattice_vectors",
-        "cartesian_site_positions",
-        "species_at_sites",
-        "species",
-        "last_modified",
-        "_alexandria_hull_distance",
-        "_alexandria_formation_energy_per_atom",
-        "_alexandria_energy",
-        "_alexandria_energy_corrected",
-        "_alexandria_band_gap",
-        "_alexandria_space_group",
-    ]
-
-    def __init__(
-        self,
-        endpoint_url: str,
-        elements: Optional[List[str]] = None,
-        stable_only: bool = False,
-        chunk_size: int = 1000,
-        stable_threshold: float = 1e-8,
-        timeout: int = 60,
-    ):
-        self.endpoint_url = endpoint_url
-        self.elements = elements
-        self.stable_only = stable_only
-        self.stable_threshold = stable_threshold
-        self.timeout = timeout
-
-        self.page_limit = max(1, min(int(chunk_size), 500))
-        if self.page_limit != chunk_size:
-            logger.info(
-                f"  Adjusting chunk size for Alexandria: {chunk_size} -> {self.page_limit}"
-            )
-
-        self.total_available: Optional[int] = None
-        self.fetched_count: int = 0
-
-    def __iter__(self) -> Generator[Dict[str, Any], None, None]:
-        logger.info("Connecting to Alexandria OPTIMADE API...")
-        logger.info(f"  Endpoint: {self.endpoint_url}")
-
-        filter_clauses: List[str] = []
-        if self.elements:
-            quoted = ", ".join(f'"{el}"' for el in self.elements)
-            filter_clauses.append(f"elements HAS ALL {quoted}")
-            logger.info(f"  Filtering to elements: {', '.join(self.elements)}")
-        if self.stable_only:
-            filter_clauses.append(
-                f"_alexandria_hull_distance <= {self.stable_threshold}"
-            )
-            logger.info(
-                f"  Filtering to stable only (hull distance <= {self.stable_threshold})"
-            )
-
-        params: Dict[str, Any] = {
-            "page_limit": self.page_limit,
-            "response_fields": ",".join(self.RESPONSE_FIELDS),
-        }
-        if filter_clauses:
-            params["filter"] = " AND ".join(filter_clauses)
-
-        next_url: Optional[str] = self.endpoint_url
-        request_params: Optional[Dict[str, Any]] = params
-
-        while next_url:
-            response = _request_with_retry(
-                next_url, params=request_params, timeout=self.timeout
-            )
-            payload = response.json()
-
-            if self.total_available is None:
-                meta = payload.get("meta", {})
-                self.total_available = meta.get("data_available")
-
-            page_docs = payload.get("data", [])
-            self.fetched_count += len(page_docs)
-            yield from page_docs
-
-            links = payload.get("links", {})
-            next_link = links.get("next")
-            if isinstance(next_link, dict):
-                next_url = next_link.get("href")
-            elif isinstance(next_link, str):
-                next_url = next_link
-            else:
-                next_url = None
-            request_params = None  # next link already includes query params
-
-
 class LocalAlexandriaStream:
     """
     Stream Alexandria entries from local .json.bz2 chunk files.
 
     Local chunk files contain a top-level ``entries`` list of serialized
     ComputedStructureEntry-like dicts. This stream converts each entry into the
-    same lightweight doc shape consumed by ``import_alexandria_material``:
+    lightweight doc shape consumed by ``import_alexandria_material``:
       {"id": "...", "attributes": {...}}
+
+    Alexandria local chunks do not include CIF text, so CIF is generated later
+    from lattice + site coordinates during import.
     """
 
     def __init__(
@@ -325,18 +165,24 @@ class LocalAlexandriaStream:
         self.file_pattern = file_pattern
         self.total_available: Optional[int] = None
         self.fetched_count: int = 0
+        self.at_chunk_boundary: bool = False
 
     @staticmethod
     def _to_doc(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Convert chunk entry to doc. Returns copies of list/dict data so the
+        chunk payload can be freed as soon as we move to the next chunk (avoids
+        retaining full chunk in memory via yielded doc references).
+        """
         data = entry.get("data", {})
         structure = entry.get("structure", {})
         lattice = structure.get("lattice", {})
         sites = structure.get("sites", [])
 
         material_id = data.get("mat_id") or entry.get("entry_id")
-        lattice_vectors = lattice.get("matrix")
-        if not material_id or lattice_vectors is None or not sites:
+        raw_lattice = lattice.get("matrix")
+        if not material_id or raw_lattice is None or not sites:
             return None
+        lattice_vectors = [list(row) for row in raw_lattice]
 
         cartesian_site_positions: List[Any] = []
         species_at_sites: List[str] = []
@@ -344,7 +190,7 @@ class LocalAlexandriaStream:
             xyz = site.get("xyz")
             if xyz is None:
                 return None
-            cartesian_site_positions.append(xyz)
+            cartesian_site_positions.append(list(xyz))
 
             label = site.get("label")
             if isinstance(label, str) and label:
@@ -365,7 +211,7 @@ class LocalAlexandriaStream:
 
         attrs = {
             "chemical_formula_reduced": data.get("formula"),
-            "elements": data.get("elements"),
+            "elements": None if data.get("elements") is None else list(data.get("elements")),
             "nsites": data.get("nsites"),
             "lattice_vectors": lattice_vectors,
             "cartesian_site_positions": cartesian_site_positions,
@@ -429,7 +275,7 @@ class LocalAlexandriaStream:
 
         total_entries_seen = 0
         for chunk_file in chunk_files:
-            logger.info(f"  Loading {chunk_file.name}")
+            logger.info(f"  Loading {chunk_file.name} (RSS {_rss_mb():.0f} MiB)")
             try:
                 with bz2.open(chunk_file, "rt") as f:
                     payload = json.load(f)
@@ -441,6 +287,7 @@ class LocalAlexandriaStream:
             total_entries_seen += len(entries)
             self.total_available = total_entries_seen
 
+            self.at_chunk_boundary = True
             for entry in entries:
                 doc = self._to_doc(entry)
                 if doc is None:
@@ -450,6 +297,8 @@ class LocalAlexandriaStream:
                 self.fetched_count += 1
                 yield doc
 
+            del payload, entries
+            gc.collect()
 
 def import_mp_material(
     db: StructureDatabase,
@@ -474,7 +323,9 @@ def import_mp_material(
     # Get formula and composition
     formula = doc.formula_pretty or structure.composition.reduced_formula
     composition = structure.composition
-    stoichiometry = {str(el): int(amt) for el, amt in composition.element_composition.items()}
+    stoichiometry = {
+        str(el): int(amt) for el, amt in composition.element_composition.items()
+    }
     num_atoms = structure.num_sites
 
     # Get space group info
@@ -505,8 +356,12 @@ def import_mp_material(
             return False
 
     # Store original MP data in metadata
-    mp_energy_per_atom = doc.energy_per_atom if hasattr(doc, "energy_per_atom") else None
-    mp_energy_above_hull = doc.energy_above_hull if hasattr(doc, "energy_above_hull") else None
+    mp_energy_per_atom = (
+        doc.energy_per_atom if hasattr(doc, "energy_per_atom") else None
+    )
+    mp_energy_above_hull = (
+        doc.energy_above_hull if hasattr(doc, "energy_above_hull") else None
+    )
     mp_is_stable = doc.is_stable if hasattr(doc, "is_stable") else None
 
     generation_metadata = {
@@ -530,10 +385,30 @@ def import_mp_material(
         generation_metadata=generation_metadata,
         source="mp",
         source_id=build_source_id("mp", material_id),
+        check_existing=False,
         defer_commit=defer_commit,
     )
 
     return True
+
+
+def _space_group_symbol_from_number(sg_number: int) -> Optional[str]:
+    """Return International space group symbol for a given number (1–230), or None."""
+    global _SG_NUMBER_TO_SYMBOL_CACHE
+    if _SG_NUMBER_TO_SYMBOL_CACHE is None:
+        from pymatgen.symmetry.groups import SpaceGroup
+
+        cache: Dict[int, str] = {}
+        for n in range(1, 231):
+            try:
+                cache[n] = SpaceGroup.from_int_number(n).symbol
+            except Exception:
+                continue
+        _SG_NUMBER_TO_SYMBOL_CACHE = cache
+    return _SG_NUMBER_TO_SYMBOL_CACHE.get(int(sg_number))
+
+
+_SG_NUMBER_TO_SYMBOL_CACHE: Optional[Dict[int, str]] = None
 
 
 def import_alexandria_material(
@@ -542,13 +417,12 @@ def import_alexandria_material(
     defer_commit: bool = False,
 ) -> bool:
     """
-    Import a single Alexandria OPTIMADE structure into the database.
+    Import a single Alexandria structure into the database.
 
     Returns True if imported, False if skipped.
     """
-    from pymatgen.core import Structure
+    from pymatgen.core import Composition, Structure
     from pymatgen.io.cif import CifWriter
-    from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 
     material_id = str(doc.get("id", ""))
     attrs = doc.get("attributes", {})
@@ -558,27 +432,26 @@ def import_alexandria_material(
     species_at_sites = attrs.get("species_at_sites")
 
     if not material_id or lattice_vectors is None or cartesian_site_positions is None:
-        logger.debug("  Skipping entry: missing required OPTIMADE structure fields")
+        logger.debug("  Skipping entry: missing required Alexandria structure fields")
         return False
     if not species_at_sites:
         logger.debug(f"  Skipping {material_id}: missing species_at_sites")
         return False
 
-    try:
-        structure = Structure(
-            lattice=lattice_vectors,
-            species=species_at_sites,
-            coords=cartesian_site_positions,
-            coords_are_cartesian=True,
-        )
-    except Exception as e:
-        logger.debug(f"  Skipping {material_id}: invalid structure payload: {e}")
+    counts = Counter(str(sp) for sp in species_at_sites if sp)
+    if not counts:
+        logger.debug(f"  Skipping {material_id}: could not determine stoichiometry")
         return False
+    stoichiometry = dict(counts)
+    num_atoms = int(sum(counts.values()))
 
-    formula = attrs.get("chemical_formula_reduced") or structure.composition.reduced_formula
-    composition = structure.composition
-    stoichiometry = {str(el): int(amt) for el, amt in composition.element_composition.items()}
-    num_atoms = structure.num_sites
+    formula = attrs.get("chemical_formula_reduced")
+    if not formula:
+        try:
+            formula = Composition(stoichiometry).reduced_formula
+        except Exception:
+            logger.debug(f"  Skipping {material_id}: could not derive formula")
+            return False
 
     sg_number = None
     sg_symbol = None
@@ -591,24 +464,32 @@ def import_alexandria_material(
     elif isinstance(raw_sg, str):
         sg_symbol = raw_sg
 
-    if sg_number is None:
-        try:
-            analyzer = SpacegroupAnalyzer(structure, symprec=0.1)
-            sg_number = analyzer.get_space_group_number()
-            if sg_symbol is None:
-                sg_symbol = analyzer.get_space_group_symbol()
-        except Exception:
-            pass
+    # Alexandria local JSON has spg as int; derive symbol from number when missing
+    if sg_number is not None and sg_symbol is None:
+        sg_symbol = _space_group_symbol_from_number(sg_number)
 
+    try:
+        structure = Structure(
+            lattice=lattice_vectors,
+            species=species_at_sites,
+            coords=cartesian_site_positions,
+            coords_are_cartesian=True,
+        )
+    except Exception as e:
+        logger.debug(f"  Skipping {material_id}: invalid structure payload: {e}")
+        return False
     try:
         cif_writer = CifWriter(structure, symprec=0.1)
         cif_content = str(cif_writer)
+        del cif_writer
     except Exception:
         try:
             cif_content = structure.to(fmt="cif")
         except Exception as e:
+            del structure
             logger.debug(f"  Skipping {material_id}: CIF generation failed: {e}")
             return False
+    del structure
 
     generation_metadata = {
         "alexandria_material_id": material_id,
@@ -635,6 +516,7 @@ def import_alexandria_material(
         generation_metadata=generation_metadata,
         source="alexandria",
         source_id=build_source_id("alexandria", material_id),
+        check_existing=False,
         defer_commit=defer_commit,
     )
 
@@ -665,18 +547,11 @@ def main():
         help="Materials Project API key (only used for provider=mp)",
     )
     parser.add_argument(
-        "--alexandria-url",
-        type=str,
-        default="https://alexandria.icams.rub.de/pbe/v1/structures",
-        help="Alexandria OPTIMADE structures endpoint URL",
-    )
-    parser.add_argument(
         "--alexandria-local-dir",
         type=str,
-        default=None,
+        required=False,
         help=(
-            "Read Alexandria from local .json.bz2 chunks in this folder "
-            "(bypasses API)"
+            "Read Alexandria from local .json.bz2 chunks in this folder"
         ),
     )
     parser.add_argument(
@@ -690,12 +565,6 @@ def main():
         type=float,
         default=1e-8,
         help="Stable threshold for Alexandria hull distance (default: 1e-8)",
-    )
-    parser.add_argument(
-        "--request-timeout",
-        type=int,
-        default=60,
-        help="HTTP request timeout in seconds (default: 60)",
     )
     parser.add_argument(
         "--elements",
@@ -713,13 +582,13 @@ def main():
         "--chunk-size",
         type=int,
         default=1000,
-        help="API fetch chunk size (default: 1000; Alexandria capped to 500)",
+        help="Materials Project API fetch chunk size (default: 1000)",
     )
     parser.add_argument(
         "--commit-every",
         type=int,
-        default=500,
-        help="Commit to database every N structures (default: 500)",
+        default=5000,
+        help="Commit to database every N structures (default: 5000)",
     )
     parser.add_argument(
         "--dry-run",
@@ -754,15 +623,20 @@ def main():
         logger.error(f"{C.RED}Failed to open database: {e}{C.RESET}")
         sys.exit(1)
 
-    # Count already-imported materials without loading all IDs into memory
+    # Count already-imported materials and load IDs for O(1) in-memory dedupe.
     already_imported_count = count_already_imported(db, source)
+    existing_source_ids = load_existing_source_ids(db, source)
     if already_imported_count:
         logger.info(
             f"Already imported: {C.YELLOW}{already_imported_count}{C.RESET} {source} structures"
         )
+    logger.info(
+        f"Loaded {len(existing_source_ids)} existing {source} source IDs for in-memory dedupe"
+    )
 
     # Build the doc iterator and known total for each provider.
-    # MP loads all docs up-front (manageable size); Alexandria streams page-by-page.
+    # MP loads all docs up-front (manageable size); Alexandria streams chunk-by-chunk
+    # from local compressed JSON files.
     logger.info("")
     alex_stream: Optional[Any] = None
     if source == "mp":
@@ -775,25 +649,21 @@ def main():
         doc_iter = iter(docs)
         total_known: Optional[int] = len(docs)
     else:
-        if args.alexandria_local_dir:
-            alex_stream = LocalAlexandriaStream(
-                local_dir=args.alexandria_local_dir,
-                elements=args.elements,
-                stable_only=args.stable_only,
-                stable_threshold=args.alexandria_stable_threshold,
-                file_pattern=args.alexandria_local_pattern,
+        if not args.alexandria_local_dir:
+            logger.error(
+                f"{C.RED}provider=alexandria requires --alexandria-local-dir{C.RESET}"
             )
-        else:
-            alex_stream = AlexandriaStream(
-                endpoint_url=args.alexandria_url,
-                elements=args.elements,
-                stable_only=args.stable_only,
-                chunk_size=args.chunk_size,
-                stable_threshold=args.alexandria_stable_threshold,
-                timeout=args.request_timeout,
-            )
+            db.close()
+            sys.exit(1)
+        alex_stream = LocalAlexandriaStream(
+            local_dir=args.alexandria_local_dir,
+            elements=args.elements,
+            stable_only=args.stable_only,
+            stable_threshold=args.alexandria_stable_threshold,
+            file_pattern=args.alexandria_local_pattern,
+        )
         doc_iter = iter(alex_stream)
-        total_known = None  # set from first OPTIMADE response
+        total_known = None
         docs = []  # unused; keeps del docs below safe
 
     def _get_material_id(doc: Any) -> str:
@@ -810,11 +680,6 @@ def main():
         skipped_existing = 0
         new_count = 0
         total_seen = 0
-        existing_source_ids = load_existing_source_ids(db, source)
-        logger.info(
-            f"Loaded {len(existing_source_ids)} existing {source} source IDs for dedupe"
-        )
-
         dry_desc = f"Dry-run scanning {source} structures"
         dry_pbar = tqdm(doc_iter, total=total_known, desc=dry_desc)
         for doc in dry_pbar:
@@ -836,12 +701,7 @@ def main():
                 if len(sample_docs) < 20:
                     sample_docs.append(doc)
             if total_seen % 500 == 0:
-                gc.collect()
-                dry_pbar.set_postfix(
-                    new=new_count,
-                    existing=skipped_existing,
-                    refresh=False,
-                )
+                dry_pbar.set_postfix(new=new_count, existing=skipped_existing, refresh=False)
         dry_pbar.close()
 
         logger.info(f"New materials to import: {C.GREEN}{new_count}{C.RESET}")
@@ -858,16 +718,22 @@ def main():
                 e_hull = (
                     doc.energy_above_hull if hasattr(doc, "energy_above_hull") else None
                 )
-                e_hull_str = f"E_hull={e_hull * 1000:.0f} meV" if e_hull is not None else ""
+                e_hull_str = (
+                    f"E_hull={e_hull * 1000:.0f} meV" if e_hull is not None else ""
+                )
                 material_id = str(doc.material_id)
             else:
                 attrs = doc.get("attributes", {})
                 formula = attrs.get("chemical_formula_reduced", "?")
                 nsites = attrs.get("nsites", "?")
                 e_hull = attrs.get("_alexandria_hull_distance")
-                e_hull_str = f"E_hull={e_hull * 1000:.0f} meV" if e_hull is not None else ""
+                e_hull_str = (
+                    f"E_hull={e_hull * 1000:.0f} meV" if e_hull is not None else ""
+                )
                 material_id = str(doc.get("id", ""))
-            logger.info(f"  {material_id:12s}  {formula:16s}  sites={nsites}  {e_hull_str}")
+            logger.info(
+                f"  {material_id:12s}  {formula:16s}  sites={nsites}  {e_hull_str}"
+            )
         if new_count > len(sample_docs):
             logger.info(f"  ... and {new_count - len(sample_docs)} more")
 
@@ -892,7 +758,6 @@ def main():
     pbar = tqdm(doc_iter, total=total_known, desc=progress_desc)
 
     for doc in pbar:
-        # Update total from OPTIMADE meta on first page (Alexandria only)
         if (
             alex_stream is not None
             and pbar.total is None
@@ -901,8 +766,18 @@ def main():
             pbar.total = alex_stream.total_available
             pbar.refresh()
 
+        # At chunk file boundaries, commit + GC so memory from the previous
+        # chunk's pymatgen objects is reclaimed before the next chunk loads.
+        if alex_stream is not None and alex_stream.at_chunk_boundary:
+            if uncommitted:
+                db.conn.commit()
+                uncommitted = 0
+            gc.collect()
+            alex_stream.at_chunk_boundary = False
+
         material_id = _get_material_id(doc)
-        if is_already_imported(db, source, material_id):
+        source_id = build_source_id(source, material_id)
+        if source_id in existing_source_ids:
             skipped_existing += 1
             continue
 
@@ -913,6 +788,7 @@ def main():
             else:
                 success = import_alexandria_material(db, doc, defer_commit=True)
             if success:
+                existing_source_ids.add(source_id)
                 num_imported += 1
                 uncommitted += 1
             else:
@@ -921,10 +797,11 @@ def main():
             logger.debug(f"  Failed {material_id}: {e}")
             num_failed += 1
 
-        # Periodic commit
+        # Periodic commit + GC to bound memory growth
         if uncommitted >= commit_every:
             db.conn.commit()
             uncommitted = 0
+            gc.collect()
 
     pbar.close()
 
@@ -933,7 +810,9 @@ def main():
         db.conn.commit()
 
     del docs
-    total_fetched = alex_stream.fetched_count if alex_stream is not None else total_known
+    total_fetched = (
+        alex_stream.fetched_count if alex_stream is not None else total_known
+    )
 
     # Final summary
     logger.info("")
@@ -945,11 +824,14 @@ def main():
     logger.info(f"  Newly imported:   {C.GREEN}{num_imported}{C.RESET}")
     if num_failed:
         logger.info(f"  Failed:           {C.YELLOW}{num_failed}{C.RESET}")
+    logger.info(f"  Peak RSS:         {_rss_mb():.0f} MiB")
     logger.info("")
 
     # Show next steps
     total_source = already_imported_count + num_imported
-    logger.info(f"{C.BOLD}Total {source} structures in database: {total_source}{C.RESET}")
+    logger.info(
+        f"{C.BOLD}Total {source} structures in database: {total_source}{C.RESET}"
+    )
     logger.info("")
     logger.info(f"{C.CYAN}Next step:{C.RESET} Relax imported structures with ORB:")
     logger.info(

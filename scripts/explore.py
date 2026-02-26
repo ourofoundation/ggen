@@ -170,6 +170,13 @@ def main():
         help="Maximum optimization steps per structure (default: 400)",
     )
     parser.add_argument(
+        "--relax-optimizer",
+        type=str,
+        choices=["fire", "lbfgs"],
+        default="fire",
+        help="Optimizer used for torch-sim relaxation (default: fire)",
+    )
+    parser.add_argument(
         "--preserve-symmetry",
         action="store_true",
         default=False,
@@ -408,6 +415,7 @@ def main():
         min_fraction=min_fraction,
         max_fraction=max_fraction,
         optimization_max_steps=args.max_steps,
+        optimization_optimizer=args.relax_optimizer,
     )
 
     # Get stats AFTER exploration

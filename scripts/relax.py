@@ -3,7 +3,7 @@
 Re-relax structures in the database using torch-sim batched GPU relaxation.
 
 Useful for fixing structures that may have been insufficiently relaxed
-(e.g., due to torch-sim FIRE not using force convergence criterion).
+(e.g., from older runs before LBFGS + explicit force convergence).
 
 Also supports initial relaxation of imported structures (e.g. from Materials
 Project) that have geometry but no ORB energies yet.
@@ -262,7 +262,7 @@ def relax_batch_torchsim(
         final_state = ts.optimize(
             system=atoms_list,
             model=ts_model,
-            optimizer=ts.Optimizer.fire,
+            optimizer=ts.Optimizer.lbfgs,
             max_steps=max_steps,
             autobatcher=False,
             init_kwargs={"cell_filter": ts.CellFilter.frechet},

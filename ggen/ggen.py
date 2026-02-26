@@ -1148,12 +1148,34 @@ class GGen:
 
     # -------------------- Batched relaxation (torch-sim) --------------------
 
+    @staticmethod
+    def _resolve_torchsim_optimizer(optimization_optimizer: str):
+        """Resolve a torch-sim optimizer name to the enum value."""
+        if not isinstance(optimization_optimizer, str):
+            raise ValueError("optimization_optimizer must be a string")
+
+        normalized = optimization_optimizer.strip().lower()
+        if not normalized:
+            raise ValueError("optimization_optimizer cannot be empty")
+
+        if not hasattr(ts.Optimizer, normalized):
+            available = sorted(
+                name for name in dir(ts.Optimizer) if not name.startswith("_")
+            )
+            raise ValueError(
+                f"Unsupported relaxation optimizer '{optimization_optimizer}'. "
+                f"Available torch-sim optimizers: {', '.join(available)}"
+            )
+
+        return getattr(ts.Optimizer, normalized)
+
     def _relax_candidates_batched(
         self,
         candidates: List[pyxtal],
         max_steps: int = 400,
         fmax: float = 0.02,
         show_progress: bool = False,
+        optimization_optimizer: str = "fire",
     ) -> List[Tuple[Structure, float, int, float]]:
         """Relax multiple candidates in parallel using torch-sim.
 
@@ -1213,12 +1235,13 @@ class GGen:
             device,
         )
 
-        # Use FIRE optimizer with cell filter and force convergence
+        # Use configured optimizer with cell filter and force convergence
         try:
+            optimizer = self._resolve_torchsim_optimizer(optimization_optimizer)
             final_state = ts.optimize(
                 system=atoms_list,
                 model=ts_model,
-                optimizer=ts.Optimizer.fire,
+                optimizer=optimizer,
                 max_steps=max_steps,
                 autobatcher=False,  # Skip slow memory estimation
                 init_kwargs={"cell_filter": ts.CellFilter.frechet},
@@ -1435,6 +1458,7 @@ class GGen:
         fmax: float = 0.02,
         show_progress: bool = False,
         preserve_symmetry: bool = False,
+        optimization_optimizer: str = "fire",
     ) -> List[Tuple[Structure, float, int, float]]:
         """Relax multiple candidates using torch-sim or sequential ASE.
 
@@ -1451,6 +1475,8 @@ class GGen:
                 FixSymmetry constraint to preserve Wyckoff positions. This is
                 slower than batched torch-sim but maintains crystallographic
                 symmetry during optimization. Default: False.
+            optimization_optimizer: Optimizer for torch-sim batched relaxation.
+                Ignored when preserve_symmetry=True. Default: "fire".
 
         Returns:
             List of (relaxed_structure, final_energy, steps, final_fmax) tuples.
@@ -1467,7 +1493,11 @@ class GGen:
                 candidates, max_steps, fmax, show_progress, preserve_symmetry=True
             )
         return self._relax_candidates_batched(
-            candidates, max_steps, fmax, show_progress
+            candidates,
+            max_steps=max_steps,
+            fmax=fmax,
+            show_progress=show_progress,
+            optimization_optimizer=optimization_optimizer,
         )
 
     # -------------------- Crystal generation --------------------
@@ -1494,6 +1524,7 @@ class GGen:
         # Optimization parameters
         optimization_max_steps: int = 400,
         optimization_fmax: float = 0.01,
+        optimization_optimizer: str = "fire",
         trajectory_interval: int = 5,
         # Progress display
         show_progress: bool = False,
@@ -1543,6 +1574,8 @@ class GGen:
                 mode. Stops when improvement is less than this. Default: 0.01.
             optimization_max_steps: Max steps for geometry optimization. Default: 400.
             optimization_fmax: Force convergence criterion (eV/Å). Default: 0.01.
+            optimization_optimizer: Optimizer used for torch-sim batched relaxation.
+            Common values: "fire", "lbfgs". Default: "fire".
             trajectory_interval: Steps between trajectory frame snapshots during
                 optimization. Set to 0 to disable intermediate frames. Default: 5.
             show_progress: If True, show a tqdm progress bar during relaxation.
@@ -1567,6 +1600,7 @@ class GGen:
                 preserve_symmetry=preserve_symmetry,
                 optimization_max_steps=optimization_max_steps,
                 optimization_fmax=optimization_fmax,
+                optimization_optimizer=optimization_optimizer,
                 trajectory_interval=trajectory_interval,
                 show_progress=show_progress,
             )
@@ -1843,6 +1877,7 @@ class GGen:
                 fmax=optimization_fmax,
                 show_progress=show_progress,
                 preserve_symmetry=preserve_symmetry,
+                optimization_optimizer=optimization_optimizer,
             )
 
             # Find the best by final relaxed energy
@@ -2129,6 +2164,7 @@ class GGen:
         preserve_symmetry: bool,
         optimization_max_steps: int,
         optimization_fmax: float,
+        optimization_optimizer: str = "fire",
         trajectory_interval: int,
         show_progress: bool = False,
     ) -> Dict[str, Any]:
@@ -2196,6 +2232,7 @@ class GGen:
                     max_iterations=1,  # Single-shot for each iteration
                     optimization_max_steps=optimization_max_steps,
                     optimization_fmax=optimization_fmax,
+                    optimization_optimizer=optimization_optimizer,
                     trajectory_interval=trajectory_interval,
                     show_progress=show_progress,
                 )

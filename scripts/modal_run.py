@@ -39,7 +39,7 @@ image = (
         # ML potentials (GPU accelerated)
         "orb-models>=0.5.5",
         "pynanoflann",
-        "torch-sim-atomistic>=0.5.0",
+        "torch-sim-atomistic>=0.5.2",
         "cuml-cu12==25.2.*",
         # Phonon calculations
         "phonopy>=2.20.0",
