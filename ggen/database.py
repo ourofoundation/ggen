@@ -1071,7 +1071,10 @@ class StructureDatabase:
         return pd, e_above_hull_map, filter_counts
 
     def get_hull_entries(
-        self, chemical_system: str, e_above_hull_cutoff: float = 0.0
+        self,
+        chemical_system: str,
+        e_above_hull_cutoff: float = 0.0,
+        run_id: Optional[str] = None,
     ) -> List[StoredStructure]:
         """
         Get structures on or near the convex hull.
@@ -1079,22 +1082,38 @@ class StructureDatabase:
         Args:
             chemical_system: Chemical system (e.g., "Fe-Mn-Co")
             e_above_hull_cutoff: Maximum e_above_hull in eV/atom (0 = only hull entries)
+            run_id: If provided, only return structures linked to this run.
+                Hull distances are still computed from all data, but only structures
+                generated in the given run are returned.
 
         Returns:
             List of StoredStructure objects on/near hull, sorted by e_above_hull
         """
         chemsys = self.normalize_chemsys(chemical_system)
 
-        rows = self.conn.execute(
-            """
-            SELECT s.*, h.e_above_hull, h.is_on_hull
-            FROM structures s
-            JOIN hull_entries h ON s.id = h.structure_id
-            WHERE h.chemsys = ? AND h.e_above_hull <= ?
-            ORDER BY h.e_above_hull ASC
-            """,
-            (chemsys, e_above_hull_cutoff),
-        ).fetchall()
+        if run_id is not None:
+            rows = self.conn.execute(
+                """
+                SELECT s.*, h.e_above_hull, h.is_on_hull
+                FROM structures s
+                JOIN hull_entries h ON s.id = h.structure_id
+                JOIN run_structures rs ON s.id = rs.structure_id
+                WHERE h.chemsys = ? AND h.e_above_hull <= ? AND rs.run_id = ?
+                ORDER BY h.e_above_hull ASC
+                """,
+                (chemsys, e_above_hull_cutoff, run_id),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                """
+                SELECT s.*, h.e_above_hull, h.is_on_hull
+                FROM structures s
+                JOIN hull_entries h ON s.id = h.structure_id
+                WHERE h.chemsys = ? AND h.e_above_hull <= ?
+                ORDER BY h.e_above_hull ASC
+                """,
+                (chemsys, e_above_hull_cutoff),
+            ).fetchall()
 
         structures = []
         for row in rows:

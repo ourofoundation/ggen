@@ -270,6 +270,53 @@ The phase diagram filename automatically reflects the filters applied, making it
 | `--tested-only` | Only include phonon-tested structures in phase diagram |
 | `--all-polymorphs` | Include all polymorphs, not just lowest-energy per formula |
 
+### Scouting Candidate Elements
+
+When you have a template like `Fe-Bi-X` and want to find which X is most promising, use the **scout** to systematically screen all candidates in an element group:
+
+```bash
+# See available element groups
+python scripts/scout.py --list-groups
+
+# Preview which systems would be explored
+python scripts/scout.py "Fe-Bi-{X}" --group 3d_metals --dry-run
+
+# Scan all 3d transition metals, scoring for tetragonal/hexagonal phases
+python scripts/scout.py "Fe-Bi-{X}" --group 3d_metals \
+    --crystal-systems tetragonal hexagonal
+
+# Add composition constraints (Fe-rich) and use explicit element list
+python scripts/scout.py "Fe-Bi-{X}" --elements Co Mn Ni Cr V Ti \
+    --crystal-systems tetragonal hexagonal \
+    --min-fraction Fe:0.3
+```
+
+**What happens:** For each candidate X, the scout runs a shallow exploration (fewer trials per stoichiometry for speed), then queries the convex hull to score how many stable structures appeared in your target crystal systems. Results are ranked in a summary table:
+
+```
+Rank  System           X     On-Hull  Near-Hull  Tgt-Hits   Best-E_hull  Formulas     Time
+  1   Bi-Fe-Ti        Ti          3         8         5       12.0 meV        42      1.2h
+  2   Bi-Co-Fe        Co          2         6         3       34.0 meV        38      1.1h
+  3   Bi-Fe-Mn        Mn          1         5         2       89.0 meV        41      1.3h
+  ...
+```
+
+The top-ranked systems are the ones worth a deep exploration run.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--group` | — | Named element group (`3d_metals`, `transition_metals`, `metalloids`, etc.) |
+| `--elements` | — | Explicit list of candidate elements |
+| `--exclude` | — | Elements to exclude (template elements are auto-excluded) |
+| `--crystal-systems` | all | Target crystal systems for scoring |
+| `--shallow-trials` | 5 | Generation attempts per stoichiometry |
+| `--min-fraction` | none | Minimum element fractions, e.g. `Fe:0.3` |
+| `--max-fraction` | none | Maximum element fractions, e.g. `Bi:0.2` |
+| `--max-atoms` | 12 | Maximum atoms per unit cell |
+| `--e-above-hull` | 0.15 | Energy cutoff (eV) for "near hull" |
+| `--dry-run` | off | Show systems without running |
+| `--list-groups` | off | Print available element groups |
+
 ### Running Multiple Systems
 
 Use GNU parallel to explore multiple systems concurrently:

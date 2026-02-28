@@ -27,6 +27,7 @@ from pymatgen.core import Composition, Element, Structure
 from pymatgen.entries.computed_entries import ComputedEntry
 from pymatgen.io.cif import CifWriter
 
+from .calculator import RSS_LIMIT_MB, get_orb_calculator, reset_dynamo_cache, rss_mb
 from .colors import Colors
 from .ggen import GGen
 
@@ -48,7 +49,7 @@ def _generate_structure_worker(args: Dict[str, Any]) -> Dict[str, Any]:
     Returns a dictionary with results that can be converted to CandidateResult.
     """
     from .ggen import GGen
-    from .calculator import get_orb_calculator
+    from .calculator import get_orb_calculator, reset_dynamo_cache
 
     stoichiometry = args["stoichiometry"]
     num_trials = args["num_trials"]
@@ -111,6 +112,7 @@ def _generate_structure_worker(args: Dict[str, Any]) -> Dict[str, Any]:
         # Clean up to free memory in this worker process
         ggen.cleanup()
         del result
+        reset_dynamo_cache()
 
         return {
             "formula": formula,
@@ -278,8 +280,6 @@ class ChemistryExplorer:
         for all subsequent structure generations.
         """
         if not self._calculator_initialized:
-            from .calculator import get_orb_calculator
-
             logger.info("Initializing calculator (will be reused for all generations)")
             self._calculator = get_orb_calculator()
             self._calculator_initialized = True
@@ -590,7 +590,11 @@ class ChemistryExplorer:
         if isinstance(obj, np.ndarray):
             return obj.tolist()
         if isinstance(obj, dict):
-            return {k: self._to_json_serializable(v) for k, v in obj.items()}
+            return {
+                k: self._to_json_serializable(v)
+                for k, v in obj.items()
+                if k != "_stored_structure"
+            }
         if isinstance(obj, (list, tuple)):
             return [self._to_json_serializable(v) for v in obj]
         return obj
@@ -1371,8 +1375,11 @@ class ChemistryExplorer:
                 }
             )
 
-        # Use ProcessPoolExecutor for parallel generation
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # Recycle workers every 20 tasks to prevent unbounded memory growth
+        # from torch.compile caches and pymatgen object accumulation.
+        with ProcessPoolExecutor(
+            max_workers=num_workers, max_tasks_per_child=20
+        ) as executor:
             # Submit all tasks
             future_to_args = {
                 executor.submit(_generate_structure_worker, args): (
@@ -1997,11 +2004,16 @@ class ChemistryExplorer:
                     self._save_candidate(conn, candidate)
                     candidates.append(candidate)
 
-                    # Aggressive memory cleanup after each stoichiometry
-                    # to prevent memory accumulation during long runs
-                    gc.collect()
+                    # Free torch caches + reclaim glibc pages
+                    reset_dynamo_cache()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
+
+                    if (i + 1) % 5 == 0 or i == 0:
+                        logger.info(
+                            "RSS after %s (%d/%d): %.0f MiB",
+                            formula, i + 1, len(stoichs_to_generate), rss_mb(),
+                        )
 
         # Add remaining structures from previous runs that weren't in our enumeration
         if load_previous_runs:

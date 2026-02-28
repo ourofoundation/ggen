@@ -21,6 +21,8 @@ from .phonons import (
     select_stable_candidate,
 )
 from .report import SystemExplorer, SystemReport, StabilityStats, SpaceGroupStats
+from .elements import get_element_group, list_groups, resolve_candidates
+from .scout import SystemScout, SystemScore, ScoutResult
 from .utils import parse_chemical_formula
 
 __version__ = "0.1.0"
@@ -53,6 +55,14 @@ __all__ = [
     "check_dynamical_stability",
     "find_first_stable_candidate",
     "select_stable_candidate",
+    # Scout
+    "SystemScout",
+    "SystemScore",
+    "ScoutResult",
+    # Elements
+    "get_element_group",
+    "list_groups",
+    "resolve_candidates",
     # Utilities
     "Colors",
     "get_orb_calculator",

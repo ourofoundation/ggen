@@ -57,6 +57,8 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module="spglib")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
+_RSS_LIMIT_MB = int(os.environ.get("GGEN_RSS_LIMIT_MB", 20_000))
+
 
 def _rss_mb() -> float:
     """Current process RSS in MiB."""
@@ -773,6 +775,11 @@ def main():
                 db.conn.commit()
                 uncommitted = 0
             gc.collect()
+            try:
+                import ctypes
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
             alex_stream.at_chunk_boundary = False
 
         material_id = _get_material_id(doc)
@@ -802,6 +809,17 @@ def main():
             db.conn.commit()
             uncommitted = 0
             gc.collect()
+            current_rss = _rss_mb()
+            if current_rss > _RSS_LIMIT_MB:
+                logger.warning(
+                    f"RSS={current_rss:.0f} MiB exceeds soft limit "
+                    f"({_RSS_LIMIT_MB} MiB) -- forcing malloc_trim"
+                )
+                try:
+                    import ctypes
+                    ctypes.CDLL("libc.so.6").malloc_trim(0)
+                except Exception:
+                    pass
 
     pbar.close()
 

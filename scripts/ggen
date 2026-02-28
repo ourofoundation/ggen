@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Wrapper that runs ggen scripts with jemalloc to prevent memory fragmentation.
+#
+# glibc's malloc doesn't return freed pages to the OS, which causes PyTorch
+# workloads (many large short-lived tensor allocations) to balloon in committed
+# memory over long runs.  jemalloc returns pages immediately via madvise.
+#
+# Usage:
+#   ggen scout "Fe-Bi-{X}" --group 3d_metals
+#   ggen explore Fe-Mn-Si --max-atoms 16
+#   ggen import --provider alexandria --alexandria-local-dir ./data
+#   ggen relax --source alexandria --unrelaxed
+#
+# Any script in ggen/scripts/ can be invoked by name (without .py).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Locate jemalloc
+if [[ -z "${LD_PRELOAD:-}" ]]; then
+    for lib in /usr/lib/libjemalloc.so /usr/lib/x86_64-linux-gnu/libjemalloc.so /usr/lib64/libjemalloc.so; do
+        if [[ -f "$lib" ]]; then
+            export LD_PRELOAD="$lib"
+            break
+        fi
+    done
+fi
+
+if [[ -z "${LD_PRELOAD:-}" ]]; then
+    echo "warning: jemalloc not found, running with glibc malloc (may OOM on long runs)" >&2
+    echo "  install: sudo pacman -S jemalloc  OR  sudo apt install libjemalloc2" >&2
+fi
+
+subcmd="${1:-}"
+if [[ -z "$subcmd" ]]; then
+    echo "usage: ggen <script> [args...]"
+    echo ""
+    echo "Available scripts:"
+    for f in "$SCRIPT_DIR"/*.py; do
+        name="$(basename "$f" .py)"
+        [[ "$name" == "__"* ]] && continue
+        echo "  $name"
+    done
+    exit 1
+fi
+shift
+
+target="$SCRIPT_DIR/${subcmd}.py"
+if [[ ! -f "$target" ]]; then
+    echo "error: unknown script '$subcmd'" >&2
+    echo "  available: $(ls "$SCRIPT_DIR"/*.py | xargs -I{} basename {} .py | grep -v '^__' | tr '\n' ' ')" >&2
+    exit 1
+fi
+
+exec python "$target" "$@"

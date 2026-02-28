@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import math
+import os
 import warnings
 from dataclasses import dataclass
 from datetime import datetime
@@ -32,7 +33,7 @@ from pyxtal import pyxtal
 from pyxtal.symmetry import Group
 from scipy.spatial.distance import cosine
 
-from .calculator import get_orb_calculator
+from .calculator import get_orb_calculator, reset_dynamo_cache, rss_mb
 from .colors import Colors
 from .operations import Operations
 from .utils import compute_fmax, parse_chemical_formula
@@ -54,8 +55,22 @@ if not logger.handlers:
     # Avoid "No handler found" warnings; user/app can configure logging level/handlers.
     logger.addHandler(logging.NullHandler())
 
+# Reuse pyxtal Group objects across all compatibility checks.
+# Constructing Group(1..230) repeatedly causes large retained memory growth.
+_PYXTAL_GROUPS_BY_NUMBER: Optional[Dict[int, Group]] = None
+
 
 # ===================== Helper utilities =====================
+
+
+def _get_pyxtal_groups_by_number() -> Dict[int, Group]:
+    """Return lazily initialized cache of pyxtal Group objects."""
+    global _PYXTAL_GROUPS_BY_NUMBER
+    if _PYXTAL_GROUPS_BY_NUMBER is None:
+        _PYXTAL_GROUPS_BY_NUMBER = {
+            sg_number: Group(sg_number, dim=3) for sg_number in range(1, 231)
+        }
+    return _PYXTAL_GROUPS_BY_NUMBER
 
 
 @lru_cache(maxsize=8192)
@@ -77,9 +92,9 @@ def _get_compatible_space_groups_cached(
     compatible_groups = []
     counts = list(counts_tuple)
 
-    for sg_number in range(1, 231):  # International space groups 1–230
+    groups_by_number = _get_pyxtal_groups_by_number()
+    for sg_number, group in groups_by_number.items():  # International space groups 1–230
         try:
-            group = Group(sg_number, dim=3)
             is_compatible, _ = group.check_compatible(counts)
             if is_compatible:
                 wyckoff_positions = group.Wyckoff_positions
@@ -894,6 +909,15 @@ class GGen:
                 "No structure loaded. Use set_structure() or from_json() first."
             )
 
+        mem_trace = os.environ.get("GGEN_MEM_TRACE", "0") == "1"
+        rss_opt_start = rss_mb() if mem_trace else None
+        if mem_trace:
+            logger.info(
+                "[mem] optimize start: n_atoms=%d RSS=%.0f MiB",
+                len(self._current_structure),
+                rss_opt_start,
+            )
+
         if self.enable_trajectory:
             self._add_trajectory_frame(
                 structure=self._current_structure,
@@ -1120,6 +1144,14 @@ class GGen:
                         pbar2.close()
                     logger.warning("Stage 2 failed: %s. Using stage 1 result.", e)
 
+            if mem_trace and rss_opt_start is not None:
+                rss_opt_end = rss_mb()
+                logger.info(
+                    "[mem] optimize end: RSS %.0f -> %.0f MiB (delta %+0.f)",
+                    rss_opt_start,
+                    rss_opt_end,
+                    rss_opt_end - rss_opt_start,
+                )
             return optimized_structure, float(final_energy), int(num_steps)
 
         except Exception as e:
@@ -1143,6 +1175,14 @@ class GGen:
                         "relax_cell": relax_cell,
                     },
                     metadata={"error": str(e), "converged": False},
+                )
+            if mem_trace and rss_opt_start is not None:
+                rss_opt_end = rss_mb()
+                logger.info(
+                    "[mem] optimize failed end: RSS %.0f -> %.0f MiB (delta %+0.f)",
+                    rss_opt_start,
+                    rss_opt_end,
+                    rss_opt_end - rss_opt_start,
                 )
             return self._current_structure, original_energy, 0
 
@@ -1202,8 +1242,33 @@ class GGen:
         if not candidates:
             return []
 
+        mem_trace = os.environ.get("GGEN_MEM_TRACE", "0") == "1"
+        rss_start = rss_mb()
+        if mem_trace:
+            logger.info(
+                "[mem] batched relax start: %d candidates RSS=%.0f MiB",
+                len(candidates),
+                rss_start,
+            )
+        else:
+            logger.debug(
+                "Batched relax start: %d candidates, RSS=%.0f MiB",
+                len(candidates),
+                rss_start,
+            )
+
+        # Keep large intermediates in locals so we can force-drop references in finally.
+        atoms_list = None
+        raw_model = None
+        ts_model = None
+        final_state = None
+        final_atoms_list = None
+        energies = None
+
         # Convert candidates to ASE atoms
         atoms_list = [c.to_ase() for c in candidates]
+        if mem_trace:
+            logger.info("[mem] after to_ase list: RSS=%.0f MiB", rss_mb())
 
         # Get the raw ORB model from our calculator
         # The ORBCalculator stores the model in .orbff attribute
@@ -1227,6 +1292,8 @@ class GGen:
             compute_forces=True,
             device=device,
         )
+        if mem_trace:
+            logger.info("[mem] after TorchSimOrbModel init: RSS=%.0f MiB", rss_mb())
 
         # Run batched optimization
         logger.debug(
@@ -1248,11 +1315,19 @@ class GGen:
                 convergence_fn=ts.generate_force_convergence_fn(force_tol=fmax),
                 pbar={"leave": False} if show_progress else False,
             )
+            if mem_trace:
+                logger.info("[mem] after ts.optimize: RSS=%.0f MiB", rss_mb())
 
             # Extract results
             results = []
             final_atoms_list = final_state.to_atoms()
+            if mem_trace:
+                logger.info("[mem] after final_state.to_atoms: RSS=%.0f MiB", rss_mb())
             energies = final_state.energy.detach().cpu().numpy()
+            if mem_trace:
+                logger.info(
+                    "[mem] after energy detach/cpu/numpy: RSS=%.0f MiB", rss_mb()
+                )
 
             for i, atoms in enumerate(final_atoms_list):
                 # Compute fmax BEFORE structure conversion to avoid numerical drift
@@ -1293,6 +1368,37 @@ class GGen:
             return self._relax_candidates_sequential(
                 candidates, max_steps, fmax, show_progress
             )
+        finally:
+            # Explicitly break references to large torch-sim/PyTorch objects.
+            # This helps avoid retaining graphs/tensors between stoichiometries.
+            energies = None
+            final_atoms_list = None
+            final_state = None
+            ts_model = None
+            raw_model = None
+            atoms_list = None
+            gc.collect()
+            reset_dynamo_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    pass
+            rss_end = rss_mb()
+            if mem_trace:
+                logger.info(
+                    "[mem] batched relax cleanup: RSS %.0f -> %.0f MiB (delta %+0.f)",
+                    rss_start,
+                    rss_end,
+                    rss_end - rss_start,
+                )
+            else:
+                logger.debug(
+                    "Batched relax cleanup: RSS %.0f -> %.0f MiB",
+                    rss_start,
+                    rss_end,
+                )
 
     def _relax_candidates_sequential(
         self,
@@ -1584,6 +1690,12 @@ class GGen:
             Dictionary with structure metadata, CIF content, and generation statistics.
             When max_iterations > 1, also includes iteration_history and convergence info.
         """
+        mem_trace = os.environ.get("GGEN_MEM_TRACE", "0") == "1"
+        mem_trace_trial = os.environ.get("GGEN_MEM_TRACE_TRIAL", "0") == "1"
+        rss_gen_start = rss_mb() if mem_trace else None
+        if mem_trace:
+            logger.info("[mem] generate start %s: RSS=%.0f MiB", formula, rss_gen_start)
+
         # Handle iterative refinement mode
         if max_iterations > 1:
             return self._generate_crystal_iterative(
@@ -1668,7 +1780,8 @@ class GGen:
         if space_group is not None:
             # User specified a space group - validate it
             try:
-                g = Group(int(space_group), dim=3)
+                sg_num = int(space_group)
+                g = _get_pyxtal_groups_by_number()[sg_num]
                 ok, _msg = g.check_compatible(counts)
                 if not ok:
                     raise ValueError(
@@ -1781,6 +1894,14 @@ class GGen:
             sg_stats["valid"] += 1
 
             # Pre-filter: check structural validity before energy evaluation
+            if mem_trace_trial:
+                logger.info(
+                    "[mem] trial prefilter start %s sg=%d t=%d RSS=%.0f MiB",
+                    formula,
+                    sg_number,
+                    trial_idx + 1,
+                    rss_mb(),
+                )
             structure = c.to_pymatgen()
             is_valid, reason = self._is_structurally_valid(
                 structure,
@@ -1788,6 +1909,16 @@ class GGen:
                 min_volume_per_atom=volume_bounds[0],
                 max_volume_per_atom=volume_bounds[1],
             )
+            if mem_trace_trial:
+                logger.info(
+                    "[mem] trial prefilter end %s sg=%d t=%d RSS=%.0f MiB",
+                    formula,
+                    sg_number,
+                    trial_idx + 1,
+                    rss_mb(),
+                )
+            # Ensure prefilter structure object is not kept alive past this iteration.
+            structure = None
 
             if not is_valid:
                 logger.debug(
@@ -1803,10 +1934,26 @@ class GGen:
 
             # Energy evaluation
             try:
+                if mem_trace_trial:
+                    logger.info(
+                        "[mem] trial energy start %s sg=%d t=%d RSS=%.0f MiB",
+                        formula,
+                        sg_number,
+                        trial_idx + 1,
+                        rss_mb(),
+                    )
                 atoms = c.to_ase()
                 atoms.calc = self.calculator
                 energy = float(atoms.get_potential_energy())
                 generation_stats["energy_evaluated"] += 1
+                if mem_trace_trial:
+                    logger.info(
+                        "[mem] trial energy end %s sg=%d t=%d RSS=%.0f MiB",
+                        formula,
+                        sg_number,
+                        trial_idx + 1,
+                        rss_mb(),
+                    )
 
                 # Combined scoring
                 score, breakdown = self._score_crystal(
@@ -1831,6 +1978,18 @@ class GGen:
                     e,
                 )
                 continue
+            finally:
+                # Drop per-trial references aggressively; we only need `c` for
+                # accepted candidates held in `all_candidates`.
+                atoms = None
+
+        if mem_trace:
+            logger.info(
+                "[mem] after trial generation %s: %d candidates RSS=%.0f MiB",
+                formula,
+                len(all_candidates),
+                rss_mb(),
+            )
 
         # Select best candidate
         if not all_candidates:
@@ -1879,6 +2038,12 @@ class GGen:
                 preserve_symmetry=preserve_symmetry,
                 optimization_optimizer=optimization_optimizer,
             )
+            if mem_trace:
+                logger.info(
+                    "[mem] after _relax_candidates %s: RSS=%.0f MiB",
+                    formula,
+                    rss_mb(),
+                )
 
             # Find the best by final relaxed energy
             if not relaxed_results:
@@ -1998,6 +2163,12 @@ class GGen:
 
         # Post-relaxation symmetry refinement
         if optimize_geometry and refine_symmetry and not preserve_symmetry:
+            if mem_trace:
+                logger.info(
+                    "[mem] before symmetry refinement %s: RSS=%.0f MiB",
+                    formula,
+                    rss_mb(),
+                )
             logger.info("Attempting post-relaxation symmetry refinement...")
             refined_struct, refined_sg, refined_symbol = (
                 self._refine_to_higher_symmetry(structure)
@@ -2048,6 +2219,12 @@ class GGen:
                 )
             else:
                 logger.info("No higher symmetry detected after relaxation")
+            if mem_trace:
+                logger.info(
+                    "[mem] after symmetry refinement %s: RSS=%.0f MiB",
+                    formula,
+                    rss_mb(),
+                )
 
         # Final structure and analysis
         self.set_structure(structure, add_to_trajectory=not optimize_geometry)
@@ -2087,6 +2264,12 @@ class GGen:
         # Produce CIF content
         cif_text = str(CifWriter(structure, symprec=SYMPREC))
         cif64 = base64.b64encode(cif_text.encode("utf-8")).decode("utf-8")
+        if mem_trace:
+            logger.info(
+                "[mem] after cif encode %s: RSS=%.0f MiB",
+                formula,
+                rss_mb(),
+            )
 
         # Final summary
         num_atoms = len(structure)
@@ -2147,6 +2330,15 @@ class GGen:
         if optimize_geometry:
             resp["optimization_steps"] = optimization_steps
             resp["final_fmax"] = best_fmax
+        if mem_trace and rss_gen_start is not None:
+            rss_gen_end = rss_mb()
+            logger.info(
+                "[mem] generate end %s: RSS %.0f -> %.0f MiB (delta %+0.f)",
+                formula,
+                rss_gen_start,
+                rss_gen_end,
+                rss_gen_end - rss_gen_start,
+            )
         return resp
 
     def _generate_crystal_iterative(
@@ -2164,8 +2356,8 @@ class GGen:
         preserve_symmetry: bool,
         optimization_max_steps: int,
         optimization_fmax: float,
-        optimization_optimizer: str = "fire",
         trajectory_interval: int,
+        optimization_optimizer: str = "fire",
         show_progress: bool = False,
     ) -> Dict[str, Any]:
         """Internal iterative crystal generation (called when max_iterations > 1)."""

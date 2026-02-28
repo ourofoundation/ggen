@@ -6,6 +6,10 @@ Uses a unified database to share structures across chemical systems.
 For example, Fe-Mn structures explored in Fe-Mn-Co will be reused when
 exploring Fe-Mn-Sn.
 
+For long runs, use jemalloc to prevent glibc malloc fragmentation:
+
+    LD_PRELOAD=/usr/lib/libjemalloc.so python explore.py Fe-Mn-Si
+
 Usage:
     python explore.py Fe-Mn-Si
     python explore.py Fe-Mn-Si --max-atoms 16 --num-trials 20
