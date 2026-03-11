@@ -29,7 +29,7 @@ ggen_mount = modal.Mount.from_local_dir(
 
 # Image with all dependencies for GPU-accelerated ggen
 image = (
-    modal.Image.debian_slim(python_version="3.11")
+    modal.Image.debian_slim(python_version="3.12")
     .apt_install("git", "build-essential")
     .pip_install(
         # Core scientific stack
@@ -40,7 +40,8 @@ image = (
         "pyxtal>=0.5.0",
         "ase>=3.22.0",
         # ML potentials (GPU accelerated)
-        "orb-models>=0.5.5",
+        "orb-models>=0.6.0",
+        "nvalchemi-toolkit-ops>=0.2.0",
         "pynanoflann",
         "torch-sim-atomistic>=0.5.2",
         "cuml-cu12==25.2.*",

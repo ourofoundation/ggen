@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ggen"
-version = "0.1.0"
+version = "0.2.0"
 description = "Crystal generation and mutation library for evolutionary structure optimization"
 readme = "README.md"
 license = "MIT"
@@ -45,7 +45,8 @@ dependencies = [
     "pyxtal>=0.5.0",
     "ase>=3.22.0",
     "requests>=2.25.0",
-    "orb-models>=0.5.5",
+    "orb-models>=0.5.5; python_version < '3.12'",
+    "orb-models>=0.6.0; python_version >= '3.12'",
     "pynanoflann",
     "tqdm>=4.60.0",
     "torch-sim-atomistic>=0.5.2",
@@ -67,6 +68,9 @@ dev = [
 ]
 docs = ["sphinx>=4.0", "sphinx-rtd-theme>=1.0", "myst-parser>=0.15"]
 jupyter = ["jupyter>=1.0", "ipywidgets>=7.0", "matplotlib>=3.0", "plotly>=5.0"]
+gpu-cu12 = [
+    "cuml-cu12==25.2.*; platform_system == 'Linux' and python_version >= '3.12'",
+]
 
 [project.urls]
 Homepage = "https://github.com/ourofoundation/ggen"

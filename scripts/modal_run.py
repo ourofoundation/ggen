@@ -37,7 +37,8 @@ image = (
         "pyxtal>=0.5.0",
         "ase>=3.22.0",
         # ML potentials (GPU accelerated)
-        "orb-models>=0.5.5",
+        "orb-models>=0.6.0",
+        "nvalchemi-toolkit-ops>=0.2.0",
         "pynanoflann",
         "torch-sim-atomistic>=0.5.2",
         "cuml-cu12==25.2.*",

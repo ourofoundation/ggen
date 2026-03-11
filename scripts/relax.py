@@ -43,6 +43,7 @@ from pymatgen.io.cif import CifWriter
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 
 from ggen import Colors, StructureDatabase
+from ggen.calculator import build_orb_torchsim_model
 from ggen.database import StoredStructure
 
 # Suppress warnings
@@ -208,7 +209,6 @@ def relax_batch_torchsim(
     Returns list of result dicts (one per entry).
     """
     import torch_sim as ts
-    from torch_sim.models.orb import OrbModel as TorchSimOrbModel
 
     adaptor = AseAtomsAdaptor()
     results = []
@@ -237,25 +237,9 @@ def relax_batch_torchsim(
     if not atoms_list:
         return results
 
-    # Get the raw ORB model from calculator
-    if hasattr(calculator, "orbff"):
-        raw_model = calculator.orbff
-    elif hasattr(calculator, "model"):
-        raw_model = calculator.model
-    else:
-        # Fallback to sequential if we can't get the model
-        raise AttributeError("Cannot extract ORB model from calculator")
-
-    # Determine device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Create torch-sim model wrapper
-    ts_model = TorchSimOrbModel(
-        model=raw_model,
-        compute_stress=True,
-        compute_forces=True,
-        device=device,
-    )
+    # Reuse the shared ORB calculator wrapper so batch relaxation benefits from
+    # the same atoms adapter and accelerated edge construction settings.
+    ts_model = build_orb_torchsim_model(calculator)
 
     # Run batched optimization with force convergence
     try:

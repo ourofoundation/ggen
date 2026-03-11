@@ -16,6 +16,15 @@ cd ggen
 pip install -e .
 ```
 
+For the latest `orb-models` `v0.6.0` stack and faster GPU graph construction, use Python `3.12+`.
+If you want the legacy cuML edge builders available as well, install:
+
+```bash
+pip install -e ".[gpu-cu12]"
+```
+
+`ggen` defaults to ORB's recommended `knn_alchemi` graph construction path. You can override it at runtime with `GGEN_ORB_EDGE_METHOD`, for example `knn_cuml_rbc` or `knn_cuml_brute`.
+
 ## CLI Usage
 
 GGen is designed for command-line exploration of chemical systems. The typical workflow:

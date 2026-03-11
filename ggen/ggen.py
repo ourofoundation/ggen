@@ -33,7 +33,12 @@ from pyxtal import pyxtal
 from pyxtal.symmetry import Group
 from scipy.spatial.distance import cosine
 
-from .calculator import get_orb_calculator, reset_dynamo_cache, rss_mb
+from .calculator import (
+    build_orb_torchsim_model,
+    get_orb_calculator,
+    reset_dynamo_cache,
+    rss_mb,
+)
 from .colors import Colors
 from .operations import Operations
 from .utils import compute_fmax, parse_chemical_formula
@@ -42,7 +47,6 @@ from .utils import compute_fmax, parse_chemical_formula
 
 import torch
 import torch_sim as ts
-from torch_sim.models.orb import OrbModel as TorchSimOrbModel
 
 
 # ===================== Constants & Logging =====================
@@ -1270,36 +1274,17 @@ class GGen:
         if mem_trace:
             logger.info("[mem] after to_ase list: RSS=%.0f MiB", rss_mb())
 
-        # Get the raw ORB model from our calculator
-        # The ORBCalculator stores the model in .orbff attribute
-        if hasattr(self.calculator, "orbff"):
-            raw_model = self.calculator.orbff
-        elif hasattr(self.calculator, "model"):
-            raw_model = self.calculator.model
-        else:
-            raise AttributeError(
-                "Cannot extract ORB model from calculator. "
-                "Expected 'orbff' or 'model' attribute."
-            )
-
-        # Determine device
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        # Create torch-sim model wrapper
-        ts_model = TorchSimOrbModel(
-            model=raw_model,
-            compute_stress=True,
-            compute_forces=True,
-            device=device,
-        )
+        # Reuse the calculator's ORB runtime config so batched relaxation follows
+        # the same adapter and edge-construction path as direct ASE evaluation.
+        ts_model = build_orb_torchsim_model(self.calculator)
         if mem_trace:
-            logger.info("[mem] after TorchSimOrbModel init: RSS=%.0f MiB", rss_mb())
+            logger.info("[mem] after ORB TorchSim init: RSS=%.0f MiB", rss_mb())
 
         # Run batched optimization
         logger.debug(
             "Starting batched relaxation of %d candidates using torch-sim (device=%s)",
             len(atoms_list),
-            device,
+            "cuda" if torch.cuda.is_available() else "cpu",
         )
 
         # Use configured optimizer with cell filter and force convergence
