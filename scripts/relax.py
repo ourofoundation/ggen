@@ -45,6 +45,7 @@ from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 from ggen import Colors, StructureDatabase
 from ggen.calculator import build_orb_torchsim_model
 from ggen.database import StoredStructure
+from ggen.ggen import _atoms_to_torchsim_state_with_charge_spin
 
 # Suppress warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="pymatgen")
@@ -240,11 +241,22 @@ def relax_batch_torchsim(
     # Reuse the shared ORB calculator wrapper so batch relaxation benefits from
     # the same atoms adapter and accelerated edge construction settings.
     ts_model = build_orb_torchsim_model(calculator)
+    ts_device = getattr(
+        ts_model,
+        "device",
+        torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    )
+    ts_dtype = getattr(ts_model, "dtype", torch.get_default_dtype())
+    ts_state = _atoms_to_torchsim_state_with_charge_spin(
+        atoms_list,
+        ts_device,
+        ts_dtype,
+    )
 
     # Run batched optimization with force convergence
     try:
         final_state = ts.optimize(
-            system=atoms_list,
+            system=ts_state,
             model=ts_model,
             optimizer=ts.Optimizer.lbfgs,
             max_steps=max_steps,

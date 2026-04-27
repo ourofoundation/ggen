@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import gc
 import io
+import inspect
 import json
 import logging
 import math
@@ -75,6 +76,34 @@ def _get_pyxtal_groups_by_number() -> Dict[int, Group]:
             sg_number: Group(sg_number, dim=3) for sg_number in range(1, 231)
         }
     return _PYXTAL_GROUPS_BY_NUMBER
+
+
+def _atoms_to_torchsim_state_with_charge_spin(atoms_list, device, dtype):
+    """Convert ASE atoms to a torch-sim state compatible across API versions.
+
+    Recent torch-sim versions moved optional system fields such as charge and
+    spin into ``system_extras``. ORB's current TorchSim adapter still reads them
+    via attribute access (``state.charge`` / ``state.spin``), which works only if
+    those extras are present. Populate neutral charge and singlet spin defaults
+    before conversion so batched ORB relaxation works with both older and newer
+    torch-sim releases.
+    """
+    for atoms in atoms_list:
+        atoms.info.setdefault("charge", 0.0)
+        atoms.info.setdefault("spin", 1.0)
+
+    atoms_to_state_signature = inspect.signature(ts.io.atoms_to_state)
+    if "system_extras_map" in atoms_to_state_signature.parameters:
+        return ts.io.atoms_to_state(
+            atoms_list,
+            device,
+            dtype,
+            system_extras_map={"charge": "charge", "spin": "spin"},
+        )
+
+    # torch-sim <=0.5 used charge/spin as canonical SimState fields and did not
+    # support extras maps.
+    return ts.io.atoms_to_state(atoms_list, device, dtype)
 
 
 @lru_cache(maxsize=8192)
@@ -1265,6 +1294,7 @@ class GGen:
         atoms_list = None
         raw_model = None
         ts_model = None
+        ts_state = None
         final_state = None
         final_atoms_list = None
         energies = None
@@ -1280,18 +1310,30 @@ class GGen:
         if mem_trace:
             logger.info("[mem] after ORB TorchSim init: RSS=%.0f MiB", rss_mb())
 
+        ts_device = getattr(
+            ts_model,
+            "device",
+            torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        )
+        ts_dtype = getattr(ts_model, "dtype", torch.get_default_dtype())
+        ts_state = _atoms_to_torchsim_state_with_charge_spin(
+            atoms_list,
+            ts_device,
+            ts_dtype,
+        )
+
         # Run batched optimization
         logger.debug(
             "Starting batched relaxation of %d candidates using torch-sim (device=%s)",
             len(atoms_list),
-            "cuda" if torch.cuda.is_available() else "cpu",
+            ts_state.device,
         )
 
         # Use configured optimizer with cell filter and force convergence
         try:
             optimizer = self._resolve_torchsim_optimizer(optimization_optimizer)
             final_state = ts.optimize(
-                system=atoms_list,
+                system=ts_state,
                 model=ts_model,
                 optimizer=optimizer,
                 max_steps=max_steps,
@@ -1359,6 +1401,7 @@ class GGen:
             energies = None
             final_atoms_list = None
             final_state = None
+            ts_state = None
             ts_model = None
             raw_model = None
             atoms_list = None
