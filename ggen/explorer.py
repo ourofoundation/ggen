@@ -27,7 +27,7 @@ from pymatgen.core import Composition, Element, Structure
 from pymatgen.entries.computed_entries import ComputedEntry
 from pymatgen.io.cif import CifWriter
 
-from .calculator import RSS_LIMIT_MB, get_orb_calculator, reset_dynamo_cache, rss_mb
+from .calculator import RSS_LIMIT_MB, get_orb_calculator, rss_mb
 from .colors import Colors
 from .ggen import GGen
 
@@ -112,7 +112,6 @@ def _generate_structure_worker(args: Dict[str, Any]) -> Dict[str, Any]:
         # Clean up to free memory in this worker process
         ggen.cleanup()
         del result
-        reset_dynamo_cache()
 
         return {
             "formula": formula,
@@ -271,6 +270,7 @@ class ChemistryExplorer:
         self._run_dir: Optional[Path] = None
         self._db_path: Optional[Path] = None
         self._db_conn: Optional[sqlite3.Connection] = None
+        self._ggen: Optional[GGen] = None
 
     @property
     def calculator(self):
@@ -284,6 +284,17 @@ class ChemistryExplorer:
             self._calculator = get_orb_calculator()
             self._calculator_initialized = True
         return self._calculator
+
+    @property
+    def ggen(self) -> GGen:
+        """Lazily initialize and return a reusable GGen instance."""
+        if self._ggen is None:
+            self._ggen = GGen(
+                calculator=self.calculator,
+                random_seed=self.random_seed,
+                enable_trajectory=False,
+            )
+        return self._ggen
 
     # -------------------- Chemical System Parsing --------------------
 
@@ -943,14 +954,8 @@ class ChemistryExplorer:
 
         logger.debug(f"Generating structure for {formula}")
 
+        ggen = self.ggen
         try:
-            # Create a fresh GGen instance for each generation
-            ggen = GGen(
-                calculator=self.calculator,
-                random_seed=self.random_seed,
-                enable_trajectory=False,
-            )
-
             # Generate crystal
             result = ggen.generate_crystal(
                 formula=formula,
@@ -1027,9 +1032,6 @@ class ChemistryExplorer:
             result["all_relaxed_trials"] = None
             del additional_trials
 
-            # Clean up the GGen instance to free memory
-            ggen.cleanup()
-
             return CandidateResult(
                 formula=formula,
                 stoichiometry=stoichiometry,
@@ -1061,6 +1063,8 @@ class ChemistryExplorer:
                 is_valid=False,
                 error_message=str(e),
             )
+        finally:
+            ggen.cleanup()
 
     def _save_structure_cif(
         self, candidate: CandidateResult, structures_dir: Path
@@ -1150,13 +1154,8 @@ class ChemistryExplorer:
                 stoich = {element: num_atoms}
                 formula = f"{element}{num_atoms if num_atoms > 1 else ''}"
 
+                ggen = self.ggen
                 try:
-                    ggen = GGen(
-                        calculator=self.calculator,
-                        random_seed=self.random_seed,
-                        enable_trajectory=False,
-                    )
-
                     # Don't constrain crystal systems for terminal elements -
                     # they need to find their natural structure (e.g., cubic for metals)
                     result = ggen.generate_crystal(
@@ -1207,6 +1206,8 @@ class ChemistryExplorer:
                         f"Failed to generate {element} with {num_atoms} atoms: {e}"
                     )
                     continue
+                finally:
+                    ggen.cleanup()
 
             if best_candidate is not None:
                 terminal_candidates.append(best_candidate)
@@ -2004,8 +2005,8 @@ class ChemistryExplorer:
                     self._save_candidate(conn, candidate)
                     candidates.append(candidate)
 
-                    # Free torch caches + reclaim glibc pages
-                    reset_dynamo_cache()
+                    # Keep compile caches warm across stoichiometries; clearing them
+                    # here would force recompilation on the next formula.
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 

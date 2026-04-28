@@ -4,14 +4,19 @@ import logging
 import os
 import resource
 import sys
+import warnings
 from pathlib import Path
 
 import torch
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"Setting global torch default dtype to torch\.float32\.",
+    category=UserWarning,
+    module=r"orb_models(\..*)?",
+)
 from orb_models.forcefield import pretrained
-try:
-    from orb_models.forcefield.inference.calculator import ORBCalculator
-except ImportError:
-    from orb_models.forcefield.calculator import ORBCalculator
+from orb_models.forcefield.inference.calculator import ORBCalculator
 
 # Default models path - can be overridden via environment variable
 MODELS_PATH = Path(os.environ.get("ORB_MODELS_PATH", Path.home() / ".orb_models"))
@@ -26,10 +31,20 @@ TORCH_COMPILE = os.environ.get("GGEN_TORCH_COMPILE", "1") != "0"
 ORB_MODEL = os.environ.get("GGEN_ORB_MODEL", "orb_v3_conservative_inf_mpa")
 ORB_PRECISION = os.environ.get("GGEN_ORB_PRECISION", "float32-high")
 ORB_EDGE_METHOD = os.environ.get("GGEN_ORB_EDGE_METHOD", "knn_alchemi")
+TORCHSIM_LOG_LEVEL = os.environ.get("GGEN_TORCHSIM_LOG_LEVEL", "WARNING").upper()
 
 # Soft RSS ceiling (MiB).  When exceeded, attempt glibc malloc_trim to
 # return freed pages to the OS.  Override with GGEN_RSS_LIMIT_MB.
 RSS_LIMIT_MB = int(os.environ.get("GGEN_RSS_LIMIT_MB", 20_000))
+
+
+def _configure_third_party_loggers() -> None:
+    """Reduce noisy third-party logging while preserving warnings/errors."""
+    level = getattr(logging, TORCHSIM_LOG_LEVEL, logging.WARNING)
+    logging.getLogger("torch_sim").setLevel(level)
+
+
+_configure_third_party_loggers()
 
 
 def rss_mb() -> float:

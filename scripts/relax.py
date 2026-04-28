@@ -255,12 +255,13 @@ def relax_batch_torchsim(
 
     # Run batched optimization with force convergence
     try:
+        use_autobatcher = torch.cuda.is_available()
         final_state = ts.optimize(
             system=ts_state,
             model=ts_model,
             optimizer=ts.Optimizer.lbfgs,
             max_steps=max_steps,
-            autobatcher=False,
+            autobatcher=use_autobatcher,
             init_kwargs={"cell_filter": ts.CellFilter.frechet},
             convergence_fn=ts.generate_force_convergence_fn(force_tol=fmax),
             pbar=True,

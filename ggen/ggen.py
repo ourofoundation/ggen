@@ -34,12 +34,7 @@ from pyxtal import pyxtal
 from pyxtal.symmetry import Group
 from scipy.spatial.distance import cosine
 
-from .calculator import (
-    build_orb_torchsim_model,
-    get_orb_calculator,
-    reset_dynamo_cache,
-    rss_mb,
-)
+from .calculator import build_orb_torchsim_model, get_orb_calculator, rss_mb
 from .colors import Colors
 from .operations import Operations
 from .utils import compute_fmax, parse_chemical_formula
@@ -381,6 +376,7 @@ class GGen:
         self.crystal_ops = Operations(random_seed=random_seed)
         self._current_structure: Optional[Structure] = None
         self._current_pyxtal: Optional[pyxtal] = None
+        self._torchsim_model = None
 
         # Trajectory tracking using pymatgen structures
         self.enable_trajectory = enable_trajectory
@@ -405,9 +401,17 @@ class GGen:
         self._trajectory_metadata.clear()
         self._trajectory_info["total_frames"] = 0
         gc.collect()
+        # Keep the TorchSim wrapper alive so batched relaxations can reuse the
+        # same ORB/TorchSim bridge across stoichiometries instead of rebuilding it.
         # Clear torch GPU cache if available
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def _get_torchsim_model(self):
+        """Return a cached TorchSim wrapper for the current calculator."""
+        if self._torchsim_model is None:
+            self._torchsim_model = build_orb_torchsim_model(self.calculator)
+        return self._torchsim_model
 
     # -------------------- Space-group utilities --------------------
 
@@ -1292,7 +1296,6 @@ class GGen:
 
         # Keep large intermediates in locals so we can force-drop references in finally.
         atoms_list = None
-        raw_model = None
         ts_model = None
         ts_state = None
         final_state = None
@@ -1306,7 +1309,9 @@ class GGen:
 
         # Reuse the calculator's ORB runtime config so batched relaxation follows
         # the same adapter and edge-construction path as direct ASE evaluation.
-        ts_model = build_orb_torchsim_model(self.calculator)
+        # Keep the wrapper cached on the GGen instance; rebuilding it for every
+        # stoichiometry can add overhead and retain extra Torch/TorchSim state.
+        ts_model = self._get_torchsim_model()
         if mem_trace:
             logger.info("[mem] after ORB TorchSim init: RSS=%.0f MiB", rss_mb())
 
@@ -1332,12 +1337,13 @@ class GGen:
         # Use configured optimizer with cell filter and force convergence
         try:
             optimizer = self._resolve_torchsim_optimizer(optimization_optimizer)
+            use_autobatcher = torch.cuda.is_available()
             final_state = ts.optimize(
                 system=ts_state,
                 model=ts_model,
                 optimizer=optimizer,
                 max_steps=max_steps,
-                autobatcher=False,  # Skip slow memory estimation
+                autobatcher=use_autobatcher,
                 init_kwargs={"cell_filter": ts.CellFilter.frechet},
                 convergence_fn=ts.generate_force_convergence_fn(force_tol=fmax),
                 pbar={"leave": False} if show_progress else False,
@@ -1397,16 +1403,18 @@ class GGen:
             )
         finally:
             # Explicitly break references to large torch-sim/PyTorch objects.
-            # This helps avoid retaining graphs/tensors between stoichiometries.
+            # Keep compile caches warm across stoichiometries; long exploration runs
+            # have seen OOM kills, but resetting Dynamo/Inductor here also forces
+            # recompilation on the next batch and likely leaves performance on the table.
+            # If OOMs persist, prefer targeted recovery on error or periodic worker
+            # recycling over clearing compile state after every successful batch.
             energies = None
             final_atoms_list = None
             final_state = None
             ts_state = None
             ts_model = None
-            raw_model = None
             atoms_list = None
             gc.collect()
-            reset_dynamo_cache()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 try:
