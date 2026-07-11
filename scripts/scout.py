@@ -131,6 +131,12 @@ def main():
         help="Generation attempts per stoichiometry (default: 5)",
     )
     parser.add_argument(
+        "--max-stoichiometries",
+        type=int,
+        default=50,
+        help="Maximum stoichiometries to explore per candidate system (default: 50)",
+    )
+    parser.add_argument(
         "--max-atoms",
         type=int,
         default=12,
@@ -272,6 +278,7 @@ def main():
     if args.group:
         print(f"  Group: {args.group}")
     print(f"  Candidates ({len(candidates)}): {', '.join(candidates)}")
+    print(f"  Max stoichiometries per system: {args.max_stoichiometries}")
     if args.crystal_systems:
         print(f"  Target crystal systems: {', '.join(args.crystal_systems)}")
 
@@ -302,6 +309,7 @@ def main():
             template=args.template,
             candidates=candidates,
             num_trials=args.shallow_trials,
+            max_stoichiometries=args.max_stoichiometries,
             max_atoms=args.max_atoms,
             min_atoms=args.min_atoms,
             crystal_systems=args.crystal_systems,

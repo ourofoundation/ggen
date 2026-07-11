@@ -1606,3 +1606,142 @@ class StructureDatabase:
         )
 
         return results
+
+    # -------------------- Shard merge / extract --------------------
+
+    def _shared_structure_columns(self, other_conn_alias: str) -> List[str]:
+        """Columns of ``structures`` present in both this DB and an attached DB.
+
+        Both databases are created by this module's schema, but the set of
+        migration columns can differ between checkouts, so we intersect to make
+        the copy robust.
+        """
+        local = [r["name"] for r in self.conn.execute("PRAGMA table_info(structures)")]
+        attached = {
+            r["name"]
+            for r in self.conn.execute(f"PRAGMA {other_conn_alias}.table_info(structures)")
+        }
+        return [c for c in local if c in attached]
+
+    def merge_from(
+        self, other_db_path: Union[str, Path], recompute_hulls: bool = True
+    ) -> Tuple[int, int]:
+        """Merge structures from another ggen database file into this one.
+
+        New structures are copied (deduplicated by ``id`` and ``structure_hash``)
+        along with their subsystem links. Hulls for every affected chemical
+        system are recomputed so downstream hull/phonon queries stay correct.
+
+        Returns ``(imported, skipped)``.
+        """
+        other = str(other_db_path)
+        conn = self.conn
+        before = conn.execute("SELECT COUNT(*) FROM structures").fetchone()[0]
+
+        conn.execute("ATTACH DATABASE ? AS shard", (other,))
+        try:
+            affected = [
+                row[0]
+                for row in conn.execute("SELECT DISTINCT chemsys FROM shard.structures")
+            ]
+            shard_total = conn.execute(
+                "SELECT COUNT(*) FROM shard.structures"
+            ).fetchone()[0]
+
+            cols = self._shared_structure_columns("shard")
+            collist = ", ".join(cols)
+            conn.execute(
+                f"""
+                INSERT INTO structures ({collist})
+                SELECT {collist} FROM shard.structures sh
+                WHERE sh.id NOT IN (SELECT id FROM structures)
+                  AND (
+                    sh.structure_hash IS NULL
+                    OR sh.structure_hash NOT IN (
+                        SELECT structure_hash FROM structures
+                        WHERE structure_hash IS NOT NULL
+                    )
+                  )
+                """
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO structure_subsystems (structure_id, subsystem)
+                SELECT structure_id, subsystem FROM shard.structure_subsystems
+                WHERE structure_id IN (SELECT id FROM structures)
+                """
+            )
+            self._commit()
+        finally:
+            conn.execute("DETACH DATABASE shard")
+
+        after = conn.execute("SELECT COUNT(*) FROM structures").fetchone()[0]
+        imported = after - before
+        skipped = shard_total - imported
+
+        if recompute_hulls:
+            for chemsys in affected:
+                try:
+                    self.compute_hull(chemsys)
+                except Exception as exc:
+                    logger.warning(f"Failed to compute hull for {chemsys}: {exc}")
+
+        logger.info(
+            f"Merged {imported} new structures from {Path(other).name} "
+            f"({skipped} duplicates skipped)"
+        )
+        return imported, skipped
+
+    def extract_subset(
+        self, out_path: Union[str, Path], structure_ids: List[str]
+    ) -> int:
+        """Write the given structures (and their subsystem links) to a fresh DB.
+
+        Used by parallel workers to emit a small shard containing only the
+        structures generated in a single exploration, leaving seeded subsystem
+        structures behind.
+        """
+        out_path = Path(out_path)
+        if out_path.exists():
+            out_path.unlink()
+
+        # Create the destination schema, then close so we can ATTACH the file.
+        StructureDatabase(out_path).close()
+
+        if not structure_ids:
+            return 0
+
+        conn = self.conn
+        conn.execute("ATTACH DATABASE ? AS sub", (str(out_path),))
+        try:
+            cols = self._shared_structure_columns("sub")
+            collist = ", ".join(cols)
+            id_set = list(structure_ids)
+            # SQLite caps host parameters (~999), so stage ids in a temp table.
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS _extract_ids (id TEXT PRIMARY KEY)")
+            conn.execute("DELETE FROM _extract_ids")
+            conn.executemany(
+                "INSERT OR IGNORE INTO _extract_ids (id) VALUES (?)",
+                ((sid,) for sid in id_set),
+            )
+            conn.execute(
+                f"""
+                INSERT INTO sub.structures ({collist})
+                SELECT {collist} FROM structures
+                WHERE id IN (SELECT id FROM _extract_ids)
+                """
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO sub.structure_subsystems (structure_id, subsystem)
+                SELECT structure_id, subsystem FROM structure_subsystems
+                WHERE structure_id IN (SELECT id FROM _extract_ids)
+                """
+            )
+            count = conn.execute("SELECT COUNT(*) FROM sub.structures").fetchone()[0]
+            self._commit()
+        finally:
+            conn.execute("DROP TABLE IF EXISTS _extract_ids")
+            conn.execute("DETACH DATABASE sub")
+
+        return count

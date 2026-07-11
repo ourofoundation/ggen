@@ -73,6 +73,32 @@ def _get_pyxtal_groups_by_number() -> Dict[int, Group]:
     return _PYXTAL_GROUPS_BY_NUMBER
 
 
+def _scale_counts_to_compatible(
+    group: Group, counts: List[int], max_total: int = 200
+) -> Optional[List[int]]:
+    """Return the smallest formula-unit multiple of ``counts`` that the space group
+    can host, or ``None`` if none fits within ``max_total`` atoms.
+
+    A chemical formula is a composition *ratio*, not a cell content. High-symmetry
+    groups can only be filled by an integer number of formula units Z: Fm-3m (#225)
+    has a minimum Wyckoff multiplicity of 4, so the 2:1:1 L2₁ Heusler is realizable
+    only at Z=4, occupying 8c/4a/4b (= 8:4:4). Checking the reduced ratio alone
+    wrongly rejects such compositions.
+    """
+    base_total = sum(counts)
+    if base_total <= 0:
+        return None
+    for z in range(1, max_total // base_total + 1):
+        scaled = [c * z for c in counts]
+        try:
+            ok, _ = group.check_compatible(scaled)
+        except Exception:
+            ok = False
+        if ok:
+            return scaled
+    return None
+
+
 def _atoms_to_torchsim_state_with_charge_spin(atoms_list, device, dtype):
     """Convert ASE atoms to a torch-sim state compatible across API versions.
 
@@ -1757,9 +1783,11 @@ class GGen:
         num_trials = int(min(num_trials, 100))
 
         elements, counts = parse_chemical_formula(formula)
-        logger.debug(
-            "Starting crystal generation for %s (elements=%s, counts=%s)",
+        logger.info(
+            "Generating %s with %d trial%s (elements=%s, counts=%s)",
             formula,
+            num_trials,
+            "" if num_trials == 1 else "s",
             elements,
             counts,
         )
@@ -1770,7 +1798,7 @@ class GGen:
             raise ValueError(
                 f"No compatible space groups found for composition {formula}"
             )
-        logger.debug("Found %d compatible space groups", len(compatible))
+        logger.info("Found %d compatible space groups for %s", len(compatible), formula)
 
         # Filter by crystal system if specified
         if crystal_systems is not None:
@@ -1814,23 +1842,34 @@ class GGen:
         was_randomly_selected = False
 
         if space_group is not None:
-            # User specified a space group - validate it
-            try:
-                sg_num = int(space_group)
-                g = _get_pyxtal_groups_by_number()[sg_num]
-                ok, _msg = g.check_compatible(counts)
-                if not ok:
-                    raise ValueError(
-                        f"Composition {counts} not compatible with space group {space_group}. "
-                        f"Compatible space groups: {[x['number'] for x in compatible]}"
-                    )
-                target_space_groups = [space_group]
-                logger.info("Using user-specified space group: %d", space_group)
-            except Exception as e:
+            # User specified a space group - validate it. The formula is a
+            # composition ratio, so scale it to the smallest whole number of
+            # formula units the group can host (e.g. 2:1:1 -> 8:4:4 for Fm-3m).
+            sg_num = int(space_group)
+            groups_by_number = _get_pyxtal_groups_by_number()
+            if sg_num not in groups_by_number:
                 raise ValueError(
-                    f"Space group validation failed: {e}. "
+                    f"Invalid space group number: {space_group} (must be 1-230)"
+                )
+            scaled = _scale_counts_to_compatible(groups_by_number[sg_num], counts)
+            if scaled is None:
+                raise ValueError(
+                    f"Composition {counts} not compatible with space group {sg_num} "
+                    f"at any formula-unit multiple. "
                     f"Compatible space groups: {[x['number'] for x in compatible]}"
                 )
+            if scaled != counts:
+                z = sum(scaled) // sum(counts)
+                logger.info(
+                    "Scaled composition %s -> %s (Z=%d) to fit space group %d Wyckoff positions",
+                    counts,
+                    scaled,
+                    z,
+                    sg_num,
+                )
+                counts = scaled
+            target_space_groups = [sg_num]
+            logger.info("Using user-specified space group: %d", sg_num)
         elif multi_spacegroup:
             # Try multiple space groups with configurable symmetry preference
             target_space_groups = self._select_top_space_groups(
@@ -2065,7 +2104,13 @@ class GGen:
         candidate_sgs = [c[3] for c in all_candidates]
 
         if optimize_geometry:
-            # Batch relax ALL candidates and pick the best by final energy
+            logger.info(
+                "Relaxing %d candidate%s with torch-sim (%s, max_steps=%d)",
+                len(candidate_crystals),
+                "" if len(candidate_crystals) == 1 else "s",
+                optimization_optimizer,
+                optimization_max_steps,
+            )
             relaxed_results = self._relax_candidates(
                 candidate_crystals,
                 max_steps=optimization_max_steps,
@@ -2112,14 +2157,11 @@ class GGen:
                 range(len(initial_energies)), key=lambda i: initial_energies[i]
             )
 
-            logger.debug(
-                "Selected best by FINAL energy: SG %d, energy=%.4f eV (was rank %d by initial energy)",
+            logger.info(
+                "Best relaxed candidate: SG %d, energy=%.4f eV (%.4f eV/atom)",
                 best_sg,
                 final_energy,
-                sorted(
-                    range(len(initial_energies)), key=lambda i: initial_energies[i]
-                ).index(best_idx)
-                + 1,
+                final_energy / len(structure) if len(structure) else final_energy,
             )
 
             if initial_best_idx != best_idx:

@@ -123,6 +123,7 @@ class SystemScout:
         num_workers: int = 1,
         optimization_max_steps: int = 400,
         optimization_optimizer: str = "fire",
+        max_stoichiometries: Optional[int] = 50,
     ) -> ScoutResult:
         """Scan candidate elements by running shallow explorations and ranking results.
 
@@ -140,6 +141,7 @@ class SystemScout:
             num_workers: Parallel workers passed to each explore() call.
             optimization_max_steps: Max relaxation steps.
             optimization_optimizer: Optimizer for relaxation ('fire' or 'lbfgs').
+            max_stoichiometries: Maximum stoichiometries to explore per candidate system.
 
         Returns:
             ScoutResult with scored and ranked systems.
@@ -154,6 +156,8 @@ class SystemScout:
         if crystal_systems:
             print(f"  Target crystal systems: {', '.join(crystal_systems)}")
         print(f"  Shallow trials: {num_trials}, max atoms: {max_atoms}")
+        if max_stoichiometries is not None:
+            print(f"  Max stoichiometries per system: {max_stoichiometries}")
         print(f"  E_hull cutoff: {e_above_hull_cutoff * 1000:.0f} meV/atom")
         print()
 
@@ -167,6 +171,7 @@ class SystemScout:
                 chemsys=chemsys,
                 variable_element=element,
                 num_trials=num_trials,
+                max_stoichiometries=max_stoichiometries,
                 max_atoms=max_atoms,
                 min_atoms=min_atoms,
                 crystal_systems=crystal_systems,
@@ -213,6 +218,7 @@ class SystemScout:
         chemsys: str,
         variable_element: str,
         num_trials: int,
+        max_stoichiometries: Optional[int],
         max_atoms: int,
         min_atoms: int,
         crystal_systems: Optional[List[str]],
@@ -243,6 +249,7 @@ class SystemScout:
                 max_atoms=max_atoms,
                 min_atoms=min_atoms,
                 num_trials=num_trials,
+                max_stoichiometries=max_stoichiometries,
                 optimize=True,
                 require_all_elements=True,
                 skip_existing_formulas=False,

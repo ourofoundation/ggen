@@ -1944,6 +1944,13 @@ class ChemistryExplorer:
                             f"{C.BOLD}{formula}{C.RESET}",
                             flush=True,
                         )
+                    else:
+                        logger.info(
+                            "[%d/%d] generating %s",
+                            i + 1,
+                            len(stoichs_to_generate),
+                            formula,
+                        )
 
                     candidate = self._generate_structure_for_stoichiometry(
                         stoichiometry=stoich,
