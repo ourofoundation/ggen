@@ -1748,12 +1748,6 @@ class GGen:
             Dictionary with structure metadata, CIF content, and generation statistics.
             When max_iterations > 1, also includes iteration_history and convergence info.
         """
-        mem_trace = os.environ.get("GGEN_MEM_TRACE", "0") == "1"
-        mem_trace_trial = os.environ.get("GGEN_MEM_TRACE_TRIAL", "0") == "1"
-        rss_gen_start = rss_mb() if mem_trace else None
-        if mem_trace:
-            logger.info("[mem] generate start %s: RSS=%.0f MiB", formula, rss_gen_start)
-
         # Handle iterative refinement mode
         if max_iterations > 1:
             return self._generate_crystal_iterative(
@@ -1775,6 +1769,83 @@ class GGen:
                 show_progress=show_progress,
                 serialize_output=serialize_output,
             )
+        if num_trials < 1:
+            raise ValueError("num_trials must be >= 1")
+
+        batch = self.generate_candidates(
+            formula=formula,
+            space_group=space_group,
+            num_trials=num_trials,
+            multi_spacegroup=multi_spacegroup,
+            top_k_spacegroups=top_k_spacegroups,
+            symmetry_bias=symmetry_bias,
+            crystal_systems=crystal_systems,
+            min_distance_filter=min_distance_filter,
+            volume_bounds=volume_bounds,
+            show_progress=show_progress,
+        )
+        return self.relax_and_select(
+            batch,
+            optimize_geometry=optimize_geometry,
+            symmetry_weight=symmetry_weight,
+            refine_symmetry=refine_symmetry,
+            preserve_symmetry=preserve_symmetry,
+            optimization_max_steps=optimization_max_steps,
+            optimization_fmax=optimization_fmax,
+            optimization_optimizer=optimization_optimizer,
+            trajectory_interval=trajectory_interval,
+            show_progress=show_progress,
+            serialize_output=serialize_output,
+        )
+
+    def generate_candidates(
+        self,
+        formula: str,
+        space_group: Optional[int] = None,
+        num_trials: int = 10,
+        multi_spacegroup: bool = True,
+        top_k_spacegroups: int = 5,
+        symmetry_bias: float = 0.0,
+        crystal_systems: Optional[List[str]] = None,
+        min_distance_filter: float = 1.0,
+        volume_bounds: Tuple[float, float] = (2.0, 100.0),
+        show_progress: bool = False,
+    ) -> Dict[str, Any]:
+        """Generate candidate crystals for a formula (CPU-only phase).
+
+        Runs PyXtal sampling across the target space groups plus the
+        structural pre-filter, with no energy evaluation. The result is a
+        batch dict for :meth:`relax_and_select`. Because this never touches
+        the calculator or the GPU, callers can run it on a background thread
+        to overlap the next batch's generation with the current batch's
+        relaxation.
+
+        Args:
+            formula: Chemical formula (e.g., "NaCl", "TiO2").
+            space_group: Specific space group number to use. If None, auto-selects.
+            num_trials: Number of random structures to generate per space group.
+            multi_spacegroup: If True and space_group is None, tries multiple space groups.
+            top_k_spacegroups: Number of top space groups to try when multi_spacegroup=True.
+            symmetry_bias: Controls preference for higher-symmetry crystal systems.
+            crystal_systems: Optional list of crystal systems to restrict generation to.
+            min_distance_filter: Minimum interatomic distance for pre-filtering (Å).
+            volume_bounds: (min, max) volume per atom bounds for pre-filtering (Å³).
+            show_progress: If True, show a tqdm progress bar during generation.
+
+        Returns:
+            Batch dict with the candidate pyxtal objects, selected space
+            groups, and generation statistics.
+
+        Raises:
+            ValueError: If no compatible space groups exist for the formula,
+                or no candidate survives the pre-filter.
+        """
+        mem_trace = os.environ.get("GGEN_MEM_TRACE", "0") == "1"
+        mem_trace_trial = os.environ.get("GGEN_MEM_TRACE_TRIAL", "0") == "1"
+        rss_gen_start = rss_mb() if mem_trace else None
+        if mem_trace:
+            logger.info("[mem] generate start %s: RSS=%.0f MiB", formula, rss_gen_start)
+
         if num_trials < 1:
             raise ValueError("num_trials must be >= 1")
         num_trials = int(min(num_trials, 100))
@@ -1893,7 +1964,7 @@ class GGen:
             )
 
         # Generate crystals across all target space groups
-        all_candidates: List[Tuple[pyxtal, float, Dict[str, float], int]] = []
+        candidate_list: List[Tuple[pyxtal, int]] = []
         generation_stats = {
             "total_attempts": 0,
             "valid_pyxtal": 0,
@@ -2005,56 +2076,9 @@ class GGen:
             generation_stats["passed_prefilter"] += 1
             sg_stats["passed_filter"] += 1
 
-            # Energy evaluation
-            try:
-                if mem_trace_trial:
-                    logger.info(
-                        "[mem] trial energy start %s sg=%d t=%d RSS=%.0f MiB",
-                        formula,
-                        sg_number,
-                        trial_idx + 1,
-                        rss_mb(),
-                    )
-                atoms = c.to_ase()
-                atoms.calc = self.calculator
-                energy = float(atoms.get_potential_energy())
-                generation_stats["energy_evaluated"] += 1
-                if mem_trace_trial:
-                    logger.info(
-                        "[mem] trial energy end %s sg=%d t=%d RSS=%.0f MiB",
-                        formula,
-                        sg_number,
-                        trial_idx + 1,
-                        rss_mb(),
-                    )
-
-                # Combined scoring
-                score, breakdown = self._score_crystal(
-                    c, energy, symmetry_weight=symmetry_weight
-                )
-
-                all_candidates.append((c, score, breakdown, sg_number))
-                logger.debug(
-                    "SG %d trial %d: energy=%.4f eV, score=%.4f (SG bonus=%.4f)",
-                    sg_number,
-                    trial_idx + 1,
-                    energy,
-                    score,
-                    breakdown["symmetry_bonus"],
-                )
-
-            except Exception as e:
-                logger.warning(
-                    "SG %d trial %d: Energy evaluation failed: %s",
-                    sg_number,
-                    trial_idx + 1,
-                    e,
-                )
-                continue
-            finally:
-                # Drop per-trial references aggressively; we only need `c` for
-                # accepted candidates held in `all_candidates`.
-                atoms = None
+            # Energy evaluation is deferred to relax_and_select, which scores
+            # all candidates in a single batched GPU forward pass.
+            candidate_list.append((c, sg_number))
 
         generation_stats["trial_generation_seconds"] = (
             time.perf_counter() - trial_generation_started
@@ -2064,8 +2088,146 @@ class GGen:
             logger.info(
                 "[mem] after trial generation %s: %d candidates RSS=%.0f MiB",
                 formula,
-                len(all_candidates),
+                len(candidate_list),
                 rss_mb(),
+            )
+
+        if not candidate_list:
+            raise ValueError(
+                "Failed to generate valid crystal structure. "
+                f"Stats: {generation_stats}. "
+                f"Compatible space groups: {[x['number'] for x in compatible]}"
+            )
+
+        return {
+            "formula": formula,
+            "requested_space_group": space_group,
+            "multi_spacegroup": multi_spacegroup,
+            "num_trials": num_trials,
+            "compatible": compatible,
+            "target_space_groups": target_space_groups,
+            "was_randomly_selected": was_randomly_selected,
+            "candidates": candidate_list,
+            "generation_stats": generation_stats,
+        }
+
+    def _evaluate_candidates_batched(
+        self, candidates: List[pyxtal]
+    ) -> List[Optional[float]]:
+        """Evaluate candidate energies in a single batched ORB forward pass.
+
+        Returns one energy per candidate, with None for candidates whose
+        evaluation produced a non-finite result. Falls back to per-candidate
+        ASE evaluation if the batched call itself fails.
+        """
+        atoms_list = [c.to_ase() for c in candidates]
+        try:
+            ts_model = self._get_torchsim_model()
+            ts_device = getattr(
+                ts_model,
+                "device",
+                torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+            )
+            ts_dtype = getattr(ts_model, "dtype", torch.get_default_dtype())
+            ts_state = _atoms_to_torchsim_state_with_charge_spin(
+                atoms_list, ts_device, ts_dtype
+            )
+            output = ts_model(ts_state)
+            energy_tensor = output.get("energy")
+            if energy_tensor is None:
+                # ORB's conservative head reports its energy as "free_energy"
+                energy_tensor = output["free_energy"]
+            energies = energy_tensor.detach().cpu().numpy()
+            return [float(e) if np.isfinite(e) else None for e in energies]
+        except Exception as e:
+            logger.warning(
+                "Batched energy evaluation failed (%s); "
+                "falling back to per-candidate evaluation",
+                e,
+            )
+            energies: List[Optional[float]] = []
+            for atoms in atoms_list:
+                try:
+                    atoms.calc = self.calculator
+                    energies.append(float(atoms.get_potential_energy()))
+                except Exception:
+                    energies.append(None)
+            return energies
+
+    def relax_and_select(
+        self,
+        batch: Dict[str, Any],
+        optimize_geometry: bool = False,
+        symmetry_weight: float = 0.01,
+        refine_symmetry: bool = True,
+        preserve_symmetry: bool = False,
+        optimization_max_steps: int = 400,
+        optimization_fmax: float = 0.01,
+        optimization_optimizer: str = "fire",
+        trajectory_interval: int = 5,
+        show_progress: bool = False,
+        serialize_output: bool = True,
+    ) -> Dict[str, Any]:
+        """Score, relax, and select the best structure of a generated batch.
+
+        GPU phase of :meth:`generate_crystal`: evaluates all candidates in
+        one batched forward pass, relaxes them with torch-sim, and keeps the
+        lowest-energy result, with optional post-relaxation symmetry
+        refinement.
+
+        Args:
+            batch: Batch dict returned by :meth:`generate_candidates`.
+            optimize_geometry: Whether to relax the candidates.
+            symmetry_weight: Weight for symmetry in combined scoring.
+            refine_symmetry: Whether to attempt symmetry refinement after relaxation.
+            preserve_symmetry: If True, use symmetry-constrained relaxation.
+            optimization_max_steps: Max steps for geometry optimization.
+            optimization_fmax: Force convergence criterion (eV/Å).
+            optimization_optimizer: Optimizer used for torch-sim batched relaxation.
+            trajectory_interval: Steps between trajectory frame snapshots.
+            show_progress: If True, show a tqdm progress bar during relaxation.
+            serialize_output: Include CIF text and base64 fields in the response.
+
+        Returns:
+            Dictionary with structure metadata, CIF content, and generation statistics.
+        """
+        mem_trace = os.environ.get("GGEN_MEM_TRACE", "0") == "1"
+        rss_gen_start = rss_mb() if mem_trace else None
+
+        formula = batch["formula"]
+        space_group = batch["requested_space_group"]
+        multi_spacegroup = batch["multi_spacegroup"]
+        num_trials = batch["num_trials"]
+        compatible = batch["compatible"]
+        target_space_groups = batch["target_space_groups"]
+        was_randomly_selected = batch["was_randomly_selected"]
+        generation_stats = batch["generation_stats"]
+        generated = batch["candidates"]
+
+        # Score all candidates with one batched forward pass instead of a
+        # per-trial GPU round-trip during generation.
+        eval_started = time.perf_counter()
+        energies = self._evaluate_candidates_batched([c for c, _ in generated])
+        generation_stats["energy_eval_seconds"] = time.perf_counter() - eval_started
+
+        all_candidates: List[Tuple[pyxtal, float, Dict[str, float], int]] = []
+        for (c, sg_number), energy in zip(generated, energies):
+            if energy is None:
+                logger.warning(
+                    "SG %d: energy evaluation failed, dropping candidate", sg_number
+                )
+                continue
+            generation_stats["energy_evaluated"] += 1
+            score, breakdown = self._score_crystal(
+                c, energy, symmetry_weight=symmetry_weight
+            )
+            all_candidates.append((c, score, breakdown, sg_number))
+            logger.debug(
+                "SG %d: energy=%.4f eV, score=%.4f (SG bonus=%.4f)",
+                sg_number,
+                energy,
+                score,
+                breakdown["symmetry_bonus"],
             )
 
         # Select best candidate
@@ -2078,6 +2240,7 @@ class GGen:
 
         # Summary log with colors (only if show_progress enabled for cleaner output)
         if show_progress:
+            C = Colors
             stats = generation_stats
             sg_summary = ", ".join(
                 f"SG{sg}:{d['passed_filter']}/{d['attempts']}"

@@ -12,7 +12,7 @@ import logging
 import signal
 import sqlite3
 import warnings
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import combinations_with_replacement
@@ -216,6 +216,24 @@ class CandidateResult:
     def clear_structure(self) -> None:
         """Clear structure from memory (can be reloaded from CIF)."""
         self.structure = None
+
+
+def _failed_candidate(
+    formula: str, stoichiometry: Dict[str, int], error: Exception
+) -> CandidateResult:
+    """Build the CandidateResult for a failed generation or relaxation."""
+    return CandidateResult(
+        formula=formula,
+        stoichiometry=stoichiometry,
+        energy_per_atom=float("nan"),
+        total_energy=float("nan"),
+        num_atoms=0,
+        space_group_number=0,
+        space_group_symbol="",
+        structure=None,  # type: ignore
+        is_valid=False,
+        error_message=str(error),
+    )
 
 
 @dataclass
@@ -940,38 +958,21 @@ class ChemistryExplorer:
 
     # -------------------- Structure Generation --------------------
 
-    def _generate_structure_for_stoichiometry(
+    def _generate_candidates_for_stoichiometry(
         self,
         stoichiometry: Dict[str, int],
         num_trials: int = 10,
-        optimize: bool = True,
         symmetry_bias: float = 0.0,
         crystal_systems: Optional[List[str]] = None,
         space_group: Optional[int] = None,
-        preserve_symmetry: bool = False,
-        show_progress: bool = False,
-        optimization_max_steps: int = 400,
-        optimization_optimizer: str = "fire",
-    ) -> CandidateResult:
-        """Generate and optimize a structure for a given stoichiometry.
+    ) -> Dict[str, Any]:
+        """Generate candidate structures for a stoichiometry (CPU-only).
 
-        Args:
-            stoichiometry: Element counts, e.g., {"Li": 1, "Co": 1, "O": 2}
-            num_trials: Number of generation attempts per stoichiometry.
-            optimize: Whether to optimize geometry.
-            symmetry_bias: Controls preference for higher-symmetry crystal systems.
-                0.0 = uniform distribution across orthorhombic and above.
-                1.0 = strong preference for cubic/hexagonal. Default: 0.0
-            crystal_systems: Optional list of crystal systems to restrict to.
-            space_group: Optional specific space group number to target.
-            preserve_symmetry: If True, use symmetry-constrained relaxation to preserve
-                high symmetry during optimization.
-            show_progress: If True, show tqdm progress bar during relaxation.
-
-        Returns:
-            CandidateResult with structure and energy information.
+        Runs PyXtal sampling and structural pre-filtering without touching
+        the calculator, so it can execute on a background thread while the
+        GPU relaxes the previous stoichiometry's batch. Returns the batch
+        dict consumed by :meth:`_relax_and_select_for_stoichiometry`.
         """
-        # Build formula string
         formula = "".join(
             f"{el}{count if count > 1 else ''}"
             for el, count in sorted(stoichiometry.items())
@@ -979,19 +980,48 @@ class ChemistryExplorer:
 
         logger.debug(f"Generating structure for {formula}")
 
+        return self.ggen.generate_candidates(
+            formula=formula,
+            space_group=space_group,
+            num_trials=num_trials,
+            multi_spacegroup=space_group
+            is None,  # Disable multi if specific SG given
+            top_k_spacegroups=5,
+            symmetry_bias=symmetry_bias,
+            crystal_systems=crystal_systems,
+        )
+
+    def _relax_and_select_for_stoichiometry(
+        self,
+        stoichiometry: Dict[str, int],
+        batch: Dict[str, Any],
+        optimize: bool = True,
+        preserve_symmetry: bool = False,
+        show_progress: bool = False,
+        optimization_max_steps: int = 400,
+        optimization_optimizer: str = "fire",
+    ) -> CandidateResult:
+        """Relax a generated candidate batch on the GPU and pick the best.
+
+        Args:
+            stoichiometry: Element counts, e.g., {"Li": 1, "Co": 1, "O": 2}
+            batch: Batch dict from :meth:`_generate_candidates_for_stoichiometry`.
+            optimize: Whether to optimize geometry.
+            preserve_symmetry: If True, use symmetry-constrained relaxation to preserve
+                high symmetry during optimization.
+            show_progress: If True, show tqdm progress bar during relaxation.
+
+        Returns:
+            CandidateResult with structure and energy information.
+        """
+        formula = batch["formula"]
+
         ggen = self.ggen
         try:
-            # Generate crystal
-            result = ggen.generate_crystal(
-                formula=formula,
-                space_group=space_group,
-                num_trials=num_trials,
+            # Score and relax the generated candidates
+            result = ggen.relax_and_select(
+                batch,
                 optimize_geometry=optimize,
-                multi_spacegroup=space_group
-                is None,  # Disable multi if specific SG given
-                top_k_spacegroups=5,
-                symmetry_bias=symmetry_bias,
-                crystal_systems=crystal_systems,
                 refine_symmetry=not preserve_symmetry,  # Don't need refinement if preserving
                 preserve_symmetry=preserve_symmetry,
                 show_progress=show_progress,
@@ -1077,18 +1107,7 @@ class ChemistryExplorer:
 
         except Exception as e:
             logger.warning(f"Failed to generate structure for {formula}: {e}")
-            return CandidateResult(
-                formula=formula,
-                stoichiometry=stoichiometry,
-                energy_per_atom=float("nan"),
-                total_energy=float("nan"),
-                num_atoms=0,
-                space_group_number=0,
-                space_group_symbol="",
-                structure=None,  # type: ignore
-                is_valid=False,
-                error_message=str(e),
-            )
+            return _failed_candidate(formula, stoichiometry, e)
         finally:
             ggen.cleanup()
 
@@ -1895,6 +1914,11 @@ class ChemistryExplorer:
         num_failed = 0
         num_reused = 0
 
+        # CPU/GPU time split within the candidate_generation stage, collected
+        # only in sequential mode where generation is pipelined under relaxation
+        generation_cpu_seconds = 0.0
+        relaxation_gpu_seconds = 0.0
+
         # Separate stoichiometries into reused vs need-to-generate
         stoichs_to_generate = []
         for stoich in stoichiometries:
@@ -1965,92 +1989,132 @@ class ChemistryExplorer:
                     optimization_optimizer=optimization_optimizer,
                 )
             else:
-                # Sequential generation - show relaxation progress for each structure
-                for i, (stoich, formula) in enumerate(stoichs_to_generate):
-                    if interrupted:
-                        logger.info("Stopping generation due to interrupt")
-                        break
+                # Sequential relaxation, pipelined with generation: while the
+                # GPU relaxes one stoichiometry's batch, a background thread
+                # generates the next batch (pure PyXtal CPU work), so the GPU
+                # does not sit idle between batches.
+                self.ggen  # Create the shared instance before the thread uses it
+                gen_pool = ThreadPoolExecutor(max_workers=1)
 
-                    if show_progress:
-                        C = Colors
-                        print(
-                            f"{C.CYAN}[{i + 1}/{len(stoichs_to_generate)}]{C.RESET} "
-                            f"{C.BOLD}{formula}{C.RESET}",
-                            flush=True,
-                        )
-                    else:
-                        logger.info(
-                            "[%d/%d] generating %s",
-                            i + 1,
-                            len(stoichs_to_generate),
-                            formula,
-                        )
-
-                    candidate = self._generate_structure_for_stoichiometry(
+                def _submit_generation(index: int):
+                    stoich, _ = stoichs_to_generate[index]
+                    return gen_pool.submit(
+                        self._generate_candidates_for_stoichiometry,
                         stoichiometry=stoich,
                         num_trials=num_trials,
-                        optimize=optimize,
                         symmetry_bias=symmetry_bias,
                         crystal_systems=crystal_systems,
                         space_group=space_group,
-                        preserve_symmetry=preserve_symmetry,
-                        show_progress=show_progress,
-                        optimization_max_steps=optimization_max_steps,
-                        optimization_optimizer=optimization_optimizer,
                     )
 
-                    # If we have a previous structure and this one failed or is worse, use the previous
-                    if formula in previous_structures:
-                        prev_candidate = previous_structures[formula]
-                        if not candidate.is_valid or (
-                            prev_candidate.is_valid
-                            and prev_candidate.energy_per_atom
-                            < candidate.energy_per_atom
-                        ):
-                            logger.debug(
-                                f"Using better structure from previous run for {formula} "
-                                f"(prev={prev_candidate.energy_per_atom:.4f} vs "
-                                f"new={candidate.energy_per_atom:.4f} eV/atom)"
+                try:
+                    pending = _submit_generation(0)
+                    for i, (stoich, formula) in enumerate(stoichs_to_generate):
+                        if interrupted:
+                            logger.info("Stopping generation due to interrupt")
+                            break
+
+                        if show_progress:
+                            C = Colors
+                            print(
+                                f"{C.CYAN}[{i + 1}/{len(stoichs_to_generate)}]{C.RESET} "
+                                f"{C.BOLD}{formula}{C.RESET}",
+                                flush=True,
                             )
-                            candidate = prev_candidate
-                            candidate.generation_metadata["reused_from_previous"] = True
+                        else:
+                            logger.info(
+                                "[%d/%d] generating %s",
+                                i + 1,
+                                len(stoichs_to_generate),
+                                formula,
+                            )
 
-                    if candidate.is_valid:
-                        # Load structure if needed (lazy loading from database)
-                        structure = candidate.get_structure()
-                        if structure is not None:
-                            # Save CIF
-                            cif_path = self._save_structure_cif(candidate, structures_dir)
-                            candidate.cif_path = cif_path
-                            num_successful += 1
+                        batch = None
+                        try:
+                            batch = pending.result()
+                            generation_cpu_seconds += batch["generation_stats"].get(
+                                "trial_generation_seconds", 0.0
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to generate structure for {formula}: {e}"
+                            )
+                            candidate = _failed_candidate(formula, stoich, e)
+                        finally:
+                            if i + 1 < len(stoichs_to_generate) and not interrupted:
+                                pending = _submit_generation(i + 1)
 
-                            # Calculate phonon stability if enabled
-                            if compute_phonons:
-                                self._calculate_phonon_stability(
-                                    candidate,
-                                    supercell=phonon_supercell,
-                                    show_progress=show_progress,
+                        if batch is not None:
+                            candidate = self._relax_and_select_for_stoichiometry(
+                                stoichiometry=stoich,
+                                batch=batch,
+                                optimize=optimize,
+                                preserve_symmetry=preserve_symmetry,
+                                show_progress=show_progress,
+                                optimization_max_steps=optimization_max_steps,
+                                optimization_optimizer=optimization_optimizer,
+                            )
+                            relax_stats = candidate.generation_metadata.get(
+                                "generation_stats", {}
+                            )
+                            relaxation_gpu_seconds += relax_stats.get(
+                                "energy_eval_seconds", 0.0
+                            ) + relax_stats.get("relaxation_seconds", 0.0)
+
+                        # If we have a previous structure and this one failed or is worse, use the previous
+                        if formula in previous_structures:
+                            prev_candidate = previous_structures[formula]
+                            if not candidate.is_valid or (
+                                prev_candidate.is_valid
+                                and prev_candidate.energy_per_atom
+                                < candidate.energy_per_atom
+                            ):
+                                logger.debug(
+                                    f"Using better structure from previous run for {formula} "
+                                    f"(prev={prev_candidate.energy_per_atom:.4f} vs "
+                                    f"new={candidate.energy_per_atom:.4f} eV/atom)"
                                 )
+                                candidate = prev_candidate
+                                candidate.generation_metadata["reused_from_previous"] = True
 
-                            # Clear structure from memory if not needed
-                            if not keep_structures_in_memory:
-                                candidate.clear_structure()
-                            # Remove stored structure reference to free memory
-                            candidate.generation_metadata.pop("_stored_structure", None)
+                        if candidate.is_valid:
+                            # Load structure if needed (lazy loading from database)
+                            structure = candidate.get_structure()
+                            if structure is not None:
+                                # Save CIF
+                                cif_path = self._save_structure_cif(candidate, structures_dir)
+                                candidate.cif_path = cif_path
+                                num_successful += 1
+
+                                # Calculate phonon stability if enabled
+                                if compute_phonons:
+                                    self._calculate_phonon_stability(
+                                        candidate,
+                                        supercell=phonon_supercell,
+                                        show_progress=show_progress,
+                                    )
+
+                                # Clear structure from memory if not needed
+                                if not keep_structures_in_memory:
+                                    candidate.clear_structure()
+                                # Remove stored structure reference to free memory
+                                candidate.generation_metadata.pop("_stored_structure", None)
+                            else:
+                                num_failed += 1
                         else:
                             num_failed += 1
-                    else:
-                        num_failed += 1
 
-                    # Save to database
-                    self._save_candidate(conn, candidate)
-                    candidates.append(candidate)
+                        # Save to database
+                        self._save_candidate(conn, candidate)
+                        candidates.append(candidate)
 
-                    if (i + 1) % 5 == 0 or i == 0:
-                        logger.info(
-                            "RSS after %s (%d/%d): %.0f MiB",
-                            formula, i + 1, len(stoichs_to_generate), rss_mb(),
-                        )
+                        if (i + 1) % 5 == 0 or i == 0:
+                            logger.info(
+                                "RSS after %s (%d/%d): %.0f MiB",
+                                formula, i + 1, len(stoichs_to_generate), rss_mb(),
+                            )
+                finally:
+                    gen_pool.shutdown(wait=True)
 
         # Add remaining structures from previous runs that weren't in our enumeration
         if load_previous_runs:
@@ -2096,6 +2160,11 @@ class ChemistryExplorer:
         gc.collect()
 
         stage_timings["candidate_generation"] = time.perf_counter() - stage_started
+        if num_workers <= 1 and (generation_cpu_seconds or relaxation_gpu_seconds):
+            # CPU generation overlaps GPU relaxation in sequential mode, so
+            # these two can sum to less than the stage's wall time
+            stage_timings["candidate_generation_cpu"] = generation_cpu_seconds
+            stage_timings["candidate_relaxation_gpu"] = relaxation_gpu_seconds
         stage_started = time.perf_counter()
 
         # Generate terminal element structures for phase diagram (unless interrupted)
