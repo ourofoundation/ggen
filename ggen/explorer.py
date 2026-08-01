@@ -41,6 +41,23 @@ logger = logging.getLogger(__name__)
 
 # ===================== Module-level helpers for parallel execution =====================
 
+_WORKER_CALCULATOR = None
+
+
+def _get_worker_calculator():
+    """Return the worker process's shared ORB calculator, loading it once.
+
+    ProcessPoolExecutor recycles workers every ``max_tasks_per_child`` tasks, so
+    caching on the module avoids reloading ORB weights and re-warming
+    torch.compile for every stoichiometry.
+    """
+    global _WORKER_CALCULATOR
+    if _WORKER_CALCULATOR is None:
+        from .calculator import get_orb_calculator
+
+        _WORKER_CALCULATOR = get_orb_calculator()
+    return _WORKER_CALCULATOR
+
 
 def _generate_structure_worker(args: Dict[str, Any]) -> Dict[str, Any]:
     """Worker function for parallel structure generation.
@@ -49,7 +66,6 @@ def _generate_structure_worker(args: Dict[str, Any]) -> Dict[str, Any]:
     Returns a dictionary with results that can be converted to CandidateResult.
     """
     from .ggen import GGen
-    from .calculator import get_orb_calculator, reset_dynamo_cache
 
     stoichiometry = args["stoichiometry"]
     num_trials = args["num_trials"]
@@ -69,8 +85,7 @@ def _generate_structure_worker(args: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     try:
-        # Each worker needs its own calculator instance
-        calculator = get_orb_calculator()
+        calculator = _get_worker_calculator()
 
         ggen = GGen(
             calculator=calculator,
@@ -91,6 +106,7 @@ def _generate_structure_worker(args: Dict[str, Any]) -> Dict[str, Any]:
             preserve_symmetry=preserve_symmetry,
             optimization_max_steps=optimization_max_steps,
             optimization_optimizer=optimization_optimizer,
+            serialize_output=False,
         )
 
         structure = ggen.get_structure()
@@ -217,6 +233,15 @@ class ExplorationResult:
     run_directory: Optional[Path] = None
     database_path: Optional[Path] = None
     total_time_seconds: float = 0.0
+    stage_timings: Dict[str, float] = field(default_factory=dict)
+    run_id: Optional[str] = None
+    num_stoichiometries: int = 0
+    num_trials_per_stoichiometry: int = 0
+
+    @property
+    def num_trials(self) -> int:
+        """Candidate structures attempted across every stoichiometry."""
+        return self.num_stoichiometries * self.num_trials_per_stoichiometry
 
 
 # ===================== ChemistryExplorer =====================
@@ -972,6 +997,7 @@ class ChemistryExplorer:
                 show_progress=show_progress,
                 optimization_max_steps=optimization_max_steps,
                 optimization_optimizer=optimization_optimizer,
+                serialize_output=False,
             )
 
             structure = ggen.get_structure()
@@ -1171,6 +1197,7 @@ class ChemistryExplorer:
                         show_progress=show_progress,
                         optimization_max_steps=optimization_max_steps,
                         optimization_optimizer=optimization_optimizer,
+                        serialize_output=False,
                     )
 
                     structure = ggen.get_structure()
@@ -1509,11 +1536,9 @@ class ChemistryExplorer:
                     self._save_candidate(conn, candidate)
                     candidates.append(candidate)
 
-                    # Aggressive memory cleanup after each stoichiometry
-                    # to prevent memory accumulation during long runs
+                    # Drop task-local Python objects without flushing the CUDA
+                    # allocator or compile caches between stoichiometries.
                     gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
 
                 except Exception as e:
                     logger.warning(f"Worker failed for {formula}: {e}")
@@ -1556,7 +1581,7 @@ class ChemistryExplorer:
         crystal_systems: Optional[List[str]] = None,
         space_group: Optional[int] = None,
         load_previous_runs: Union[bool, int] = False,
-        skip_existing_formulas: bool = True,
+        skip_existing_formulas: bool = False,
         preserve_symmetry: bool = False,
         num_workers: int = 1,
         show_progress: bool = True,
@@ -1609,9 +1634,10 @@ class ChemistryExplorer:
                 - False (default): Don't load from previous runs
                 - True: Load from all previous runs found
                 - int: Load from the N most recent previous runs
-            skip_existing_formulas: If True (default) and load_previous_runs is enabled,
-                skip generating structures for formulas that were already successfully
-                generated in previous runs. If False, regenerate all and keep the best.
+            skip_existing_formulas: If True and load_previous_runs is enabled, skip
+                generating structures for formulas that were already successfully
+                generated in previous runs. Default False, so every run gets a fresh
+                chance at a better polymorph and the best structure is kept.
             preserve_symmetry: If True, use symmetry-constrained relaxation to preserve
                 high symmetry during optimization. This uses ASE's FixSymmetry constraint
                 to keep atoms on their Wyckoff positions. Recommended when you want to
@@ -1663,6 +1689,8 @@ class ChemistryExplorer:
         )
 
         start_time = time.time()
+        stage_started = time.perf_counter()
+        stage_timings: Dict[str, float] = {}
 
         # Setup interrupt handling for graceful shutdown
         interrupted = False
@@ -1777,6 +1805,9 @@ class ChemistryExplorer:
             )
             conn.commit()
 
+        stage_timings["setup_and_load"] = time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
+
         # Enumerate stoichiometries
         stoichiometries = self.enumerate_stoichiometries(
             elements=elements,
@@ -1854,6 +1885,9 @@ class ChemistryExplorer:
             stoichiometries = [stoichiometries[i] for i in indices]
 
         logger.info(f"Exploring {len(stoichiometries)} stoichiometries")
+
+        stage_timings["enumeration"] = time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
 
         # Generate structures for each stoichiometry
         candidates = []
@@ -2012,11 +2046,6 @@ class ChemistryExplorer:
                     self._save_candidate(conn, candidate)
                     candidates.append(candidate)
 
-                    # Keep compile caches warm across stoichiometries; clearing them
-                    # here would force recompilation on the next formula.
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-
                     if (i + 1) % 5 == 0 or i == 0:
                         logger.info(
                             "RSS after %s (%d/%d): %.0f MiB",
@@ -2065,6 +2094,9 @@ class ChemistryExplorer:
         # Clear previous_structures to free memory now that all processing is complete
         previous_structures.clear()
         gc.collect()
+
+        stage_timings["candidate_generation"] = time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
 
         # Generate terminal element structures for phase diagram (unless interrupted)
         # Always generate fresh terminals and compare with previous runs to get the best
@@ -2160,6 +2192,9 @@ class ChemistryExplorer:
                     if not keep_structures_in_memory:
                         terminal.clear_structure()
 
+        stage_timings["terminal_generation"] = time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
+
         # Build phase diagram
         phase_diagram = None
         hull_entries = []
@@ -2219,6 +2254,9 @@ class ChemistryExplorer:
                 show_progress=show_progress,
             )
 
+        stage_timings["hull_and_stability"] = time.perf_counter() - stage_started
+        finalize_started = time.perf_counter()
+
         # Finalize
         total_time = time.time() - start_time
 
@@ -2252,6 +2290,7 @@ class ChemistryExplorer:
                 num_successful=num_successful,
                 num_failed=num_failed,
             )
+        stage_timings["finalization"] = time.perf_counter() - finalize_started
 
         reused_msg = f" ({num_reused} from previous runs)" if num_reused > 0 else ""
         interrupted_msg = " (INTERRUPTED)" if interrupted else ""
@@ -2272,6 +2311,10 @@ class ChemistryExplorer:
             run_directory=run_dir,
             database_path=self._db_path,
             total_time_seconds=total_time,
+            stage_timings=stage_timings,
+            run_id=self._unified_run_id,
+            num_stoichiometries=len(stoichiometries),
+            num_trials_per_stoichiometry=num_trials,
         )
 
     # -------------------- Analysis & Visualization --------------------

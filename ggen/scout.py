@@ -14,7 +14,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 
@@ -31,6 +31,24 @@ logger = logging.getLogger(__name__)
 # On-hull = 1.0, 25 meV = 0.37, 50 meV = 0.14, 100 meV = 0.02.
 HULL_WEIGHT_SCALE = 0.025
 
+# Near-hull structures retained per scanned system.
+TOP_HITS_PER_SYSTEM = 5
+
+
+@dataclass
+class TopHit:
+    """A near-hull structure retained as evidence for a scanned system."""
+
+    structure_id: str
+    formula: str
+    space_group: str
+    space_group_number: Optional[int]
+    crystal_system: str
+    e_above_hull: float
+    is_on_hull: bool
+    num_atoms: int
+    novelty: str = "known"
+
 
 @dataclass
 class SystemScore:
@@ -44,11 +62,19 @@ class SystemScore:
     target_on_hull_count: int = 0
     distinct_target_formulas: int = 0
     weighted_target_score: float = 0.0
+    # Lowest e_above_hull among target-symmetry hits, or among all near-hull
+    # entries when the scan has no target crystal systems.
     best_e_hull: Optional[float] = None
     total_candidates: int = 0
     formulas_explored: int = 0
+    num_stoichiometries: int = 0
+    num_trials: int = 0
+    structures_kept: int = 0
+    new_composition_count: int = 0
+    new_polymorph_count: int = 0
     total_time_seconds: float = 0.0
-    top_target_hits: List[Tuple[str, str, float]] = field(default_factory=list)
+    top_hits: List[TopHit] = field(default_factory=list)
+    run_id: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -57,6 +83,7 @@ class ScoutResult:
     """Results from a full scout scan across candidate elements."""
 
     template: str
+    fixed_elements: List[str]
     candidates: List[str]
     scores: List[SystemScore]
     target_crystal_systems: Optional[List[str]] = None
@@ -72,10 +99,12 @@ class SystemScout:
         database: StructureDatabase,
         output_dir: Optional[Path] = None,
         random_seed: Optional[int] = None,
+        calculator=None,
     ):
         self.database = database
         self.output_dir = Path(output_dir) if output_dir else Path.cwd()
         self.random_seed = random_seed
+        self.calculator = calculator
 
     @staticmethod
     def parse_template(template: str) -> List[str]:
@@ -204,6 +233,7 @@ class SystemScout:
 
         result = ScoutResult(
             template=template,
+            fixed_elements=fixed_elements,
             candidates=candidates,
             scores=scores,
             target_crystal_systems=crystal_systems,
@@ -238,11 +268,13 @@ class SystemScout:
         start = time.time()
         explorer = None
         try:
-            # Use a fresh explorer/calculator per system to bound long-run memory.
+            # Fresh explorer per system bounds long-run memory; the calculator
+            # is shared so the ORB model is not reloaded for every candidate.
             explorer = ChemistryExplorer(
                 random_seed=self.random_seed,
                 output_dir=self.output_dir,
                 database=self.database,
+                calculator=self.calculator,
             )
             result: ExplorationResult = explorer.explore(
                 chemical_system=chemsys,
@@ -265,51 +297,83 @@ class SystemScout:
 
             score.total_candidates = result.num_successful
             score.formulas_explored = result.num_candidates
+            score.num_stoichiometries = result.num_stoichiometries
+            score.num_trials = result.num_trials
 
             # Only score structures generated in THIS run so that
             # previously-explored systems don't inflate the ranking.
             # Hull distances are still computed from all data.
-            run_id = explorer._unified_run_id
+            score.run_id = explorer._unified_run_id
+            score.structures_kept = self.database.get_run_statistics(score.run_id)[
+                "structures"
+            ]
 
-            hull_entries = self.database.get_hull_entries(
-                chemsys,
-                e_above_hull_cutoff=e_above_hull_cutoff,
-                run_id=run_id,
-            )
+            # Terminal elements sit on the hull by construction, so they are
+            # never evidence that a system is worth exploring.
+            hull_entries = [
+                entry
+                for entry in self.database.get_hull_entries(
+                    chemsys,
+                    e_above_hull_cutoff=e_above_hull_cutoff,
+                    run_id=score.run_id,
+                )
+                if len(entry.elements) > 1
+            ]
+            known_polymorphs = self.database.get_known_polymorphs(chemsys)
 
+            targets = set(crystal_systems or [])
             target_formulas: set[str] = set()
-            target_hit_details: List[Tuple[str, str, float]] = []
+            hits: List[TopHit] = []
 
             for entry in hull_entries:
                 if entry.is_on_hull:
                     score.on_hull_count += 1
                 score.near_hull_count += 1
 
-                if crystal_systems and entry.space_group_number is not None:
-                    cs = get_crystal_system(entry.space_group_number)
-                    if cs in crystal_systems:
-                        score.target_crystal_system_hits += 1
-                        e_hull = entry.e_above_hull or 0.0
+                novelty = self.database.classify_novelty(entry, known_polymorphs)
+                if novelty == "new composition":
+                    score.new_composition_count += 1
+                elif novelty == "new polymorph":
+                    score.new_polymorph_count += 1
 
-                        if entry.is_on_hull:
-                            score.target_on_hull_count += 1
+                e_hull = entry.e_above_hull or 0.0
+                crystal_system = (
+                    get_crystal_system(entry.space_group_number)
+                    if entry.space_group_number is not None
+                    else "unknown"
+                )
+                hits.append(
+                    TopHit(
+                        structure_id=entry.id,
+                        formula=entry.formula,
+                        space_group=entry.space_group_symbol or "?",
+                        space_group_number=entry.space_group_number,
+                        crystal_system=crystal_system,
+                        e_above_hull=e_hull,
+                        is_on_hull=entry.is_on_hull,
+                        num_atoms=entry.num_atoms,
+                        novelty=novelty,
+                    )
+                )
 
-                        target_formulas.add(entry.formula)
-                        score.weighted_target_score += math.exp(
-                            -e_hull / HULL_WEIGHT_SCALE
-                        )
-                        target_hit_details.append((
-                            entry.formula,
-                            entry.space_group_symbol or "?",
-                            e_hull,
-                        ))
-
-                        if score.best_e_hull is None or e_hull < score.best_e_hull:
-                            score.best_e_hull = e_hull
+                if crystal_system in targets:
+                    score.target_crystal_system_hits += 1
+                    if entry.is_on_hull:
+                        score.target_on_hull_count += 1
+                    target_formulas.add(entry.formula)
+                    score.weighted_target_score += math.exp(-e_hull / HULL_WEIGHT_SCALE)
 
             score.distinct_target_formulas = len(target_formulas)
-            target_hit_details.sort(key=lambda x: x[2])
-            score.top_target_hits = target_hit_details[:5]
+
+            scored_hits = (
+                [h for h in hits if h.crystal_system in targets] if targets else hits
+            )
+            score.best_e_hull = min((h.e_above_hull for h in scored_hits), default=None)
+
+            # Target-symmetry hits first, then the closest remaining phases, so
+            # a scan without target systems still returns its best structures.
+            hits.sort(key=lambda h: (h.crystal_system not in targets, h.e_above_hull))
+            score.top_hits = hits[:TOP_HITS_PER_SYSTEM]
 
         except Exception as e:
             logger.error("Exploration failed for %s: %s", chemsys, e)
@@ -318,12 +382,17 @@ class SystemScout:
             explorer = None
             gc.collect()
 
-        # Free memory between systems
-        reset_dynamo_cache()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
         current_rss = rss_mb()
+        if current_rss > RSS_LIMIT_MB:
+            logger.warning(
+                "RSS %.0f MiB exceeds limit %d MiB; clearing compile and CUDA caches",
+                current_rss,
+                RSS_LIMIT_MB,
+            )
+            reset_dynamo_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            current_rss = rss_mb()
         logger.info("RSS after %s: %.0f MiB", chemsys, current_rss)
 
         score.total_time_seconds = time.time() - start
@@ -345,8 +414,11 @@ class SystemScout:
         # Header
         header = f"{'Rank':<5} {'System':<16} {'X':<5}"
         if has_targets:
-            header += f" {'Tgt-On':>6} {'Uniq':>5} {'Score':>7} {'Best-E_hull':>12}"
-        header += f" {'On-Hull':>8} {'Near-Hull':>10} {'Time':>8}"
+            header += f" {'Tgt-On':>6} {'Uniq':>5} {'Score':>7}"
+        header += (
+            f" {'Best-E_hull':>12} {'On-Hull':>8} {'Near-Hull':>10}"
+            f" {'New':>5} {'Time':>8}"
+        )
         print(f"{C.BOLD}{header}{C.RESET}")
         print("-" * len(header.replace(C.BOLD, "").replace(C.RESET, "")))
 
@@ -358,22 +430,24 @@ class SystemScout:
 
             elapsed = _format_time(score.total_time_seconds)
 
+            e_hull_str = (
+                f"{score.best_e_hull * 1000:.1f} meV"
+                if score.best_e_hull is not None
+                else "-"
+            )
+
             line = f"{rank:<5} {score.chemical_system:<16} {score.variable_element:<5}"
             if has_targets:
-                e_hull_str = (
-                    f"{score.best_e_hull * 1000:.1f} meV"
-                    if score.best_e_hull is not None
-                    else "-"
-                )
                 line += (
                     f" {score.target_on_hull_count:>6}"
                     f" {score.distinct_target_formulas:>5}"
                     f" {score.weighted_target_score:>7.1f}"
-                    f" {e_hull_str:>12}"
                 )
             line += (
+                f" {e_hull_str:>12}"
                 f" {score.on_hull_count:>8}"
                 f" {score.near_hull_count:>10}"
+                f" {score.new_composition_count + score.new_polymorph_count:>5}"
                 f" {elapsed:>8}"
             )
 
@@ -382,19 +456,17 @@ class SystemScout:
             else:
                 print(line)
 
-        # Top target-symmetry hits detail
-        if has_targets:
-            any_hits = any(s.top_target_hits for s in scores if not s.error)
-            if any_hits:
-                print(f"\n{C.BOLD}Top target-symmetry hits:{C.RESET}")
-                for rank, score in enumerate(scores, 1):
-                    if score.error or not score.top_target_hits:
-                        continue
-                    hits_str = ", ".join(
-                        f"{f} / {sg} ({e * 1000:.0f} meV)"
-                        for f, sg, e in score.top_target_hits
-                    )
-                    print(f"  {rank}. {C.CYAN}{score.chemical_system}{C.RESET}: {hits_str}")
+        # Best near-hull structure detail
+        if any(s.top_hits for s in scores if not s.error):
+            print(f"\n{C.BOLD}Top hits:{C.RESET}")
+            for rank, score in enumerate(scores, 1):
+                if score.error or not score.top_hits:
+                    continue
+                hits_str = ", ".join(
+                    f"{h.formula} / {h.space_group} ({h.e_above_hull * 1000:.0f} meV)"
+                    for h in score.top_hits
+                )
+                print(f"  {rank}. {C.CYAN}{score.chemical_system}{C.RESET}: {hits_str}")
 
         print()
 
@@ -402,16 +474,19 @@ class SystemScout:
 def _sort_key(score: SystemScore):
     """Sort key for ranking systems.
 
-    Priority: stable phases in target symmetry → compositional breadth →
-    quality-weighted target score → best E_hull as tiebreaker.
+    Priority: stable phases in target symmetry, compositional breadth, then
+    quality-weighted target score. Hull counts and best E_hull break the
+    remaining ties, and are what rank a scan with no target crystal systems.
     """
     if score.error:
-        return (0, 0, 0.0, float("inf"))
+        return (0, 0, 0.0, 0, 0, float("inf"))
     best_e = score.best_e_hull if score.best_e_hull is not None else float("inf")
     return (
         -score.target_on_hull_count,
         -score.distinct_target_formulas,
         -score.weighted_target_score,
+        -score.on_hull_count,
+        -score.near_hull_count,
         best_e,
     )
 

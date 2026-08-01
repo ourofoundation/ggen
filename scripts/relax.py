@@ -253,15 +253,17 @@ def relax_batch_torchsim(
         ts_dtype,
     )
 
-    # Run batched optimization with force convergence
+    # Run batched optimization with force convergence.
+    # autobatcher=False skips the slow OOM-probe memory estimation; typical
+    # re-relax batches fit on GPU, and torch-sim still hot-swaps converged
+    # systems out of the active batch.
     try:
-        use_autobatcher = torch.cuda.is_available()
         final_state = ts.optimize(
             system=ts_state,
             model=ts_model,
             optimizer=ts.Optimizer.lbfgs,
             max_steps=max_steps,
-            autobatcher=use_autobatcher,
+            autobatcher=False,
             init_kwargs={"cell_filter": ts.CellFilter.frechet},
             convergence_fn=ts.generate_force_convergence_fn(force_tol=fmax),
             pbar=True,

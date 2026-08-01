@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import time
 import warnings
 from dataclasses import dataclass
 from datetime import datetime
@@ -426,12 +427,8 @@ class GGen:
         self._trajectory_structures.clear()
         self._trajectory_metadata.clear()
         self._trajectory_info["total_frames"] = 0
-        gc.collect()
         # Keep the TorchSim wrapper alive so batched relaxations can reuse the
-        # same ORB/TorchSim bridge across stoichiometries instead of rebuilding it.
-        # Clear torch GPU cache if available
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # same ORB/TorchSim bridge and CUDA allocator across stoichiometries.
 
     def _get_torchsim_model(self):
         """Return a cached TorchSim wrapper for the current calculator."""
@@ -1295,12 +1292,9 @@ class GGen:
         Returns:
             List of (relaxed_structure, final_energy, steps, final_fmax) tuples.
 
-            Note: We return final_fmax from relaxation rather than recomputing it later
-            because the pymatgen<->ASE round-trip conversion can introduce numerical
-            differences. In some cases we observed fmax changing from <0.01 to >0.02
-            after structure format conversion, likely due to coordinate wrapping and
-            floating-point precision differences affecting force calculations near
-            shallow energy minima.
+            Note: ``final_fmax`` comes from torch-sim's last-step forces
+            (``system_wise_max_force``), matching the convergence criterion and
+            avoiding a second ORB forward pass per trial.
         """
         if not candidates:
             return []
@@ -1327,6 +1321,7 @@ class GGen:
         final_state = None
         final_atoms_list = None
         energies = None
+        fmaxes = None
 
         # Convert candidates to ASE atoms
         atoms_list = [c.to_ase() for c in candidates]
@@ -1360,16 +1355,18 @@ class GGen:
             ts_state.device,
         )
 
-        # Use configured optimizer with cell filter and force convergence
+        # Use configured optimizer with cell filter and force convergence.
+        # autobatcher=False skips the slow OOM-probe memory estimation; our
+        # batches (≲15 × ≲20-atom cells) always fit on an A10G, and torch-sim
+        # still hot-swaps converged systems out of the active batch.
         try:
             optimizer = self._resolve_torchsim_optimizer(optimization_optimizer)
-            use_autobatcher = torch.cuda.is_available()
             final_state = ts.optimize(
                 system=ts_state,
                 model=ts_model,
                 optimizer=optimizer,
                 max_steps=max_steps,
-                autobatcher=use_autobatcher,
+                autobatcher=False,
                 init_kwargs={"cell_filter": ts.CellFilter.frechet},
                 convergence_fn=ts.generate_force_convergence_fn(force_tol=fmax),
                 pbar={"leave": False} if show_progress else False,
@@ -1383,20 +1380,16 @@ class GGen:
             if mem_trace:
                 logger.info("[mem] after final_state.to_atoms: RSS=%.0f MiB", rss_mb())
             energies = final_state.energy.detach().cpu().numpy()
+            fmaxes = ts.system_wise_max_force(final_state).detach().cpu().numpy()
             if mem_trace:
                 logger.info(
-                    "[mem] after energy detach/cpu/numpy: RSS=%.0f MiB", rss_mb()
+                    "[mem] after energy/fmax detach/cpu/numpy: RSS=%.0f MiB", rss_mb()
                 )
 
             for i, atoms in enumerate(final_atoms_list):
-                # Compute fmax BEFORE structure conversion to avoid numerical drift
-                # from pymatgen<->ASE round-trip (see docstring)
-                atoms.calc = self.calculator
-                filtered = FrechetCellFilter(atoms)
-                final_fmax = compute_fmax(filtered.get_forces())
-
                 structure = _atoms_to_structure_wrapped(atoms)
                 energy = float(energies[i])
+                final_fmax = float(fmaxes[i])
                 # torch-sim batched optimization doesn't track per-structure steps
                 # Use max_steps as upper bound estimate
                 steps = max_steps
@@ -1423,6 +1416,12 @@ class GGen:
             logger.error(
                 "Batched relaxation failed: %s. Falling back to sequential.", e
             )
+            if isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in str(
+                e
+            ).lower():
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             # Fall back to sequential relaxation
             return self._relax_candidates_sequential(
                 candidates, max_steps, fmax, show_progress
@@ -1434,6 +1433,7 @@ class GGen:
             # recompilation on the next batch and likely leaves performance on the table.
             # If OOMs persist, prefer targeted recovery on error or periodic worker
             # recycling over clearing compile state after every successful batch.
+            fmaxes = None
             energies = None
             final_atoms_list = None
             final_state = None
@@ -1441,12 +1441,6 @@ class GGen:
             ts_model = None
             atoms_list = None
             gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                try:
-                    torch.cuda.ipc_collect()
-                except Exception:
-                    pass
             rss_end = rss_mb()
             if mem_trace:
                 logger.info(
@@ -1649,11 +1643,9 @@ class GGen:
         Returns:
             List of (relaxed_structure, final_energy, steps, final_fmax) tuples.
 
-            Note: We return final_fmax computed on the ASE atoms BEFORE converting
-            to pymatgen Structure. This avoids numerical drift from the pymatgen<->ASE
-            round-trip that can cause fmax to change significantly (we observed cases
-            where fmax jumped from <0.01 to >0.02 after conversion, likely due to
-            coordinate wrapping and floating-point precision near shallow minima).
+            Note: Batched path takes ``final_fmax`` from torch-sim's last-step
+            forces. Sequential path computes it on ASE atoms before the
+            pymatgen conversion to avoid round-trip numerical drift.
         """
         if preserve_symmetry:
             # torch-sim doesn't support symmetry constraints, use sequential ASE
@@ -1696,6 +1688,7 @@ class GGen:
         trajectory_interval: int = 5,
         # Progress display
         show_progress: bool = False,
+        serialize_output: bool = True,
     ) -> Dict[str, Any]:
         """Generate a crystal structure using PyXtal with enhanced stability and symmetry.
 
@@ -1747,6 +1740,9 @@ class GGen:
             trajectory_interval: Steps between trajectory frame snapshots during
                 optimization. Set to 0 to disable intermediate frames. Default: 5.
             show_progress: If True, show a tqdm progress bar during relaxation.
+            serialize_output: Include CIF text and base64 fields in the response.
+                Exploration callers can disable this because they serialize the
+                selected structure separately.
 
         Returns:
             Dictionary with structure metadata, CIF content, and generation statistics.
@@ -1777,6 +1773,7 @@ class GGen:
                 optimization_optimizer=optimization_optimizer,
                 trajectory_interval=trajectory_interval,
                 show_progress=show_progress,
+                serialize_output=serialize_output,
             )
         if num_trials < 1:
             raise ValueError("num_trials must be >= 1")
@@ -1930,6 +1927,7 @@ class GGen:
                 bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
             )
 
+        trial_generation_started = time.perf_counter()
         for sg_number, trial_idx in trial_iter:
             # Initialize sg_stats on first trial for this SG
             if sg_number not in generation_stats["by_spacegroup"]:
@@ -2058,6 +2056,10 @@ class GGen:
                 # accepted candidates held in `all_candidates`.
                 atoms = None
 
+        generation_stats["trial_generation_seconds"] = (
+            time.perf_counter() - trial_generation_started
+        )
+
         if mem_trace:
             logger.info(
                 "[mem] after trial generation %s: %d candidates RSS=%.0f MiB",
@@ -2111,6 +2113,7 @@ class GGen:
                 optimization_optimizer,
                 optimization_max_steps,
             )
+            relaxation_started = time.perf_counter()
             relaxed_results = self._relax_candidates(
                 candidate_crystals,
                 max_steps=optimization_max_steps,
@@ -2118,6 +2121,9 @@ class GGen:
                 show_progress=show_progress,
                 preserve_symmetry=preserve_symmetry,
                 optimization_optimizer=optimization_optimizer,
+            )
+            generation_stats["relaxation_seconds"] = (
+                time.perf_counter() - relaxation_started
             )
             if mem_trace:
                 logger.info(
@@ -2239,6 +2245,8 @@ class GGen:
         del all_candidates
         del candidate_sgs
 
+        symmetry_refinement_started = time.perf_counter()
+
         # Post-relaxation symmetry refinement
         if optimize_geometry and refine_symmetry and not preserve_symmetry:
             if mem_trace:
@@ -2303,6 +2311,9 @@ class GGen:
                     formula,
                     rss_mb(),
                 )
+        generation_stats["symmetry_refinement_seconds"] = (
+            time.perf_counter() - symmetry_refinement_started
+        )
 
         # Final structure and analysis
         self.set_structure(structure, add_to_trajectory=not optimize_geometry)
@@ -2339,9 +2350,15 @@ class GGen:
                 f"calculated: {final_sg_sym} #{final_sg_num}{optimization_text})"
             )
 
-        # Produce CIF content
-        cif_text = str(CifWriter(structure, symprec=SYMPREC))
-        cif64 = base64.b64encode(cif_text.encode("utf-8")).decode("utf-8")
+        serialization_started = time.perf_counter()
+        cif_text = None
+        cif64 = None
+        if serialize_output:
+            cif_text = str(CifWriter(structure, symprec=SYMPREC))
+            cif64 = base64.b64encode(cif_text.encode("utf-8")).decode("utf-8")
+        generation_stats["serialization_seconds"] = (
+            time.perf_counter() - serialization_started
+        )
         if mem_trace:
             logger.info(
                 "[mem] after cif encode %s: RSS=%.0f MiB",
@@ -2397,14 +2414,15 @@ class GGen:
             "geometry_optimized": optimize_geometry,
             "symmetry_refined": refine_symmetry and optimize_geometry,
             "generation_stats": generation_stats,
-            "cif_content": cif_text,
-            "cif_base64": cif64,
             "filename": filename,
             "name": name,
             "description": description,
             # Additional relaxed trials (polymorphs) - populated when optimize_geometry=True
             "all_relaxed_trials": all_relaxed_trials,
         }
+        if serialize_output:
+            resp["cif_content"] = cif_text
+            resp["cif_base64"] = cif64
         if optimize_geometry:
             resp["optimization_steps"] = optimization_steps
             resp["final_fmax"] = best_fmax
@@ -2437,6 +2455,7 @@ class GGen:
         trajectory_interval: int,
         optimization_optimizer: str = "fire",
         show_progress: bool = False,
+        serialize_output: bool = True,
     ) -> Dict[str, Any]:
         """Internal iterative crystal generation (called when max_iterations > 1)."""
         logger.info(
@@ -2505,6 +2524,7 @@ class GGen:
                     optimization_optimizer=optimization_optimizer,
                     trajectory_interval=trajectory_interval,
                     show_progress=show_progress,
+                    serialize_output=False,
                 )
             except Exception as e:
                 logger.warning("Iteration %d failed: %s", iteration + 1, e)
@@ -2597,9 +2617,11 @@ class GGen:
         final_sg_num = final_spg.get_space_group_number()
         final_sg_sym = final_spg.get_space_group_symbol()
 
-        # Generate CIF
-        cif_text = str(CifWriter(best_structure, symprec=SYMPREC))
-        cif64 = base64.b64encode(cif_text.encode("utf-8")).decode("utf-8")
+        cif_text = None
+        cif64 = None
+        if serialize_output:
+            cif_text = str(CifWriter(best_structure, symprec=SYMPREC))
+            cif64 = base64.b64encode(cif_text.encode("utf-8")).decode("utf-8")
 
         filename = f"{formula}_{final_sg_sym.replace('/', '-')}.cif"
         name = f"{formula} ({final_sg_sym})"
@@ -2618,7 +2640,7 @@ class GGen:
             best_energy,
         )
 
-        return {
+        response = {
             "formula": formula,
             "final_space_group": final_sg_num,
             "final_space_group_symbol": final_sg_sym,
@@ -2626,12 +2648,14 @@ class GGen:
             "converged": converged,
             "num_iterations": len(iteration_history),
             "iteration_history": iteration_history,
-            "cif_content": cif_text,
-            "cif_base64": cif64,
             "filename": filename,
             "name": name,
             "description": description,
         }
+        if serialize_output:
+            response["cif_content"] = cif_text
+            response["cif_base64"] = cif64
+        return response
 
     # -------------------- Structure description / IO --------------------
 
