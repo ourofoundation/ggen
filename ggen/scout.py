@@ -10,7 +10,6 @@ from __future__ import annotations
 import gc
 import logging
 import math
-import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +22,7 @@ from .colors import Colors
 from .database import StructureDatabase
 from .explorer import ChemistryExplorer, ExplorationResult
 from .report import get_crystal_system
+from .utils import normalize_dashes
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +112,7 @@ class SystemScout:
 
         Returns the list of fixed element symbols.
         """
-        parts = re.split(r"[-]", template)
+        parts = normalize_dashes(template).split("-")
         fixed = []
         for part in parts:
             part = part.strip()
@@ -128,7 +128,7 @@ class SystemScout:
 
         Returns a normalized chemical system string (e.g., 'Bi-Fe-Ti').
         """
-        parts = re.split(r"[-]", template)
+        parts = normalize_dashes(template).split("-")
         elements = []
         for part in parts:
             part = part.strip()

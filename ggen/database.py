@@ -420,7 +420,11 @@ class StructureDatabase:
     @staticmethod
     def normalize_chemsys(system: str) -> str:
         """Normalize a chemical system string (alphabetically sorted)."""
-        elements = [e.strip() for e in system.replace("-", " ").split()]
+        from .utils import normalize_dashes
+
+        elements = [
+            e.strip() for e in normalize_dashes(system).replace("-", " ").split()
+        ]
         return "-".join(sorted(elements))
 
     @staticmethod

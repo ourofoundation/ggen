@@ -360,19 +360,23 @@ class ChemistryExplorer:
         """
         if isinstance(system, list):
             elements = system
-        elif "-" in system:
-            elements = [e.strip() for e in system.split("-")]
         else:
-            # Parse concatenated symbols (e.g., "LiCoO")
-            elements = []
-            i = 0
-            while i < len(system):
-                if i + 1 < len(system) and system[i + 1].islower():
-                    elements.append(system[i : i + 2])
-                    i += 2
-                else:
-                    elements.append(system[i])
-                    i += 1
+            from .utils import normalize_dashes
+
+            system = normalize_dashes(system)
+            if "-" in system:
+                elements = [e.strip() for e in system.split("-")]
+            else:
+                # Parse concatenated symbols (e.g., "LiCoO")
+                elements = []
+                i = 0
+                while i < len(system):
+                    if i + 1 < len(system) and system[i + 1].islower():
+                        elements.append(system[i : i + 2])
+                        i += 2
+                    else:
+                        elements.append(system[i])
+                        i += 1
 
         # Validate elements
         validated = []

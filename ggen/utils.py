@@ -1,6 +1,16 @@
+import re
 from typing import Literal, Tuple
 
 import numpy as np
+
+# Unicode dash variants (en/em dash, minus sign, fullwidth hyphen, …) that
+# LLMs and rich-text paste often substitute for ASCII "-".
+_DASH_RE = re.compile(r"[\u2010-\u2015\u2212\ufe58\ufe63\uff0d]")
+
+
+def normalize_dashes(s: str) -> str:
+    """Replace Unicode dash variants with ASCII hyphen-minus."""
+    return _DASH_RE.sub("-", s)
 
 
 def compute_fmax(
