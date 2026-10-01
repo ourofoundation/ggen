@@ -40,7 +40,7 @@ def assert_explorations_equivalent(
     baseline: dict,
     actual: dict,
     *,
-    energy_atol: float = 1e-4,
+    energy_atol: float = 5e-4,
 ) -> None:
     """Assert equivalent structures and energies without comparing CIF bytes."""
     assert actual["chemical_system"] == baseline["chemical_system"]

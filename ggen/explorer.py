@@ -11,9 +11,11 @@ import json
 import logging
 import signal
 import sqlite3
+import time
 import warnings
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from concurrent.futures.process import BrokenProcessPool
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from itertools import combinations_with_replacement
 from pathlib import Path
@@ -165,6 +167,76 @@ def _generate_structure_worker(args: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 
+_WORKER_GENERATORS: Dict[Optional[int], Any] = {}
+
+# Pooled relaxation stops shrinking its GPU atom budget here and gives up instead
+_MIN_RELAX_BATCH_ATOMS = 250
+
+# GPU memory per atom held in a relaxation batch, measured for ORB v3
+# conservative on an A10G with cells of up to 16 atoms (4,000 atoms peaked at
+# 15.9 GiB). Used only to size the default batch; out-of-memory still backs off.
+_RELAX_GPU_MIB_PER_ATOM = 4.0
+
+
+def default_relax_batch_atoms() -> int:
+    """Atom budget for pooled relaxation that fills most of the current GPU."""
+    if not torch.cuda.is_available():
+        return 1000
+    total_mib = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
+    return max(_MIN_RELAX_BATCH_ATOMS, int(0.75 * total_mib / _RELAX_GPU_MIB_PER_ATOM))
+
+
+def _init_generation_worker() -> None:
+    """Keep each generation worker single-threaded; the pool supplies parallelism."""
+    try:
+        torch.set_num_threads(1)
+    except Exception:
+        pass
+
+
+_GENERATION_POOL: Optional[ProcessPoolExecutor] = None
+_GENERATION_POOL_SIZE = 0
+
+
+def _get_generation_pool(workers: int) -> ProcessPoolExecutor:
+    """Return the process-wide candidate-generation pool, starting it if needed.
+
+    Workers take several seconds to import the package, so the pool outlives
+    any single exploration and is reused by the next one.
+    """
+    global _GENERATION_POOL, _GENERATION_POOL_SIZE
+    if _GENERATION_POOL is not None and _GENERATION_POOL_SIZE != workers:
+        _GENERATION_POOL.shutdown(wait=False, cancel_futures=True)
+        _GENERATION_POOL = None
+    if _GENERATION_POOL is None:
+        import multiprocessing
+
+        _GENERATION_POOL = ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=multiprocessing.get_context("forkserver"),
+            initializer=_init_generation_worker,
+        )
+        _GENERATION_POOL_SIZE = workers
+    return _GENERATION_POOL
+
+
+def _generate_candidates_worker(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Propose candidates for one formula in a CPU-only worker process.
+
+    Never touches the calculator, so workers do not load the model. Seeded
+    generation depends only on (seed, formula, space group, trial), so the
+    result is the same whichever process runs it.
+    """
+    from .ggen import GGen
+
+    seed = args.pop("random_seed")
+    generator = _WORKER_GENERATORS.get(seed)
+    if generator is None:
+        generator = GGen(random_seed=seed, enable_trajectory=False)
+        _WORKER_GENERATORS[seed] = generator
+    return generator.generate_candidates(**args)
+
+
 # ===================== Data Classes =====================
 
 
@@ -314,6 +386,8 @@ class ChemistryExplorer:
         self._db_path: Optional[Path] = None
         self._db_conn: Optional[sqlite3.Connection] = None
         self._ggen: Optional[GGen] = None
+        # Lowered when pooled relaxation runs out of GPU memory
+        self._relax_batch_atoms_cap: Optional[int] = None
 
     @property
     def calculator(self):
@@ -346,6 +420,7 @@ class ChemistryExplorer:
 
         Accepts formats like:
         - "Li-Co-O" (hyphen-separated)
+        - "Fe" (a single element, which explores only its terminal reference)
         - "LiCoO" (concatenated element symbols)
         - ["Li", "Co", "O"] (list)
 
@@ -387,8 +462,8 @@ class ChemistryExplorer:
             except ValueError:
                 raise ValueError(f"Invalid element symbol: {el}")
 
-        if len(validated) < 2:
-            raise ValueError("Chemical system must contain at least 2 elements")
+        if not validated:
+            raise ValueError("Chemical system must contain at least 1 element")
 
         return sorted(set(validated))
 
@@ -715,8 +790,10 @@ class ChemistryExplorer:
         )
         conn.commit()
 
-        # Also save to unified database if available
-        if self.database is not None and candidate.is_valid:
+        # Also save to unified database if available. Structures loaded from it
+        # are already stored there.
+        already_stored = candidate.generation_metadata.get("loaded_from_unified_db")
+        if self.database is not None and candidate.is_valid and not already_stored:
             try:
                 # Get CIF content
                 cif_content = None
@@ -1034,86 +1111,99 @@ class ChemistryExplorer:
                 serialize_output=False,
             )
 
-            structure = ggen.get_structure()
-            if structure is None:
-                raise ValueError("No structure generated")
-
-            energy = result["best_crystal_energy"]
-            num_atoms = len(structure)
-            energy_per_atom = energy / num_atoms
-
-            # Save additional relaxed trials (polymorphs) to unified database
-            # These are valuable structures that were fully relaxed but weren't the best
-            additional_trials = result.get("all_relaxed_trials", [])
-            if additional_trials and self.database is not None:
-                for trial in additional_trials:
-                    try:
-                        trial_struct = trial["structure"]
-                        trial_cif = trial_struct.to(fmt="cif")
-                        self.database.add_structure(
-                            formula=formula,
-                            stoichiometry=stoichiometry,
-                            energy_per_atom=float(trial["energy_per_atom"]),
-                            total_energy=float(trial["energy"]),
-                            num_atoms=int(trial["num_atoms"]),
-                            space_group_number=int(trial["space_group_number"]),
-                            space_group_symbol=trial["space_group_symbol"],
-                            cif_content=trial_cif,
-                            structure=None,  # Don't store structure object to save memory
-                            is_valid=True,
-                            generation_metadata={
-                                "is_additional_trial": True,
-                                "original_space_group": trial.get(
-                                    "original_space_group"
-                                ),
-                                "optimization_steps": trial.get(
-                                    "optimization_steps", 0
-                                ),
-                            },
-                            run_id=self._unified_run_id,
-                        )
-                        # Clear structure from trial dict to free memory
-                        trial["structure"] = None
-                    except Exception as e:
-                        logger.debug(
-                            f"Failed to save additional trial for {formula}: {e}"
-                        )
-
-                if additional_trials:
-                    logger.debug(
-                        f"Saved {len(additional_trials)} additional polymorphs for {formula}"
-                    )
-
-            # Track count before clearing
-            num_trials_saved = len(additional_trials)
-
-            # Clear all_relaxed_trials from result to free memory
-            # (we've already saved them to the database and set structures to None)
-            result["all_relaxed_trials"] = None
-            del additional_trials
-
-            return CandidateResult(
-                formula=formula,
-                stoichiometry=stoichiometry,
-                energy_per_atom=energy_per_atom,
-                total_energy=energy,
-                num_atoms=num_atoms,
-                space_group_number=result["final_space_group"],
-                space_group_symbol=result["final_space_group_symbol"],
-                structure=structure,
-                generation_metadata={
-                    "generation_stats": result.get("generation_stats", {}),
-                    "score_breakdown": result.get("score_breakdown", {}),
-                    "optimization_steps": result.get("optimization_steps", 0),
-                    "num_additional_trials_saved": num_trials_saved,
-                },
-            )
+            return self._candidate_from_selection(stoichiometry, formula, result)
 
         except Exception as e:
             logger.warning(f"Failed to generate structure for {formula}: {e}")
             return _failed_candidate(formula, stoichiometry, e)
         finally:
             ggen.cleanup()
+
+    def _candidate_from_selection(
+        self,
+        stoichiometry: Dict[str, int],
+        formula: str,
+        result: Dict[str, Any],
+    ) -> CandidateResult:
+        """Build the CandidateResult for a selection made by ``GGen.relax_and_select``.
+
+        Also stores the non-winning relaxed trials as polymorphs in the unified
+        database.
+        """
+        structure = result.get("structure")
+        if structure is None:
+            raise ValueError("No structure generated")
+
+        energy = result["best_crystal_energy"]
+        num_atoms = len(structure)
+        energy_per_atom = energy / num_atoms
+
+        # Save additional relaxed trials (polymorphs) to unified database
+        # These are valuable structures that were fully relaxed but weren't the best
+        additional_trials = result.get("all_relaxed_trials", [])
+        if additional_trials and self.database is not None:
+            for trial in additional_trials:
+                try:
+                    trial_struct = trial["structure"]
+                    trial_cif = trial_struct.to(fmt="cif")
+                    self.database.add_structure(
+                        formula=formula,
+                        stoichiometry=stoichiometry,
+                        energy_per_atom=float(trial["energy_per_atom"]),
+                        total_energy=float(trial["energy"]),
+                        num_atoms=int(trial["num_atoms"]),
+                        space_group_number=int(trial["space_group_number"]),
+                        space_group_symbol=trial["space_group_symbol"],
+                        cif_content=trial_cif,
+                        structure=None,  # Don't store structure object to save memory
+                        is_valid=True,
+                        generation_metadata={
+                            "is_additional_trial": True,
+                            "original_space_group": trial.get(
+                                "original_space_group"
+                            ),
+                            "optimization_steps": trial.get(
+                                "optimization_steps", 0
+                            ),
+                        },
+                        run_id=self._unified_run_id,
+                    )
+                    # Clear structure from trial dict to free memory
+                    trial["structure"] = None
+                except Exception as e:
+                    logger.debug(
+                        f"Failed to save additional trial for {formula}: {e}"
+                    )
+
+            if additional_trials:
+                logger.debug(
+                    f"Saved {len(additional_trials)} additional polymorphs for {formula}"
+                )
+
+        # Track count before clearing
+        num_trials_saved = len(additional_trials)
+
+        # Clear all_relaxed_trials from result to free memory
+        # (we've already saved them to the database and set structures to None)
+        result["all_relaxed_trials"] = None
+        del additional_trials
+
+        return CandidateResult(
+            formula=formula,
+            stoichiometry=stoichiometry,
+            energy_per_atom=energy_per_atom,
+            total_energy=energy,
+            num_atoms=num_atoms,
+            space_group_number=result["final_space_group"],
+            space_group_symbol=result["final_space_group_symbol"],
+            structure=structure,
+            generation_metadata={
+                "generation_stats": result.get("generation_stats", {}),
+                "score_breakdown": result.get("score_breakdown", {}),
+                "optimization_steps": result.get("optimization_steps", 0),
+                "num_additional_trials_saved": num_trials_saved,
+            },
+        )
 
     def _save_structure_cif(
         self, candidate: CandidateResult, structures_dir: Path
@@ -1158,6 +1248,66 @@ class ChemistryExplorer:
             f.write(str(cif_writer))
 
         return cif_path
+
+    def _record_candidate(
+        self,
+        candidate: CandidateResult,
+        formula: str,
+        previous_structures: Dict[str, CandidateResult],
+        structures_dir: Path,
+        conn: sqlite3.Connection,
+        compute_phonons: bool,
+        phonon_supercell: Tuple[int, int, int],
+        show_progress: bool,
+        keep_structures_in_memory: bool,
+    ) -> Tuple[CandidateResult, bool]:
+        """Persist one stoichiometry's outcome, preferring a better known structure.
+
+        Returns the candidate that was recorded (the new one, or the previously
+        known one if that is lower in energy) and whether it counts as a success.
+        """
+        succeeded = False
+        # If we have a previous structure and this one failed or is worse, use the previous
+        if formula in previous_structures:
+            prev_candidate = previous_structures[formula]
+            if not candidate.is_valid or (
+                prev_candidate.is_valid
+                and prev_candidate.energy_per_atom
+                < candidate.energy_per_atom
+            ):
+                logger.debug(
+                    f"Using better structure from previous run for {formula} "
+                    f"(prev={prev_candidate.energy_per_atom:.4f} vs "
+                    f"new={candidate.energy_per_atom:.4f} eV/atom)"
+                )
+                candidate = prev_candidate
+                candidate.generation_metadata["reused_from_previous"] = True
+
+        if candidate.is_valid:
+            # Load structure if needed (lazy loading from database)
+            structure = candidate.get_structure()
+            if structure is not None:
+                # Save CIF
+                cif_path = self._save_structure_cif(candidate, structures_dir)
+                candidate.cif_path = cif_path
+                succeeded = True
+
+                # Calculate phonon stability if enabled
+                if compute_phonons:
+                    self._calculate_phonon_stability(
+                        candidate,
+                        supercell=phonon_supercell,
+                        show_progress=show_progress,
+                    )
+
+                # Clear structure from memory if not needed
+                if not keep_structures_in_memory:
+                    candidate.clear_structure()
+                # Remove stored structure reference to free memory
+                candidate.generation_metadata.pop("_stored_structure", None)
+
+        self._save_candidate(conn, candidate)
+        return candidate, succeeded
 
     # -------------------- Phase Diagram Analysis --------------------
 
@@ -1586,6 +1736,440 @@ class ChemistryExplorer:
 
         return candidates, num_successful, num_failed
 
+    # -------------------- Pooled Generation + Relaxation --------------------
+
+    def _candidate_selections(
+        self,
+        formulas: List[str],
+        generation_kwargs: Dict[str, Any],
+        optimization_max_steps: int,
+        optimization_optimizer: str,
+        relax_batch_atoms: int,
+        generation_workers: int,
+        pool_formulas: int,
+        timings: Dict[str, float],
+        interrupted_flag=lambda: False,
+    ):
+        """Propose on the CPU, relax on a full GPU, select per formula.
+
+        Three stages, decoupled so each can be swapped or scaled on its own:
+
+        1. *Propose*: workers produce a ``Candidate`` list per formula. All
+           formulas are submitted up front, so proposing runs ahead of the GPU.
+        2. *Relax*: whichever formulas are ready (up to ``pool_formulas``) go
+           to one ``GGen.relax_atoms`` call, which keeps ``relax_batch_atoms``
+           atoms on the GPU by swapping finished structures for waiting ones.
+        3. *Select*: each formula picks its winner; symmetry-refined winners
+           are re-relaxed together in a second pooled call.
+
+        Yields one list per pool of (formula_index, selection), where selection
+        is the ``GGen.relax_and_select`` response or the exception that formula
+        failed with. Stage durations accumulate into ``timings``.
+        """
+        from concurrent.futures import FIRST_COMPLETED, wait
+
+        for key in (
+            "candidate_generation_wait",
+            "candidate_generation_cpu",
+            "candidate_relaxation_gpu",
+            "candidate_selection",
+            "symmetry_rerelaxation_gpu",
+        ):
+            timings.setdefault(key, 0.0)
+        ggen = self.ggen
+        fmax = 0.01  # GGen.relax_and_select's default optimization_fmax
+
+        thread_pool = None
+        if generation_workers > 0:
+            process_pool = _get_generation_pool(generation_workers)
+            futures = {
+                process_pool.submit(
+                    _generate_candidates_worker,
+                    {
+                        **generation_kwargs,
+                        "formula": formula,
+                        "random_seed": self.random_seed,
+                    },
+                ): index
+                for index, formula in enumerate(formulas)
+            }
+        else:
+            thread_pool = ThreadPoolExecutor(max_workers=1)
+            futures = {
+                thread_pool.submit(
+                    ggen.generate_candidates, formula=formula, **generation_kwargs
+                ): index
+                for index, formula in enumerate(formulas)
+            }
+
+        try:
+            waiting = set(futures)
+            ready: List[Any] = []
+            while waiting or ready:
+                if interrupted_flag():
+                    logger.info("Stopping generation due to interrupt")
+                    break
+
+                # ---- Propose: take what is ready, without idling the GPU for
+                # stragglers. A few formulas are enough to start a pool.
+                started = time.perf_counter()
+                enough = min(4, len(waiting) + len(ready))
+                while waiting and len(ready) < enough:
+                    done, waiting = wait(waiting, return_when=FIRST_COMPLETED)
+                    ready.extend(done)
+                done = {future for future in waiting if future.done()}
+                waiting -= done
+                ready.extend(done)
+                ready.sort(key=futures.__getitem__)
+                pool, ready = ready[:pool_formulas], ready[pool_formulas:]
+
+                results: List[Tuple[int, Any]] = []
+                batches: List[Tuple[int, Dict[str, Any]]] = []
+                for future in pool:
+                    index = futures[future]
+                    try:
+                        batch = future.result()
+                        timings["candidate_generation_cpu"] += batch[
+                            "generation_stats"
+                        ].get("trial_generation_seconds", 0.0)
+                        batches.append((index, batch))
+                    except BrokenProcessPool:
+                        # The worker pool died (e.g. a worker was OOM-killed).
+                        # Generate here instead, and let the next exploration
+                        # start a fresh pool.
+                        global _GENERATION_POOL
+                        _GENERATION_POOL = None
+                        try:
+                            batches.append(
+                                (
+                                    index,
+                                    ggen.generate_candidates(
+                                        formula=formulas[index], **generation_kwargs
+                                    ),
+                                )
+                            )
+                        except Exception as e:
+                            results.append((index, e))
+                    except Exception as e:
+                        results.append((index, e))
+                timings["candidate_generation_wait"] += time.perf_counter() - started
+
+                # ---- Relax ----
+                started = time.perf_counter()
+                atoms_list = [
+                    candidate.to_ase()
+                    for _, batch in batches
+                    for candidate, _ in batch["candidates"]
+                ]
+                pooled_ok = True
+                relaxed: List[Any] = []
+                try:
+                    relaxed = self._relax_pooled(
+                        atoms_list,
+                        optimization_max_steps,
+                        fmax,
+                        optimization_optimizer,
+                        relax_batch_atoms,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Pooled relaxation failed (%s); relaxing this pool "
+                        "one formula at a time",
+                        e,
+                    )
+                    pooled_ok = False
+                timings["candidate_relaxation_gpu"] += time.perf_counter() - started
+
+                # ---- Select ----
+                started = time.perf_counter()
+                selections: List[Tuple[int, Dict[str, Any]]] = []
+                offset = 0
+                for index, batch in batches:
+                    count = len(batch["candidates"])
+                    try:
+                        selection = ggen.relax_and_select(
+                            batch,
+                            optimize_geometry=True,
+                            refine_symmetry=True,
+                            optimization_max_steps=optimization_max_steps,
+                            optimization_fmax=fmax,
+                            optimization_optimizer=optimization_optimizer,
+                            serialize_output=False,
+                            relaxed_results=(
+                                relaxed[offset : offset + count] if pooled_ok else None
+                            ),
+                            defer_symmetry_rerelax=pooled_ok,
+                        )
+                        selections.append((index, selection))
+                    except Exception as e:
+                        results.append((index, e))
+                    finally:
+                        ggen.cleanup()
+                    offset += count
+                timings["candidate_selection"] += time.perf_counter() - started
+
+                # ---- Re-relax symmetry-refined winners together ----
+                started = time.perf_counter()
+                to_rerelax = [
+                    selection
+                    for _, selection in selections
+                    if "pending_rerelax" in selection
+                ]
+                if to_rerelax:
+                    from pymatgen.io.ase import AseAtomsAdaptor
+
+                    adaptor = AseAtomsAdaptor()
+                    try:
+                        rerelaxed: List[Any] = self._relax_pooled(
+                            [
+                                adaptor.get_atoms(selection["pending_rerelax"])
+                                for selection in to_rerelax
+                            ],
+                            min(100, optimization_max_steps),
+                            fmax,
+                            optimization_optimizer,
+                            relax_batch_atoms,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Pooled symmetry re-relaxation failed (%s); "
+                            "keeping unrefined structures",
+                            e,
+                        )
+                        rerelaxed = [None] * len(to_rerelax)
+                    for selection, result in zip(to_rerelax, rerelaxed):
+                        ggen.apply_rerelaxed(selection, result)
+                timings["symmetry_rerelaxation_gpu"] += time.perf_counter() - started
+
+                logger.debug(
+                    "Pooled %d candidates from %d formulas (%d still generating), "
+                    "RSS %.0f MiB",
+                    len(atoms_list),
+                    len(pool),
+                    len(waiting),
+                    rss_mb(),
+                )
+                yield sorted(results + selections, key=lambda item: item[0])
+        finally:
+            for future in futures:
+                future.cancel()
+            if thread_pool is not None:
+                thread_pool.shutdown(wait=False, cancel_futures=True)
+
+    def _explore_pooled(
+        self,
+        stoichs_to_generate: List[Tuple[Dict[str, int], str]],
+        previous_structures: Dict[str, CandidateResult],
+        candidates: List[CandidateResult],
+        num_successful: int,
+        num_failed: int,
+        structures_dir: Path,
+        conn: sqlite3.Connection,
+        num_trials: int,
+        symmetry_bias: float,
+        crystal_systems: Optional[List[str]],
+        space_group: Optional[int],
+        show_progress: bool,
+        keep_structures_in_memory: bool,
+        interrupted_flag,
+        compute_phonons: bool,
+        phonon_supercell: Tuple[int, int, int],
+        optimization_max_steps: int,
+        optimization_optimizer: str,
+        relax_batch_atoms: int,
+        generation_workers: int,
+        pool_formulas: int,
+    ) -> Tuple[int, int, Dict[str, float]]:
+        """Explore compound stoichiometries through the pooled pipeline.
+
+        Appends to ``candidates`` and returns updated
+        (num_successful, num_failed, stage timings).
+        """
+        timings: Dict[str, float] = {"candidate_recording": 0.0}
+        done_formulas = 0
+        for pool in self._candidate_selections(
+            formulas=[formula for _, formula in stoichs_to_generate],
+            generation_kwargs={
+                "space_group": space_group,
+                "num_trials": num_trials,
+                "multi_spacegroup": space_group is None,
+                "top_k_spacegroups": 5,
+                "symmetry_bias": symmetry_bias,
+                "crystal_systems": crystal_systems,
+            },
+            optimization_max_steps=optimization_max_steps,
+            optimization_optimizer=optimization_optimizer,
+            relax_batch_atoms=relax_batch_atoms,
+            generation_workers=generation_workers,
+            pool_formulas=pool_formulas,
+            timings=timings,
+            interrupted_flag=interrupted_flag,
+        ):
+            started = time.perf_counter()
+            for index, selection in pool:
+                stoich, formula = stoichs_to_generate[index]
+                try:
+                    if isinstance(selection, Exception):
+                        raise selection
+                    candidate = self._candidate_from_selection(
+                        stoich, formula, selection
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to generate structure for {formula}: {e}")
+                    candidate = _failed_candidate(formula, stoich, e)
+                candidate, succeeded = self._record_candidate(
+                    candidate,
+                    formula,
+                    previous_structures,
+                    structures_dir,
+                    conn,
+                    compute_phonons,
+                    phonon_supercell,
+                    show_progress,
+                    keep_structures_in_memory,
+                )
+                if succeeded:
+                    num_successful += 1
+                else:
+                    num_failed += 1
+                candidates.append(candidate)
+            timings["candidate_recording"] += time.perf_counter() - started
+
+            done_formulas += len(pool)
+            if show_progress:
+                print(
+                    f"{Colors.CYAN}[{done_formulas}/{len(stoichs_to_generate)}]"
+                    f"{Colors.RESET} stoichiometries explored",
+                    flush=True,
+                )
+            else:
+                logger.info(
+                    "[%d/%d] stoichiometries explored (latest: %s)",
+                    done_formulas,
+                    len(stoichs_to_generate),
+                    ", ".join(stoichs_to_generate[index][1] for index, _ in pool[-3:]),
+                )
+
+        return num_successful, num_failed, timings
+
+    def _generate_terminal_elements_pooled(
+        self,
+        elements: List[str],
+        num_trials: int,
+        symmetry_bias: float,
+        optimization_max_steps: int,
+        optimization_optimizer: str,
+        relax_batch_atoms: int,
+        generation_workers: int,
+        pool_formulas: int,
+    ) -> List[CandidateResult]:
+        """Pooled counterpart of :meth:`_generate_terminal_elements`.
+
+        Every element's 1-, 2- and 4-atom cells are proposed and relaxed
+        together; the lowest energy per atom wins for each element.
+        """
+        cells = [(element, n) for element in elements for n in (1, 2, 4)]
+        formulas = [f"{element}{n if n > 1 else ''}" for element, n in cells]
+        best: Dict[str, CandidateResult] = {}
+        for pool in self._candidate_selections(
+            formulas=formulas,
+            generation_kwargs={
+                "num_trials": num_trials,
+                "multi_spacegroup": True,
+                "top_k_spacegroups": 5,
+                "symmetry_bias": symmetry_bias,
+                # Elements must be free to find their natural structure
+                "crystal_systems": None,
+            },
+            optimization_max_steps=optimization_max_steps,
+            optimization_optimizer=optimization_optimizer,
+            relax_batch_atoms=relax_batch_atoms,
+            generation_workers=generation_workers,
+            pool_formulas=pool_formulas,
+            timings={},
+        ):
+            for index, selection in pool:
+                element, _ = cells[index]
+                if isinstance(selection, Exception):
+                    logger.warning(f"Failed to generate {formulas[index]}: {selection}")
+                    continue
+                structure = selection["structure"]
+                energy = selection["best_crystal_energy"]
+                candidate = CandidateResult(
+                    formula=element,  # Use element symbol as formula for terminals
+                    stoichiometry={element: 1},  # Normalized to 1 atom
+                    energy_per_atom=energy / len(structure),
+                    total_energy=energy,
+                    num_atoms=len(structure),
+                    space_group_number=selection["final_space_group"],
+                    space_group_symbol=selection["final_space_group_symbol"],
+                    structure=structure,
+                    generation_metadata={
+                        "is_terminal": True,
+                        "original_formula": formulas[index],
+                    },
+                )
+                if (
+                    element not in best
+                    or candidate.energy_per_atom < best[element].energy_per_atom
+                ):
+                    best[element] = candidate
+
+        for element in elements:
+            if element in best:
+                logger.info(
+                    f"Terminal {element}: E={best[element].energy_per_atom:.4f} "
+                    f"eV/atom, SG={best[element].space_group_symbol}"
+                )
+            else:
+                logger.error(f"Failed to generate any structure for element {element}")
+        return [best[element] for element in elements if element in best]
+
+    def _relax_pooled(
+        self,
+        atoms_list: List[Any],
+        max_steps: int,
+        fmax: float,
+        optimization_optimizer: str,
+        relax_batch_atoms: int,
+    ) -> List[Tuple[Structure, float, int, float]]:
+        """Relax a mixed pool of structures, streaming them through the GPU.
+
+        On a CUDA out-of-memory error the atom budget is halved and the pool
+        retried; the smaller budget is remembered for later pools. The error is
+        raised once the budget cannot shrink further.
+        """
+        budget = min(relax_batch_atoms, self._relax_batch_atoms_cap or relax_batch_atoms)
+        while True:
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore", message="Optimize has reached max steps"
+                    )
+                    return self.ggen.relax_atoms(
+                        atoms_list,
+                        max_steps=max_steps,
+                        fmax=fmax,
+                        optimization_optimizer=optimization_optimizer,
+                        batch_atoms=budget,
+                    )
+            except Exception as e:
+                out_of_memory = isinstance(
+                    e, torch.cuda.OutOfMemoryError
+                ) or "out of memory" in str(e).lower()
+                if not out_of_memory or budget <= _MIN_RELAX_BATCH_ATOMS:
+                    raise
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                budget = max(_MIN_RELAX_BATCH_ATOMS, budget // 2)
+                self._relax_batch_atoms_cap = budget
+                logger.warning(
+                    "Pooled relaxation ran out of GPU memory; retrying with "
+                    "relax_batch_atoms=%d",
+                    budget,
+                )
+
     # -------------------- Main Exploration Method --------------------
 
     def explore(
@@ -1616,6 +2200,10 @@ class ChemistryExplorer:
         max_fraction: Optional[Dict[str, float]] = None,
         optimization_max_steps: int = 400,
         optimization_optimizer: str = "fire",
+        reuse_terminals: bool = True,
+        relax_batch_atoms: Optional[Union[int, str]] = "auto",
+        generation_workers: int = 2,
+        pool_formulas: int = 32,
     ) -> ExplorationResult:
         """Explore a chemical system by generating candidate structures.
 
@@ -1692,12 +2280,24 @@ class ChemistryExplorer:
             optimization_max_steps: Max steps for geometry optimization. Default: 400.
             optimization_optimizer: Optimizer used for torch-sim batched relaxation.
                 Common values: "fire", "lbfgs". Default: "fire".
+            reuse_terminals: If True (default), an element whose reference structure
+                is already known (unified database or previous runs) with a plausible
+                energy is reused instead of searched again. Set False to search every
+                element afresh; the lower-energy reference is kept either way.
+            relax_batch_atoms: Atom budget for pooled relaxation. Candidates from
+                many stoichiometries stream through one GPU batch holding about this
+                many atoms, instead of one small batch per stoichiometry. "auto"
+                (default) sizes the budget to the GPU's memory. None relaxes each
+                stoichiometry separately. Ignored with
+                preserve_symmetry, optimize=False, or num_workers > 1.
+            generation_workers: CPU processes proposing candidates for pooled
+                relaxation. 0 uses one background thread.
+            pool_formulas: Stoichiometries pooled per relaxation call. Results are
+                saved after each pool, so this is also the checkpoint granularity.
 
         Returns:
             ExplorationResult with all candidates, phase diagram, and stable phases.
         """
-        import time
-
         # Suppress pymatgen CIF parsing warnings
         warnings.filterwarnings(
             "ignore", category=UserWarning, module="pymatgen.core.structure"
@@ -1710,6 +2310,9 @@ class ChemistryExplorer:
         warnings.filterwarnings(
             "ignore", category=UserWarning, module="orb_models.utils"
         )
+
+        if relax_batch_atoms == "auto":
+            relax_batch_atoms = default_relax_batch_atoms()
 
         start_time = time.time()
         stage_started = time.perf_counter()
@@ -1901,8 +2504,9 @@ class ChemistryExplorer:
                 )
 
         if max_stoichiometries and len(stoichiometries) > max_stoichiometries:
-            # Randomly sample stoichiometries
-            indices = self.rng.choice(
+            # Randomly sample stoichiometries. A per-call generator keeps the
+            # subset the same for every seeded explore of the same system.
+            indices = np.random.default_rng(self.random_seed).choice(
                 len(stoichiometries), size=max_stoichiometries, replace=False
             )
             stoichiometries = [stoichiometries[i] for i in indices]
@@ -1992,6 +2596,35 @@ class ChemistryExplorer:
                     optimization_max_steps=optimization_max_steps,
                     optimization_optimizer=optimization_optimizer,
                 )
+            elif relax_batch_atoms and optimize and not preserve_symmetry:
+                (
+                    num_successful,
+                    num_failed,
+                    pooled_timings,
+                ) = self._explore_pooled(
+                    stoichs_to_generate=stoichs_to_generate,
+                    previous_structures=previous_structures,
+                    candidates=candidates,
+                    num_successful=num_successful,
+                    num_failed=num_failed,
+                    structures_dir=structures_dir,
+                    conn=conn,
+                    num_trials=num_trials,
+                    symmetry_bias=symmetry_bias,
+                    crystal_systems=crystal_systems,
+                    space_group=space_group,
+                    show_progress=show_progress,
+                    keep_structures_in_memory=keep_structures_in_memory,
+                    interrupted_flag=lambda: interrupted,
+                    compute_phonons=compute_phonons,
+                    phonon_supercell=phonon_supercell,
+                    optimization_max_steps=optimization_max_steps,
+                    optimization_optimizer=optimization_optimizer,
+                    relax_batch_atoms=relax_batch_atoms,
+                    generation_workers=generation_workers,
+                    pool_formulas=pool_formulas,
+                )
+                stage_timings.update(pooled_timings)
             else:
                 # Sequential relaxation, pipelined with generation: while the
                 # GPU relaxes one stoichiometry's batch, a background thread
@@ -2065,51 +2698,21 @@ class ChemistryExplorer:
                                 "energy_eval_seconds", 0.0
                             ) + relax_stats.get("relaxation_seconds", 0.0)
 
-                        # If we have a previous structure and this one failed or is worse, use the previous
-                        if formula in previous_structures:
-                            prev_candidate = previous_structures[formula]
-                            if not candidate.is_valid or (
-                                prev_candidate.is_valid
-                                and prev_candidate.energy_per_atom
-                                < candidate.energy_per_atom
-                            ):
-                                logger.debug(
-                                    f"Using better structure from previous run for {formula} "
-                                    f"(prev={prev_candidate.energy_per_atom:.4f} vs "
-                                    f"new={candidate.energy_per_atom:.4f} eV/atom)"
-                                )
-                                candidate = prev_candidate
-                                candidate.generation_metadata["reused_from_previous"] = True
-
-                        if candidate.is_valid:
-                            # Load structure if needed (lazy loading from database)
-                            structure = candidate.get_structure()
-                            if structure is not None:
-                                # Save CIF
-                                cif_path = self._save_structure_cif(candidate, structures_dir)
-                                candidate.cif_path = cif_path
-                                num_successful += 1
-
-                                # Calculate phonon stability if enabled
-                                if compute_phonons:
-                                    self._calculate_phonon_stability(
-                                        candidate,
-                                        supercell=phonon_supercell,
-                                        show_progress=show_progress,
-                                    )
-
-                                # Clear structure from memory if not needed
-                                if not keep_structures_in_memory:
-                                    candidate.clear_structure()
-                                # Remove stored structure reference to free memory
-                                candidate.generation_metadata.pop("_stored_structure", None)
-                            else:
-                                num_failed += 1
+                        candidate, succeeded = self._record_candidate(
+                            candidate,
+                            formula,
+                            previous_structures,
+                            structures_dir,
+                            conn,
+                            compute_phonons,
+                            phonon_supercell,
+                            show_progress,
+                            keep_structures_in_memory,
+                        )
+                        if succeeded:
+                            num_successful += 1
                         else:
                             num_failed += 1
-
-                        # Save to database
-                        self._save_candidate(conn, candidate)
                         candidates.append(candidate)
 
                         if (i + 1) % 5 == 0 or i == 0:
@@ -2159,6 +2762,27 @@ class ChemistryExplorer:
                 f"({num_reused} from previous runs)"
             )
 
+        # Best known elemental reference per element, kept before the rest of
+        # previous_structures is released
+        previous_terminals: Dict[str, CandidateResult] = {}
+        for prev in previous_structures.values():
+            if not prev.is_valid or len(prev.stoichiometry) != 1:
+                continue
+            if prev.energy_per_atom is None or np.isnan(prev.energy_per_atom):
+                continue
+            (element,) = prev.stoichiometry
+            best = previous_terminals.get(element)
+            if best is None or prev.energy_per_atom < best.energy_per_atom:
+                previous_terminals[element] = prev
+        for element, prev in previous_terminals.items():
+            # Hull entries need the reference normalized to one atom
+            previous_terminals[element] = replace(
+                prev,
+                formula=element,
+                stoichiometry={element: 1},
+                generation_metadata={**prev.generation_metadata, "is_terminal": True},
+            )
+
         # Clear previous_structures to free memory now that all processing is complete
         previous_structures.clear()
         gc.collect()
@@ -2171,8 +2795,9 @@ class ChemistryExplorer:
             stage_timings["candidate_relaxation_gpu"] = relaxation_gpu_seconds
         stage_started = time.perf_counter()
 
-        # Generate terminal element structures for phase diagram (unless interrupted)
-        # Always generate fresh terminals and compare with previous runs to get the best
+        # Terminal element structures for the phase diagram (unless interrupted).
+        # Known references are reused; the rest are searched and compared with any
+        # previous reference to keep the best.
         terminal_candidates = []
 
         # Sanity bounds for terminal element energies (eV/atom)
@@ -2185,17 +2810,57 @@ class ChemistryExplorer:
             return MIN_REASONABLE_ENERGY <= energy <= MAX_REASONABLE_ENERGY
 
         if not interrupted:
-            logger.info(f"Generating terminal element structures for {elements}")
-            new_terminals = self._generate_terminal_elements(
-                elements=elements,
-                num_trials=num_trials,
-                optimize=optimize,
-                symmetry_bias=symmetry_bias,
-                preserve_symmetry=preserve_symmetry,
-                show_progress=show_progress,
-                optimization_max_steps=optimization_max_steps,
-                optimization_optimizer=optimization_optimizer,
-            )
+            elements_to_generate = list(elements)
+            if reuse_terminals:
+                elements_to_generate = []
+                for element in elements:
+                    prev_terminal = previous_terminals.get(element)
+                    if (
+                        prev_terminal is not None
+                        and _is_reasonable_terminal_energy(prev_terminal.energy_per_atom)
+                        and prev_terminal.get_structure() is not None
+                    ):
+                        logger.info(
+                            f"Reusing terminal {element}: "
+                            f"E={prev_terminal.energy_per_atom:.4f} eV/atom, "
+                            f"SG={prev_terminal.space_group_symbol}"
+                        )
+                        prev_terminal.generation_metadata["reused_from_previous"] = True
+                        terminal_candidates.append(prev_terminal)
+                    else:
+                        elements_to_generate.append(element)
+
+            if elements_to_generate:
+                logger.info(
+                    f"Generating terminal element structures for {elements_to_generate}"
+                )
+            if (
+                relax_batch_atoms
+                and optimize
+                and not preserve_symmetry
+                and num_workers <= 1
+            ):
+                new_terminals = self._generate_terminal_elements_pooled(
+                    elements=elements_to_generate,
+                    num_trials=num_trials,
+                    symmetry_bias=symmetry_bias,
+                    optimization_max_steps=optimization_max_steps,
+                    optimization_optimizer=optimization_optimizer,
+                    relax_batch_atoms=relax_batch_atoms,
+                    generation_workers=generation_workers,
+                    pool_formulas=pool_formulas,
+                )
+            else:
+                new_terminals = self._generate_terminal_elements(
+                    elements=elements_to_generate,
+                    num_trials=num_trials,
+                    optimize=optimize,
+                    symmetry_bias=symmetry_bias,
+                    preserve_symmetry=preserve_symmetry,
+                    show_progress=show_progress,
+                    optimization_max_steps=optimization_max_steps,
+                    optimization_optimizer=optimization_optimizer,
+                )
 
             # Compare with previous runs and keep the better terminal
             # But reject terminals with obviously wrong energies
@@ -2204,8 +2869,8 @@ class ChemistryExplorer:
                 new_energy = new_terminal.energy_per_atom
                 new_reasonable = _is_reasonable_terminal_energy(new_energy)
 
-                if element in previous_structures:
-                    prev_terminal = previous_structures[element]
+                if element in previous_terminals:
+                    prev_terminal = previous_terminals[element]
                     prev_energy = prev_terminal.energy_per_atom
                     prev_reasonable = _is_reasonable_terminal_energy(prev_energy)
 
@@ -2264,6 +2929,7 @@ class ChemistryExplorer:
                     self._save_candidate(conn, terminal)
                     if not keep_structures_in_memory:
                         terminal.clear_structure()
+                    terminal.generation_metadata.pop("_stored_structure", None)
 
         stage_timings["terminal_generation"] = time.perf_counter() - stage_started
         stage_started = time.perf_counter()

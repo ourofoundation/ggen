@@ -10,7 +10,8 @@ import math
 import os
 import time
 import warnings
-from dataclasses import dataclass
+import zlib
+from dataclasses import dataclass, field
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -62,6 +63,45 @@ _PYXTAL_GROUPS_BY_NUMBER: Optional[Dict[int, Group]] = None
 
 
 # ===================== Helper utilities =====================
+
+
+def _share_default_pyxtal_tolerances() -> None:
+    """Make pyxtal reuse its default tolerance matrix instead of rebuilding it.
+
+    ``pyxtal.operations.check_distance`` builds ``Tol_matrix(prototype="atomic")``
+    on every call that is not handed one, which its Wyckoff-merge path never
+    does. Each build loops over every element pair in Python (~3 ms) and that
+    was over half of candidate generation time. The matrix is only read, so
+    one shared instance per (prototype, factor) gives identical results.
+    """
+    import pyxtal.operations as pyxtal_operations
+
+    original = pyxtal_operations.Tol_matrix
+    if getattr(original, "_ggen_shared", False):
+        return
+    shared: Dict[Tuple[str, float], Any] = {}
+
+    def shared_tol_matrix(*tuples, prototype="atomic", factor=1.0):
+        if tuples:
+            return original(*tuples, prototype=prototype, factor=factor)
+        key = (prototype, factor)
+        if key not in shared:
+            shared[key] = original(prototype=prototype, factor=factor)
+        return shared[key]
+
+    shared_tol_matrix._ggen_shared = True
+    pyxtal_operations.Tol_matrix = shared_tol_matrix
+
+
+_share_default_pyxtal_tolerances()
+
+
+@lru_cache(maxsize=1)
+def _default_tolerance_matrix():
+    """pyxtal's default atomic tolerance matrix, built once per process."""
+    from pyxtal.tolerance import Tol_matrix
+
+    return Tol_matrix(prototype="atomic", factor=1.0)
 
 
 def _get_pyxtal_groups_by_number() -> Dict[int, Group]:
@@ -374,6 +414,60 @@ def get_structure_fingerprint(structure: Structure) -> np.ndarray:
     return features
 
 
+@dataclass
+class Candidate:
+    """A proposed crystal awaiting relaxation.
+
+    This is the hand-off between whatever proposes structures (random PyXtal
+    sampling today; prototype substitution, mutation, ... later) and the
+    relaxation/selection stages, which only need the atoms and a little
+    provenance. It pickles cheaply, so proposals can come from other processes.
+    """
+
+    atoms: Any  # ase.Atoms
+    space_group_number: int
+    space_group_symbol: str
+    num_wyckoff_sites: int
+    source: str = "pyxtal_random"
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_pyxtal(cls, crystal: pyxtal) -> "Candidate":
+        return cls(
+            atoms=crystal.to_ase(),
+            space_group_number=int(crystal.group.number),
+            space_group_symbol=str(crystal.group.symbol),
+            num_wyckoff_sites=len(crystal.atom_sites),
+        )
+
+    def to_ase(self):
+        return self.atoms.copy()
+
+    def to_pymatgen(self) -> Structure:
+        return AseAtomsAdaptor().get_structure(self.atoms)
+
+
+class _InFlightBatcher(ts.InFlightAutoBatcher):
+    """In-flight autobatcher whose per-system iteration cap cannot be overwritten.
+
+    ``ts.optimize`` resets ``max_iterations`` from its *global* ``max_steps``,
+    and once that global count is exceeded it takes one step per swap instead
+    of ``steps_between_swaps``. When a pool larger than one GPU batch streams
+    through, that starves late systems of steps. Pinning the cap here lets the
+    caller pass an effectively unlimited global ``max_steps`` while every
+    system still gets exactly its own step budget.
+    """
+
+    @property
+    def max_iterations(self):
+        return self._pinned_max_iterations
+
+    @max_iterations.setter
+    def max_iterations(self, value):
+        if not hasattr(self, "_pinned_max_iterations"):
+            self._pinned_max_iterations = value
+
+
 # ===================== GGen =====================
 
 
@@ -396,7 +490,10 @@ class GGen:
             device: Device to use for calculator ('cpu' or 'cuda'). If None, automatically
                 detects CUDA availability and uses it if available. Only used when calculator is None.
         """
-        self.calculator = calculator or get_orb_calculator(device=device)
+        # Loaded on first use, so CPU-only users (e.g. candidate-generation
+        # worker processes) never pay for the model.
+        self._calculator = calculator
+        self._calculator_device = device
         self.random_seed = random_seed
         self.rng = np.random.default_rng(random_seed)
 
@@ -414,6 +511,16 @@ class GGen:
             "random_seed": random_seed,
             "total_frames": 0,
         }
+
+    @property
+    def calculator(self):
+        if self._calculator is None:
+            self._calculator = get_orb_calculator(device=self._calculator_device)
+        return self._calculator
+
+    @calculator.setter
+    def calculator(self, value) -> None:
+        self._calculator = value
 
     def cleanup(self) -> None:
         """Clean up internal state to free memory.
@@ -433,8 +540,34 @@ class GGen:
     def _get_torchsim_model(self):
         """Return a cached TorchSim wrapper for the current calculator."""
         if self._torchsim_model is None:
-            self._torchsim_model = build_orb_torchsim_model(self.calculator)
+            # Kept on the calculator too, so every GGen sharing one calculator
+            # (e.g. a fresh explorer per scouted system) shares one wrapper.
+            calculator = self.calculator
+            model = getattr(calculator, "_ggen_torchsim_model", None)
+            if model is None:
+                model = build_orb_torchsim_model(calculator)
+                try:
+                    calculator._ggen_torchsim_model = model
+                except AttributeError:
+                    pass
+            self._torchsim_model = model
         return self._torchsim_model
+
+    def _derive_rng(self, *key: Any) -> np.random.Generator:
+        """Return an RNG for one sampling decision, keyed by ``key``.
+
+        With a ``random_seed`` the stream depends only on the seed and the key
+        (e.g. formula, space group, trial index), so results are reproducible
+        regardless of the order or thread in which decisions are made, and
+        distinct keys draw distinct structures. Without a seed it is fresh
+        entropy.
+        """
+        if self.random_seed is None:
+            return np.random.default_rng()
+        words = [zlib.crc32(str(k).encode()) for k in key]
+        return np.random.default_rng(
+            np.random.SeedSequence([int(self.random_seed), *words])
+        )
 
     # -------------------- Space-group utilities --------------------
 
@@ -597,7 +730,7 @@ class GGen:
 
     def _score_crystal(
         self,
-        crystal: pyxtal,
+        crystal: Candidate,
         energy: float,
         symmetry_weight: float = 0.1,
         wyckoff_weight: float = 0.01,
@@ -607,7 +740,7 @@ class GGen:
         Lower scores are better.
 
         Args:
-            crystal: PyXtal crystal object
+            crystal: Candidate structure
             energy: Calculated energy (eV)
             symmetry_weight: Weight for symmetry bonus (higher SG = lower score)
             wyckoff_weight: Penalty per unique Wyckoff site
@@ -619,11 +752,11 @@ class GGen:
         energy_score = energy
 
         # Symmetry bonus: higher SG number generally means higher symmetry
-        sg_number = crystal.group.number
+        sg_number = crystal.space_group_number
         symmetry_bonus = -sg_number * symmetry_weight
 
         # Wyckoff efficiency: fewer unique sites = more symmetric/simpler
-        num_wyckoff_sites = len(crystal.atom_sites)
+        num_wyckoff_sites = crystal.num_wyckoff_sites
         wyckoff_penalty = num_wyckoff_sites * wyckoff_weight
 
         total_score = energy_score + symmetry_bonus + wyckoff_penalty
@@ -691,6 +824,7 @@ class GGen:
         compatible_groups: List[Dict[str, Any]],
         top_k: int = 5,
         symmetry_bias: float = 0.0,
+        rng: Optional[np.random.Generator] = None,
     ) -> List[int]:
         """Select top K space groups with configurable symmetry preference.
 
@@ -701,6 +835,8 @@ class GGen:
                 0.0 = sample uniformly across crystal systems (above monoclinic)
                 1.0 = prioritize highest-symmetry space groups
                 Default: 0.0
+            rng: Generator used for sampling. Defaults to one seeded from
+                ``random_seed``.
 
         Returns:
             List of space group numbers
@@ -747,7 +883,8 @@ class GGen:
         low_priority_systems = ["triclinic", "monoclinic"]
 
         selected = []
-        rng = np.random.default_rng(self.random_seed)
+        if rng is None:
+            rng = np.random.default_rng(self.random_seed)
 
         # First pass: one from each priority system that has compatible groups
         for system in priority_systems:
@@ -1269,73 +1406,49 @@ class GGen:
 
         return getattr(ts.Optimizer, normalized)
 
-    def _relax_candidates_batched(
+    def relax_atoms(
         self,
-        candidates: List[pyxtal],
+        atoms_list: List[Any],
         max_steps: int = 400,
         fmax: float = 0.02,
-        show_progress: bool = False,
         optimization_optimizer: str = "fire",
+        batch_atoms: Optional[int] = None,
+        show_progress: bool = False,
     ) -> List[Tuple[Structure, float, int, float]]:
-        """Relax multiple candidates in parallel using torch-sim.
+        """Relax ASE structures on the GPU with torch-sim, in input order.
 
-        This method uses torch-sim's batched GPU optimization to relax all
-        candidates simultaneously, providing significant speedup over sequential
-        relaxation.
+        The structures need not share a formula: this is the shared relaxation
+        stage for any mix of candidates.
 
         Args:
-            candidates: List of PyXtal crystal objects to relax.
+            atoms_list: ASE Atoms to relax.
             max_steps: Maximum optimization steps per structure.
             fmax: Force convergence criterion (eV/Å).
-            show_progress: Whether to show progress bar.
+            optimization_optimizer: torch-sim optimizer name.
+            batch_atoms: Atoms held on the GPU at once. When the pool is larger,
+                structures stream through: each converged (or step-capped) one
+                is swapped for a waiting one, keeping the GPU full. None puts
+                the whole pool in one batch.
+            show_progress: Whether to show a progress bar.
 
         Returns:
-            List of (relaxed_structure, final_energy, steps, final_fmax) tuples.
+            One (relaxed_structure, final_energy, steps, final_fmax) per input.
+            ``final_fmax`` is torch-sim's last-step ``system_wise_max_force``,
+            which matches the convergence criterion without another forward
+            pass. ``steps`` is the cap, as torch-sim does not report
+            per-structure step counts.
 
-            Note: ``final_fmax`` comes from torch-sim's last-step forces
-            (``system_wise_max_force``), matching the convergence criterion and
-            avoiding a second ORB forward pass per trial.
+        Raises:
+            Whatever torch-sim raises; callers decide how to fall back.
         """
-        if not candidates:
+        if not atoms_list:
             return []
-
-        mem_trace = os.environ.get("GGEN_MEM_TRACE", "0") == "1"
-        rss_start = rss_mb()
-        if mem_trace:
-            logger.info(
-                "[mem] batched relax start: %d candidates RSS=%.0f MiB",
-                len(candidates),
-                rss_start,
-            )
-        else:
-            logger.debug(
-                "Batched relax start: %d candidates, RSS=%.0f MiB",
-                len(candidates),
-                rss_start,
-            )
-
-        # Keep large intermediates in locals so we can force-drop references in finally.
-        atoms_list = None
-        ts_model = None
-        ts_state = None
-        final_state = None
-        final_atoms_list = None
-        energies = None
-        fmaxes = None
-
-        # Convert candidates to ASE atoms
-        atoms_list = [c.to_ase() for c in candidates]
-        if mem_trace:
-            logger.info("[mem] after to_ase list: RSS=%.0f MiB", rss_mb())
 
         # Reuse the calculator's ORB runtime config so batched relaxation follows
         # the same adapter and edge-construction path as direct ASE evaluation.
-        # Keep the wrapper cached on the GGen instance; rebuilding it for every
-        # stoichiometry can add overhead and retain extra Torch/TorchSim state.
+        # The wrapper is cached on the GGen instance; rebuilding it per call adds
+        # overhead and can retain extra Torch/TorchSim state.
         ts_model = self._get_torchsim_model()
-        if mem_trace:
-            logger.info("[mem] after ORB TorchSim init: RSS=%.0f MiB", rss_mb())
-
         ts_device = getattr(
             ts_model,
             "device",
@@ -1343,73 +1456,107 @@ class GGen:
         )
         ts_dtype = getattr(ts_model, "dtype", torch.get_default_dtype())
         ts_state = _atoms_to_torchsim_state_with_charge_spin(
-            atoms_list,
-            ts_device,
-            ts_dtype,
+            atoms_list, ts_device, ts_dtype
         )
 
-        # Run batched optimization
+        # autobatcher=False puts every system in one batch and skips torch-sim's
+        # slow OOM-probe memory estimation; converged systems are still dropped
+        # from the active batch. With batch_atoms the same hot-swapping refills
+        # the batch from the waiting pool, capped by atom count.
+        steps_between_swaps = 5
+        autobatcher: Any = False
+        optimize_max_steps = max_steps
+        total_atoms = sum(len(atoms) for atoms in atoms_list)
+        if batch_atoms and total_atoms > batch_atoms:
+            largest = max(len(atoms) for atoms in atoms_list)
+            autobatcher = _InFlightBatcher(
+                model=ts_model,
+                memory_scales_with="n_atoms",
+                max_memory_scaler=float(max(batch_atoms, largest)),
+                max_iterations=max(1, max_steps // steps_between_swaps),
+            )
+            # The per-structure cap lives on the autobatcher
+            optimize_max_steps = 10**9
+
         logger.debug(
-            "Starting batched relaxation of %d candidates using torch-sim (device=%s)",
+            "Relaxing %d structures (%d atoms, batch_atoms=%s) with torch-sim on %s",
             len(atoms_list),
+            total_atoms,
+            batch_atoms,
             ts_state.device,
         )
+        final_state = ts.optimize(
+            system=ts_state,
+            model=ts_model,
+            optimizer=self._resolve_torchsim_optimizer(optimization_optimizer),
+            max_steps=optimize_max_steps,
+            steps_between_swaps=steps_between_swaps,
+            autobatcher=autobatcher,
+            init_kwargs={"cell_filter": ts.CellFilter.frechet},
+            convergence_fn=ts.generate_force_convergence_fn(force_tol=fmax),
+            pbar={"leave": False} if show_progress else False,
+        )
 
-        # Use configured optimizer with cell filter and force convergence.
-        # autobatcher=False skips the slow OOM-probe memory estimation; our
-        # batches (≲15 × ≲20-atom cells) always fit on an A10G, and torch-sim
-        # still hot-swaps converged systems out of the active batch.
-        try:
-            optimizer = self._resolve_torchsim_optimizer(optimization_optimizer)
-            final_state = ts.optimize(
-                system=ts_state,
-                model=ts_model,
-                optimizer=optimizer,
-                max_steps=max_steps,
-                autobatcher=False,
-                init_kwargs={"cell_filter": ts.CellFilter.frechet},
-                convergence_fn=ts.generate_force_convergence_fn(force_tol=fmax),
-                pbar={"leave": False} if show_progress else False,
+        final_atoms_list = final_state.to_atoms()
+        energies = final_state.energy.detach().cpu().numpy()
+        fmaxes = ts.system_wise_max_force(final_state).detach().cpu().numpy()
+        return [
+            (
+                _atoms_to_structure_wrapped(atoms),
+                float(energies[i]),
+                max_steps,
+                float(fmaxes[i]),
             )
-            if mem_trace:
-                logger.info("[mem] after ts.optimize: RSS=%.0f MiB", rss_mb())
+            for i, atoms in enumerate(final_atoms_list)
+        ]
 
-            # Extract results
-            results = []
-            final_atoms_list = final_state.to_atoms()
-            if mem_trace:
-                logger.info("[mem] after final_state.to_atoms: RSS=%.0f MiB", rss_mb())
-            energies = final_state.energy.detach().cpu().numpy()
-            fmaxes = ts.system_wise_max_force(final_state).detach().cpu().numpy()
-            if mem_trace:
-                logger.info(
-                    "[mem] after energy/fmax detach/cpu/numpy: RSS=%.0f MiB", rss_mb()
-                )
+    def _relax_candidates_batched(
+        self,
+        candidates: List[Candidate],
+        max_steps: int = 400,
+        fmax: float = 0.02,
+        show_progress: bool = False,
+        optimization_optimizer: str = "fire",
+    ) -> List[Tuple[Structure, float, int, float]]:
+        """Relax one batch of candidates with torch-sim, falling back to ASE.
 
-            for i, atoms in enumerate(final_atoms_list):
-                structure = _atoms_to_structure_wrapped(atoms)
-                energy = float(energies[i])
-                final_fmax = float(fmaxes[i])
-                # torch-sim batched optimization doesn't track per-structure steps
-                # Use max_steps as upper bound estimate
-                steps = max_steps
-                results.append((structure, energy, steps, final_fmax))
+        Args:
+            candidates: Candidates to relax.
+            max_steps: Maximum optimization steps per structure.
+            fmax: Force convergence criterion (eV/Å).
+            show_progress: Whether to show progress bar.
 
-                # Log if didn't converge
+        Returns:
+            List of (relaxed_structure, final_energy, steps, final_fmax) tuples.
+        """
+        if not candidates:
+            return []
+
+        mem_trace = os.environ.get("GGEN_MEM_TRACE", "0") == "1"
+        rss_start = rss_mb()
+        log_mem = logger.info if mem_trace else logger.debug
+        log_mem(
+            "[mem] batched relax start: %d candidates RSS=%.0f MiB",
+            len(candidates),
+            rss_start,
+        )
+
+        try:
+            results = self.relax_atoms(
+                [c.to_ase() for c in candidates],
+                max_steps=max_steps,
+                fmax=fmax,
+                optimization_optimizer=optimization_optimizer,
+                show_progress=show_progress,
+            )
+            for i, (_, _, _, final_fmax) in enumerate(results):
                 if final_fmax > fmax:
                     # In batched mode we don't know exact steps or why it stopped
-                    msg = f"Trial {i + 1}/{len(final_atoms_list)} did not converge (batched): fmax={final_fmax:.4f}"
+                    msg = f"Trial {i + 1}/{len(results)} did not converge (batched): fmax={final_fmax:.4f}"
                     if show_progress:
                         tqdm.write(msg)
                     else:
                         logger.info(msg)
-
-            logger.debug(
-                "Batched relaxation complete. Energies: min=%.4f, max=%.4f eV",
-                min(energies),
-                max(energies),
-            )
-
             return results
 
         except Exception as e:
@@ -1427,38 +1574,20 @@ class GGen:
                 candidates, max_steps, fmax, show_progress
             )
         finally:
-            # Explicitly break references to large torch-sim/PyTorch objects.
-            # Keep compile caches warm across stoichiometries; long exploration runs
-            # have seen OOM kills, but resetting Dynamo/Inductor here also forces
-            # recompilation on the next batch and likely leaves performance on the table.
-            # If OOMs persist, prefer targeted recovery on error or periodic worker
-            # recycling over clearing compile state after every successful batch.
-            fmaxes = None
-            energies = None
-            final_atoms_list = None
-            final_state = None
-            ts_state = None
-            ts_model = None
-            atoms_list = None
+            # Drop task-local Python objects, but keep compile caches and the
+            # CUDA allocator warm across batches: resetting Dynamo/Inductor here
+            # would force recompilation on the next batch. If OOMs persist,
+            # prefer targeted recovery on error or periodic worker recycling.
             gc.collect()
-            rss_end = rss_mb()
-            if mem_trace:
-                logger.info(
-                    "[mem] batched relax cleanup: RSS %.0f -> %.0f MiB (delta %+0.f)",
-                    rss_start,
-                    rss_end,
-                    rss_end - rss_start,
-                )
-            else:
-                logger.debug(
-                    "Batched relax cleanup: RSS %.0f -> %.0f MiB",
-                    rss_start,
-                    rss_end,
-                )
+            log_mem(
+                "[mem] batched relax cleanup: RSS %.0f -> %.0f MiB",
+                rss_start,
+                rss_mb(),
+            )
 
     def _relax_candidates_sequential(
         self,
-        candidates: List[pyxtal],
+        candidates: List[Candidate],
         max_steps: int = 400,
         fmax: float = 0.02,
         show_progress: bool = False,
@@ -1615,7 +1744,7 @@ class GGen:
 
     def _relax_candidates(
         self,
-        candidates: List[pyxtal],
+        candidates: List[Candidate],
         max_steps: int = 200,
         fmax: float = 0.02,
         show_progress: bool = False,
@@ -1833,7 +1962,7 @@ class GGen:
             show_progress: If True, show a tqdm progress bar during generation.
 
         Returns:
-            Batch dict with the candidate pyxtal objects, selected space
+            Batch dict with the :class:`Candidate` list, selected space
             groups, and generation statistics.
 
         Raises:
@@ -1941,7 +2070,10 @@ class GGen:
         elif multi_spacegroup:
             # Try multiple space groups with configurable symmetry preference
             target_space_groups = self._select_top_space_groups(
-                compatible, top_k=top_k_spacegroups, symmetry_bias=symmetry_bias
+                compatible,
+                top_k=top_k_spacegroups,
+                symmetry_bias=symmetry_bias,
+                rng=self._derive_rng(formula, "space_groups"),
             )
             was_randomly_selected = True
             logger.debug(
@@ -1964,7 +2096,7 @@ class GGen:
             )
 
         # Generate crystals across all target space groups
-        candidate_list: List[Tuple[pyxtal, int]] = []
+        candidate_list: List[Tuple[Candidate, int]] = []
         generation_stats = {
             "total_attempts": 0,
             "valid_pyxtal": 0,
@@ -2013,17 +2145,22 @@ class GGen:
             sg_stats["attempts"] += 1
 
             # Generate random crystal
+            # pyxtal's atomic generator ignores ``seed``; only ``random_state``
+            # reaches its RNG. Each trial gets its own stream so trials differ
+            # from each other but repeat exactly under the same random_seed.
             c = pyxtal()
             try:
                 c.from_random(
                     dim=3,
-                    group=sg_number,
+                    # The cached Group saves rebuilding its Wyckoff tables per trial
+                    group=_get_pyxtal_groups_by_number()[sg_number],
                     species=elements,
                     numIons=counts,
-                    seed=self.random_seed,
+                    random_state=self._derive_rng(formula, sg_number, trial_idx),
+                    tm=_default_tolerance_matrix(),
                 )
             except TypeError:
-                # Older pyxtal versions may not accept seed
+                # Older pyxtal versions may not accept random_state
                 c.from_random(dim=3, group=sg_number, species=elements, numIons=counts)
 
             if not c.valid:
@@ -2078,7 +2215,7 @@ class GGen:
 
             # Energy evaluation is deferred to relax_and_select, which scores
             # all candidates in a single batched GPU forward pass.
-            candidate_list.append((c, sg_number))
+            candidate_list.append((Candidate.from_pyxtal(c), sg_number))
 
         generation_stats["trial_generation_seconds"] = (
             time.perf_counter() - trial_generation_started
@@ -2112,7 +2249,7 @@ class GGen:
         }
 
     def _evaluate_candidates_batched(
-        self, candidates: List[pyxtal]
+        self, candidates: List[Candidate]
     ) -> List[Optional[float]]:
         """Evaluate candidate energies in a single batched ORB forward pass.
 
@@ -2167,6 +2304,10 @@ class GGen:
         trajectory_interval: int = 5,
         show_progress: bool = False,
         serialize_output: bool = True,
+        relaxed_results: Optional[
+            List[Optional[Tuple[Structure, float, int, float]]]
+        ] = None,
+        defer_symmetry_rerelax: bool = False,
     ) -> Dict[str, Any]:
         """Score, relax, and select the best structure of a generated batch.
 
@@ -2187,12 +2328,24 @@ class GGen:
             trajectory_interval: Steps between trajectory frame snapshots.
             show_progress: If True, show a tqdm progress bar during relaxation.
             serialize_output: Include CIF text and base64 fields in the response.
+            relaxed_results: Relaxations already computed for ``batch["candidates"]``
+                (one per candidate, in order, None where relaxation failed), e.g.
+                from a pooled :meth:`relax_atoms` call spanning many formulas.
+                When given, no energy evaluation or relaxation runs here.
+            defer_symmetry_rerelax: If True, a symmetry-refined winner is not
+                re-relaxed here. The refined structure is returned under
+                ``pending_rerelax`` so the caller can relax many of them together
+                and then call :meth:`apply_rerelaxed`; until then the response
+                describes the unrefined winner.
 
         Returns:
             Dictionary with structure metadata, CIF content, and generation statistics.
         """
         mem_trace = os.environ.get("GGEN_MEM_TRACE", "0") == "1"
         rss_gen_start = rss_mb() if mem_trace else None
+        precomputed = relaxed_results is not None
+        if precomputed and not optimize_geometry:
+            raise ValueError("relaxed_results requires optimize_geometry=True")
 
         formula = batch["formula"]
         space_group = batch["requested_space_group"]
@@ -2206,11 +2359,26 @@ class GGen:
 
         # Score all candidates with one batched forward pass instead of a
         # per-trial GPU round-trip during generation.
-        eval_started = time.perf_counter()
-        energies = self._evaluate_candidates_batched([c for c, _ in generated])
-        generation_stats["energy_eval_seconds"] = time.perf_counter() - eval_started
+        if precomputed:
+            # The unrelaxed energy does not inform selection (see
+            # docs/candidate_selection_analysis.md), so pooled callers skip it.
+            # Keep only the candidates whose relaxation produced a finite energy.
+            kept = [
+                (pair, relaxed)
+                for pair, relaxed in zip(generated, relaxed_results)
+                if relaxed is not None and np.isfinite(relaxed[1])
+            ]
+            generated = [pair for pair, _ in kept]
+            relaxed_results = [relaxed for _, relaxed in kept]
+            energies: List[Optional[float]] = [float("nan")] * len(generated)
+        else:
+            eval_started = time.perf_counter()
+            energies = self._evaluate_candidates_batched([c for c, _ in generated])
+            generation_stats["energy_eval_seconds"] = (
+                time.perf_counter() - eval_started
+            )
 
-        all_candidates: List[Tuple[pyxtal, float, Dict[str, float], int]] = []
+        all_candidates: List[Tuple[Candidate, float, Dict[str, float], int]] = []
         for (c, sg_number), energy in zip(generated, energies):
             if energy is None:
                 logger.warning(
@@ -2276,18 +2444,19 @@ class GGen:
                 optimization_optimizer,
                 optimization_max_steps,
             )
-            relaxation_started = time.perf_counter()
-            relaxed_results = self._relax_candidates(
-                candidate_crystals,
-                max_steps=optimization_max_steps,
-                fmax=optimization_fmax,
-                show_progress=show_progress,
-                preserve_symmetry=preserve_symmetry,
-                optimization_optimizer=optimization_optimizer,
-            )
-            generation_stats["relaxation_seconds"] = (
-                time.perf_counter() - relaxation_started
-            )
+            if not precomputed:
+                relaxation_started = time.perf_counter()
+                relaxed_results = self._relax_candidates(
+                    candidate_crystals,
+                    max_steps=optimization_max_steps,
+                    fmax=optimization_fmax,
+                    show_progress=show_progress,
+                    preserve_symmetry=preserve_symmetry,
+                    optimization_optimizer=optimization_optimizer,
+                )
+                generation_stats["relaxation_seconds"] = (
+                    time.perf_counter() - relaxation_started
+                )
             if mem_trace:
                 logger.info(
                     "[mem] after _relax_candidates %s: RSS=%.0f MiB",
@@ -2314,7 +2483,7 @@ class GGen:
                 "wyckoff_penalty": 0.0,
                 "total": final_energy,
                 "space_group": best_sg,
-                "num_wyckoff_sites": len(best_crystal.atom_sites),
+                "num_wyckoff_sites": best_crystal.num_wyckoff_sites,
                 "selection_method": "batch_relax_all",
             }
 
@@ -2333,7 +2502,7 @@ class GGen:
                 final_energy / len(structure) if len(structure) else final_energy,
             )
 
-            if initial_best_idx != best_idx:
+            if not precomputed and initial_best_idx != best_idx:
                 logger.debug(
                     "Initial energy heuristic would have picked SG %d (final energy=%.4f eV, rank %d)",
                     candidate_sgs[initial_best_idx],
@@ -2349,9 +2518,12 @@ class GGen:
 
             # Store relaxation stats
             generation_stats["num_relaxed"] = len(relaxed_results)
-            generation_stats["initial_best_idx"] = initial_best_idx
             generation_stats["final_best_idx"] = best_idx
-            generation_stats["initial_picked_correct"] = initial_best_idx == best_idx
+            if not precomputed:
+                generation_stats["initial_best_idx"] = initial_best_idx
+                generation_stats["initial_picked_correct"] = (
+                    initial_best_idx == best_idx
+                )
 
             # Collect all relaxed trials (excluding the best, which is returned separately)
             # These are valuable polymorphs that can be saved to the database
@@ -2409,6 +2581,7 @@ class GGen:
         del candidate_sgs
 
         symmetry_refinement_started = time.perf_counter()
+        pending_rerelax: Optional[Structure] = None
 
         # Post-relaxation symmetry refinement
         if optimize_geometry and refine_symmetry and not preserve_symmetry:
@@ -2422,7 +2595,9 @@ class GGen:
             refined_struct, refined_sg, refined_symbol = (
                 self._refine_to_higher_symmetry(structure)
             )
-            if refined_sg > 1:
+            if refined_sg > 1 and defer_symmetry_rerelax:
+                pending_rerelax = refined_struct
+            elif refined_sg > 1:
                 original_atoms = len(structure)
                 refined_atoms = len(refined_struct)
 
@@ -2484,7 +2659,7 @@ class GGen:
         final_sg_num = spg.get_space_group_number()
         final_sg_sym = spg.get_space_group_symbol()
 
-        requested_space_group_symbol = best_crystal.group.symbol
+        requested_space_group_symbol = best_crystal.space_group_symbol
         filename = f"{formula}_{final_sg_sym.replace('/', '-')}.cif"
         name = f"{formula} ({final_sg_sym})"
 
@@ -2583,6 +2758,8 @@ class GGen:
             # Additional relaxed trials (polymorphs) - populated when optimize_geometry=True
             "all_relaxed_trials": all_relaxed_trials,
         }
+        if pending_rerelax is not None:
+            resp["pending_rerelax"] = pending_rerelax
         if serialize_output:
             resp["cif_content"] = cif_text
             resp["cif_base64"] = cif64
@@ -2598,6 +2775,34 @@ class GGen:
                 rss_gen_end,
                 rss_gen_end - rss_gen_start,
             )
+        return resp
+
+    def apply_rerelaxed(
+        self,
+        resp: Dict[str, Any],
+        relaxed: Optional[Tuple[Structure, float, int, float]],
+    ) -> Dict[str, Any]:
+        """Fold a deferred symmetry re-relaxation into a selection response.
+
+        Counterpart of ``relax_and_select(..., defer_symmetry_rerelax=True)``:
+        ``relaxed`` is the relaxation of ``resp["pending_rerelax"]``. If it
+        failed, the response keeps describing the unrefined winner.
+        """
+        resp.pop("pending_rerelax", None)
+        if relaxed is None or not np.isfinite(relaxed[1]):
+            return resp
+
+        structure, energy, steps, final_fmax = relaxed
+        spg = SpacegroupAnalyzer(structure, symprec=SYMPREC)
+        resp["structure"] = structure
+        resp["best_crystal_energy"] = energy
+        resp["final_space_group"] = spg.get_space_group_number()
+        resp["final_space_group_symbol"] = spg.get_space_group_symbol()
+        resp["space_group_changed"] = (
+            resp["final_space_group"] != resp["selected_space_group"]
+        )
+        resp["optimization_steps"] = resp.get("optimization_steps", 0) + steps
+        resp["final_fmax"] = final_fmax
         return resp
 
     def _generate_crystal_iterative(
