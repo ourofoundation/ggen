@@ -1008,7 +1008,12 @@ class StructureDatabase:
             sg_label = sg.replace("/", "-")
             source_label = (structure.source or "ggen").lower()
             entry_id = f"{structure.formula} ({sg_label}, {source_label})"
-            entry = ComputedEntry(comp, energy, entry_id=entry_id)
+            entry = ComputedEntry(
+                comp,
+                energy,
+                entry_id=entry_id,
+                data={"space_group": structure.space_group_symbol},
+            )
             entries.append(entry)
             entry_structure_pairs.append((entry, structure))
 
