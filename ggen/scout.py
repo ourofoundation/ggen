@@ -88,6 +88,8 @@ class ScoutResult:
     scores: List[SystemScore]
     target_crystal_systems: Optional[List[str]] = None
     e_above_hull_cutoff: float = 0.150
+    # Candidate elements left unscanned because the deadline was reached
+    skipped_candidates: List[str] = field(default_factory=list)
 
 
 class SystemScout:
@@ -153,6 +155,7 @@ class SystemScout:
         optimization_max_steps: int = 400,
         optimization_optimizer: str = "fire",
         max_stoichiometries: Optional[int] = 50,
+        deadline: Optional[float] = None,
     ) -> ScoutResult:
         """Scan candidate elements by running shallow explorations and ranking results.
 
@@ -171,6 +174,9 @@ class SystemScout:
             optimization_max_steps: Max relaxation steps.
             optimization_optimizer: Optimizer for relaxation ('fire' or 'lbfgs').
             max_stoichiometries: Maximum stoichiometries to explore per candidate system.
+            deadline: Epoch time after which no further systems (or stoichiometries
+                within the current one) are started. Unscanned candidates are
+                listed in ``skipped_candidates`` on the result.
 
         Returns:
             ScoutResult with scored and ranked systems.
@@ -190,7 +196,14 @@ class SystemScout:
         print(f"  E_hull cutoff: {e_above_hull_cutoff * 1000:.0f} meV/atom")
         print()
 
+        skipped: List[str] = []
         for i, element in enumerate(candidates):
+            if deadline is not None and time.time() >= deadline:
+                skipped = list(candidates[i:])
+                logger.warning(
+                    "Deadline reached: not scanning %s", ", ".join(skipped)
+                )
+                break
             chemsys = self.expand_template(template, element)
             label = f"[{i + 1}/{len(candidates)}] {chemsys} (X={element})"
             logger.info("START %s  RSS=%.0f MiB", label, rss_mb())
@@ -210,6 +223,7 @@ class SystemScout:
                 num_workers=num_workers,
                 optimization_max_steps=optimization_max_steps,
                 optimization_optimizer=optimization_optimizer,
+                deadline=deadline,
             )
             scores.append(score)
 
@@ -238,6 +252,7 @@ class SystemScout:
             scores=scores,
             target_crystal_systems=crystal_systems,
             e_above_hull_cutoff=e_above_hull_cutoff,
+            skipped_candidates=skipped,
         )
 
         self._print_summary(result)
@@ -258,6 +273,7 @@ class SystemScout:
         num_workers: int,
         optimization_max_steps: int,
         optimization_optimizer: str,
+        deadline: Optional[float] = None,
     ) -> SystemScore:
         """Run a shallow exploration and score the results."""
         score = SystemScore(
@@ -293,6 +309,7 @@ class SystemScout:
                 max_fraction=max_fraction,
                 optimization_max_steps=optimization_max_steps,
                 optimization_optimizer=optimization_optimizer,
+                deadline=deadline,
             )
 
             score.total_candidates = result.num_successful

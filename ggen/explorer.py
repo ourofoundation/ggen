@@ -325,6 +325,8 @@ class ExplorationResult:
     total_time_seconds: float = 0.0
     stage_timings: Dict[str, float] = field(default_factory=dict)
     run_id: Optional[str] = None
+    # True when a deadline ended the run before every stoichiometry was explored
+    stopped_at_deadline: bool = False
     num_stoichiometries: int = 0
     num_trials_per_stoichiometry: int = 0
 
@@ -1807,7 +1809,7 @@ class ChemistryExplorer:
             ready: List[Any] = []
             while waiting or ready:
                 if interrupted_flag():
-                    logger.info("Stopping generation due to interrupt")
+                    logger.info("Stopping: interrupted or out of time")
                     break
 
                 # ---- Propose: take what is ready, without idling the GPU for
@@ -2204,6 +2206,7 @@ class ChemistryExplorer:
         relax_batch_atoms: Optional[Union[int, str]] = "auto",
         generation_workers: int = 2,
         pool_formulas: int = 32,
+        deadline: Optional[float] = None,
     ) -> ExplorationResult:
         """Explore a chemical system by generating candidate structures.
 
@@ -2294,6 +2297,10 @@ class ChemistryExplorer:
                 relaxation. 0 uses one background thread.
             pool_formulas: Stoichiometries pooled per relaxation call. Results are
                 saved after each pool, so this is also the checkpoint granularity.
+            deadline: Epoch time after which no further stoichiometries are started.
+                Work already on the GPU finishes, and the hull is still built from
+                what was explored, so the result is partial rather than lost.
+                ``stopped_at_deadline`` on the result reports whether this happened.
 
         Returns:
             ExplorationResult with all candidates, phase diagram, and stable phases.
@@ -2334,6 +2341,12 @@ class ChemistryExplorer:
             )
 
         signal.signal(signal.SIGINT, handle_interrupt)
+
+        def out_of_time() -> bool:
+            return deadline is not None and time.time() >= deadline
+
+        def should_stop() -> bool:
+            return interrupted or out_of_time()
 
         # Parse chemical system
         elements = self.parse_chemical_system(chemical_system)
@@ -2566,7 +2579,7 @@ class ChemistryExplorer:
             logger.info(f"Reused {num_reused} structures from previous runs")
 
         # Generate new structures (sequential or parallel)
-        if stoichs_to_generate and not interrupted:
+        if stoichs_to_generate and not should_stop():
             if num_workers > 1:
                 # Parallel generation
                 logger.info(
@@ -2590,7 +2603,7 @@ class ChemistryExplorer:
                     num_workers=num_workers,
                     show_progress=show_progress,
                     keep_structures_in_memory=keep_structures_in_memory,
-                    interrupted_flag=lambda: interrupted,
+                    interrupted_flag=should_stop,
                     compute_phonons=compute_phonons,
                     phonon_supercell=phonon_supercell,
                     optimization_max_steps=optimization_max_steps,
@@ -2615,7 +2628,7 @@ class ChemistryExplorer:
                     space_group=space_group,
                     show_progress=show_progress,
                     keep_structures_in_memory=keep_structures_in_memory,
-                    interrupted_flag=lambda: interrupted,
+                    interrupted_flag=should_stop,
                     compute_phonons=compute_phonons,
                     phonon_supercell=phonon_supercell,
                     optimization_max_steps=optimization_max_steps,
@@ -2647,7 +2660,7 @@ class ChemistryExplorer:
                 try:
                     pending = _submit_generation(0)
                     for i, (stoich, formula) in enumerate(stoichs_to_generate):
-                        if interrupted:
+                        if should_stop():
                             logger.info("Stopping generation due to interrupt")
                             break
 
@@ -2678,7 +2691,7 @@ class ChemistryExplorer:
                             )
                             candidate = _failed_candidate(formula, stoich, e)
                         finally:
-                            if i + 1 < len(stoichs_to_generate) and not interrupted:
+                            if i + 1 < len(stoichs_to_generate) and not should_stop():
                                 pending = _submit_generation(i + 1)
 
                         if batch is not None:
@@ -2760,6 +2773,14 @@ class ChemistryExplorer:
             logger.info(
                 f"Included {len(candidates)} total candidates "
                 f"({num_reused} from previous runs)"
+            )
+
+        stopped_at_deadline = out_of_time() and len(candidates) < len(stoichiometries)
+        if stopped_at_deadline:
+            logger.warning(
+                "Deadline reached: explored %d of %d stoichiometries",
+                len(candidates),
+                len(stoichiometries),
             )
 
         # Best known elemental reference per element, kept before the rest of
@@ -3052,6 +3073,7 @@ class ChemistryExplorer:
             total_time_seconds=total_time,
             stage_timings=stage_timings,
             run_id=self._unified_run_id,
+            stopped_at_deadline=stopped_at_deadline,
             num_stoichiometries=len(stoichiometries),
             num_trials_per_stoichiometry=num_trials,
         )
