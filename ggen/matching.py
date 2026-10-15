@@ -28,7 +28,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Sources whose structures were made on Ouro, so they are not prior art.
-OURO_SOURCES = ("ggen", "ouro")
+# "matra-genoa" is written by the Matra-Genoa app's explore route.
+OURO_SOURCES = ("ggen", "ouro", "matra-genoa")
 
 KNOWN = "known"
 NEW_POLYMORPH = "new polymorph"

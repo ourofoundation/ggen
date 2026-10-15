@@ -156,7 +156,7 @@ class StoredStructure:
     generation_metadata: Dict[str, Any] = field(default_factory=dict)
 
     # Provenance tracking
-    source: str = "ggen"  # 'ggen', 'mp', 'alexandria', 'ouro'
+    source: str = "ggen"  # 'ggen', 'mp', 'alexandria', 'ouro', 'matra-genoa'
     source_id: Optional[str] = None  # Original identifier, e.g. 'mp-1234'
 
     created_at: Optional[str] = None
@@ -571,7 +571,7 @@ class StructureDatabase:
             error_message: Error message if invalid
             generation_metadata: Additional metadata dict
             run_id: Optional run ID to link this structure to
-            source: Data source ('ggen', 'mp', 'alexandria', 'ouro')
+            source: Data source ('ggen', 'mp', 'alexandria', 'ouro', 'matra-genoa')
             source_id: Original identifier from the source (e.g., 'mp-1234')
             is_dynamically_stable: Whether structure is dynamically stable (no imaginary phonon modes)
             num_imaginary_modes: Number of imaginary phonon modes
