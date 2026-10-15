@@ -22,14 +22,15 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
 
 from pymatgen.core import Structure
 
+from .database import GENERATED_SOURCES
+
 if TYPE_CHECKING:
     from .database import StoredStructure, StructureDatabase
 
 logger = logging.getLogger(__name__)
 
 # Sources whose structures were made on Ouro, so they are not prior art.
-# "matra-genoa" is written by the Matra-Genoa app's explore route.
-OURO_SOURCES = ("ggen", "ouro", "matra-genoa")
+OURO_SOURCES = (*GENERATED_SOURCES, "ouro")
 
 KNOWN = "known"
 NEW_POLYMORPH = "new polymorph"

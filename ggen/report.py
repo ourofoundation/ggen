@@ -620,6 +620,7 @@ class SystemExplorer:
         exclude_space_groups: Optional[List[str]] = None,
         tested_only: bool = False,
         all_polymorphs: bool = False,
+        include_generated_p1: bool = True,
     ) -> Tuple[Optional[PhaseDiagram], Dict[str, float], Dict[str, int]]:
         """
         Compute the phase diagram for a chemical system.
@@ -630,6 +631,8 @@ class SystemExplorer:
             exclude_space_groups: List of space group symbols to exclude (e.g., ["P1"])
             tested_only: If True, only include phonon-tested structures
             all_polymorphs: If True, include all structures not just best per formula
+            include_generated_p1: If False, leave out generated P1 structures
+                (see ``StructureDatabase.compute_hull``)
 
         Returns:
             Tuple of (PhaseDiagram, e_above_hull dict, filter_counts dict).
@@ -641,6 +644,7 @@ class SystemExplorer:
             exclude_space_groups=exclude_space_groups,
             tested_only=tested_only,
             all_polymorphs=all_polymorphs,
+            include_generated_p1=include_generated_p1,
         )
 
     def plot_phase_diagram(

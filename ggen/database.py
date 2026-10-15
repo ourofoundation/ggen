@@ -57,6 +57,10 @@ from pymatgen.entries.computed_entries import ComputedEntry
 
 from .surfaces import DEFAULT_SURFACE, SOURCE_GEOMETRY, get_surface
 
+# Sources a structure generator wrote on Ouro, as opposed to published
+# references ('mp', 'alexandria') and user submissions ('ouro').
+GENERATED_SOURCES = ("ggen", "matra-genoa")
+
 if TYPE_CHECKING:
     from .matching import Candidate, NoveltyIndex
 
@@ -1238,6 +1242,7 @@ class StructureDatabase:
         exclude_space_groups: Optional[List[str]] = None,
         tested_only: bool = False,
         all_polymorphs: bool = False,
+        include_generated_p1: bool = True,
     ) -> Tuple[Optional[PhaseDiagram], Dict[str, float], Dict[str, int]]:
         """
         Compute the convex hull for a chemical system on this surface.
@@ -1252,6 +1257,10 @@ class StructureDatabase:
             exclude_space_groups: List of space group symbols to exclude (e.g., ["P1"])
             tested_only: If True, only include structures that have been phonon-tested
             all_polymorphs: If True, put every structure in the phase diagram
+            include_generated_p1: If False, leave out P1 structures from
+                ``GENERATED_SOURCES``: mostly symmetry-broken leftovers. P1
+                phases from published references stay, since some are real
+                ground states. Phase diagrams shown to people pass False.
 
         Returns:
             Tuple of (PhaseDiagram, dict mapping structure_id -> e_above_hull, filter_counts)
@@ -1275,6 +1284,12 @@ class StructureDatabase:
         if exclude_space_groups:
             excluded = set(exclude_space_groups)
             drop(lambda r: r["space_group_symbol"] in excluded, "excluded_space_groups")
+        if not include_generated_p1:
+            drop(
+                lambda r: r["space_group_symbol"] == "P1"
+                and (r["source"] or "ggen") in GENERATED_SOURCES,
+                "excluded_generated_p1",
+            )
         if tested_only:
             drop(lambda r: r["is_dynamically_stable"] is None, "excluded_untested")
 
@@ -1341,6 +1356,7 @@ class StructureDatabase:
         chemical_system: str,
         e_above_hull_cutoff: float = 0.0,
         run_id: Optional[str] = None,
+        include_generated_p1: bool = True,
     ) -> List[StoredStructure]:
         """
         Get structures on or near the convex hull, one per reduced formula.
@@ -1356,11 +1372,16 @@ class StructureDatabase:
                 Hull distances are still computed from all data, but only
                 structures generated in the given run are returned, and only
                 when they are the best of their formula.
+            include_generated_p1: Passed to ``compute_hull``.
 
         Returns:
             List of StoredStructure objects on/near hull, sorted by e_above_hull
         """
-        _, e_hull, _ = self.compute_hull(chemical_system, update_database=False)
+        _, e_hull, _ = self.compute_hull(
+            chemical_system,
+            update_database=False,
+            include_generated_p1=include_generated_p1,
+        )
         cutoff = e_above_hull_cutoff + ON_HULL_TOLERANCE
         near = [(e, sid) for sid, e in e_hull.items() if e <= cutoff]
         if not near:

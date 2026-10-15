@@ -71,6 +71,27 @@ def test_hull_uses_lowest_corrected_energy_per_formula(db):
     assert db.get_structure(polymorph).e_above_hull == pytest.approx(0.05)
 
 
+def test_leaving_out_generated_p1_keeps_published_p1(db):
+    add(db, bcc("Fe"), -8.0, source="mp")
+    add(db, fcc("Ni"), -5.5, source="mp")
+    published = add(db, b2("Fe", "Ni"), -7.0, source="mp", space_group_symbol="P1")
+    generated = add(db, b2("Fe", "Ni", lattice=3.0), -7.2, space_group_symbol="P1")
+    symmetric = add(db, b2("Fe", "Ni", lattice=3.1), -6.9, source="matra-genoa", space_group_symbol="Pm-3m")
+
+    _, e_hull, counts = db.compute_hull(
+        "Fe-Ni", update_database=False, include_generated_p1=False
+    )
+    assert generated not in e_hull
+    assert counts["excluded_generated_p1"] == 1
+    assert e_hull[published] == pytest.approx(0.0)
+    assert e_hull[symmetric] == pytest.approx(0.1)
+
+    near = db.get_hull_entries("Fe-Ni", e_above_hull_cutoff=0.2, include_generated_p1=False)
+    assert generated not in {s.id for s in near}
+    # The default keeps everything, so internal callers are unchanged.
+    assert db.compute_hull("Fe-Ni", update_database=False)[1][generated] == pytest.approx(0.0)
+
+
 def test_mp2020_corrections_apply_to_ml_energies(db):
     """FeO gets the Fe +U mixing and oxide corrections; metallic Fe gets none."""
     fe = add(db, bcc("Fe"), -8.3)
