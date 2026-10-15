@@ -55,24 +55,36 @@ class SourceRecord:
 # -------------------- Materials Project --------------------
 
 
+# Slices of the summary collection, each small enough to come back as a
+# plain paged list (~30k documents): an unfiltered query takes mp-api's
+# DeltaTable path, which is far too slow to iterate.
+_SITE_BINS = [(1, 10), (11, 20), (21, 40), (41, 80), (81, 100000)]
+
+
 def _mp_summary(mpr, elements: Optional[Sequence[str]]):
     """All materials' chemical systems, and the ids MP licenses non-commercially."""
-    kwargs: Dict[str, Any] = {"fields": ["material_id", "chemsys", "builder_meta"]}
-    if elements:
-        kwargs["elements"] = list(elements)
-    docs = mpr.materials.summary.search(**kwargs)
-    systems = sorted({doc.chemsys for doc in docs})
+    fields = ["material_id", "chemsys", "builder_meta"]
+    systems: set = set()
     non_commercial = []
-    for doc in docs:
-        license = getattr(getattr(doc, "builder_meta", None), "license", None)
-        license = str(getattr(license, "value", license)) if license else None
-        if license in NON_COMMERCIAL_LICENSES:
-            non_commercial.append((str(doc.material_id), license))
+    seen = 0
+    for n in range(1, 10):
+        for sites in _SITE_BINS:
+            kwargs: Dict[str, Any] = {"num_elements": (n, n), "num_sites": sites, "fields": fields}
+            if elements:
+                kwargs["elements"] = list(elements)
+            for doc in mpr.materials.summary.search(**kwargs):
+                seen += 1
+                systems.add(doc.chemsys)
+                license = getattr(getattr(doc, "builder_meta", None), "license", None)
+                license = str(getattr(license, "value", license)) if license else None
+                if license in NON_COMMERCIAL_LICENSES:
+                    non_commercial.append((str(doc.material_id), license))
+        logger.info(f"  MP summary: {seen:,} materials through {n} elements")
     logger.info(
-        f"Materials Project: {len(docs):,} materials in {len(systems):,} systems, "
+        f"Materials Project: {seen:,} materials in {len(systems):,} systems, "
         f"{len(non_commercial):,} licensed non-commercially"
     )
-    return systems, non_commercial
+    return sorted(systems), non_commercial
 
 
 def materials_project(
