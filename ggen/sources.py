@@ -141,6 +141,8 @@ def _alexandria_record(entry: Dict[str, Any]) -> Optional[SourceRecord]:
         space_group_number=int(sg_number) if sg_number else None,
         metadata={
             "alexandria_band_gap": data.get("band_gap_ind", data.get("band_gap_dir")),
+            # PBE total magnetic moment of the cell (μB)
+            "alexandria_total_mag": data.get("total_mag"),
             "alexandria_last_modified": data.get("last_modified"),
         },
     )
