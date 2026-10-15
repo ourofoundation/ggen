@@ -342,28 +342,21 @@ class MasterDB:
 
     @modal.method()
     def phonon_candidates(self, cutoff: float, limit: int | None) -> list[dict]:
-        query = """
-            SELECT s.id, s.formula, s.num_atoms, s.cif_content,
-                   MIN(h.e_above_hull) AS e_above_hull
-            FROM structures s
-            JOIN hull_entries h ON s.id = h.structure_id
-            WHERE h.e_above_hull <= ?
-              AND s.is_dynamically_stable IS NULL
-              AND s.cif_content IS NOT NULL
-            GROUP BY s.id
-            ORDER BY e_above_hull ASC, s.energy_per_atom ASC
-        """
-        if limit:
-            query += f" LIMIT {int(limit)}"
-        rows = self.db.conn.execute(query, (cutoff,)).fetchall()
+        structures = self.db.query_structures(
+            "c.e_above_hull <= ? AND c.is_dynamically_stable IS NULL",
+            (cutoff,),
+            order_by="c.e_above_hull, c.energy_per_atom",
+            limit=limit,
+        )
         return [
             {
-                "id": r["id"],
-                "formula": r["formula"],
-                "num_atoms": r["num_atoms"],
-                "cif": r["cif_content"],
+                "id": s.id,
+                "formula": s.formula,
+                "num_atoms": s.num_atoms,
+                "cif": s.cif_content,
             }
-            for r in rows
+            for s in structures
+            if s.cif_content
         ]
 
     @modal.method()

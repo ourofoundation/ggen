@@ -107,19 +107,20 @@ def backfill_spglib(
     from tqdm import tqdm
 
     conditions = [
-        "space_group_number IS NULL",
-        "space_group_symbol IS NULL",
-        "cif_content IS NOT NULL",
-        "cif_content != ''",
-        "is_valid = 1",
+        "s.space_group_number IS NULL",
+        "s.space_group_symbol IS NULL",
+        "s.is_valid = 1",
     ]
     params = []
     if source:
-        conditions.append("source = ?")
+        conditions.append("s.source = ?")
         params.append(source)
 
-    query = "SELECT id, cif_content FROM structures WHERE " + " AND ".join(conditions)
-    rows = db.conn.execute(query, params).fetchall()
+    rows = [
+        {"id": s.id, "cif_content": s.cif_content}
+        for s in db.query_structures(" AND ".join(conditions), params)
+        if s.cif_content
+    ]
 
     if dry_run:
         return len(rows)

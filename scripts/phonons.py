@@ -66,59 +66,29 @@ def get_entries_needing_phonons(
     Returns:
         List of StoredStructure objects needing phonon calculations
     """
-    conn = db.conn
-
-    # Build the stability filter
     if rerun_unstable:
         # Include both NULL (never tested) and unstable (0)
-        stability_filter = (
-            "(s.is_dynamically_stable IS NULL OR s.is_dynamically_stable = 0)"
-        )
+        where = ["(c.is_dynamically_stable IS NULL OR c.is_dynamically_stable = 0)"]
     else:
         # Only structures never tested
-        stability_filter = "s.is_dynamically_stable IS NULL"
-
+        where = ["c.is_dynamically_stable IS NULL"]
+    where += ["s.is_valid = 1", "c.e_above_hull <= ?"]
+    params: List = [e_above_hull_cutoff]
     if chemical_system:
-        # Get entries for specific system
-        chemsys = db.normalize_chemsys(chemical_system)
-        query = f"""
-            SELECT s.*, h.e_above_hull, h.is_on_hull
-            FROM structures s
-            JOIN hull_entries h ON s.id = h.structure_id
-            WHERE h.chemsys = ?
-              AND h.e_above_hull <= ?
-              AND {stability_filter}
-              AND s.cif_content IS NOT NULL
-            ORDER BY h.e_above_hull ASC, s.energy_per_atom ASC
-        """
-        params: Tuple = (chemsys, e_above_hull_cutoff)
-    else:
-        # Get entries across all systems
-        query = f"""
-            SELECT DISTINCT s.*, MIN(h.e_above_hull) as e_above_hull, MAX(h.is_on_hull) as is_on_hull
-            FROM structures s
-            JOIN hull_entries h ON s.id = h.structure_id
-            WHERE h.e_above_hull <= ?
-              AND {stability_filter}
-              AND s.cif_content IS NOT NULL
-            GROUP BY s.id
-            ORDER BY e_above_hull ASC, s.energy_per_atom ASC
-        """
-        params = (e_above_hull_cutoff,)
+        clause, subsystems = db._subsystem_clause(chemical_system)
+        where.append(clause)
+        params.extend(subsystems)
 
-    if max_structures:
-        query += f" LIMIT {max_structures}"
-
-    rows = conn.execute(query, params).fetchall()
-
-    structures = []
-    for row in rows:
-        s = db._row_to_structure(row)
-        s.e_above_hull = row["e_above_hull"]
-        s.is_on_hull = bool(row["is_on_hull"])
-        structures.append(s)
-
-    return structures
+    return [
+        s
+        for s in db.query_structures(
+            " AND ".join(where),
+            params,
+            order_by="c.e_above_hull, c.energy_per_atom",
+            limit=max_structures,
+        )
+        if s.cif_content
+    ]
 
 
 def get_adaptive_supercell(

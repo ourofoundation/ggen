@@ -5,7 +5,7 @@ including inside the Modal burn worker. The CLI in ``scripts/discoveries.py`` an
 the burn orchestrator both build on these functions.
 
 For each chemical system we recompute the convex hull from all stored structures
-(ggen + any imported MP entries) and categorize each ggen hull entry as a
+(ggen + imported reference entries, MP2020-corrected) and categorize each ggen hull entry as a
 ``new_composition`` (no MP structure at that formula), ``beat_mp`` (lower energy
 than MP's best), or ``elemental``.
 """
@@ -13,11 +13,9 @@ than MP's best), or ``elemental``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-from pymatgen.analysis.phase_diagram import PhaseDiagram
 from pymatgen.core import Composition
-from pymatgen.entries.computed_entries import ComputedEntry
 
 from .database import StoredStructure, StructureDatabase
 
@@ -101,28 +99,12 @@ def analyze_system(
     result.mp_structures_count = len(mp_best)
     result.ggen_structures_count = len(ggen_best)
 
-    entries = []
-    entry_structure_pairs: List[Tuple[ComputedEntry, StoredStructure]] = []
+    _, e_hull_by_id, _ = db.compute_hull(chemsys, update_database=False)
 
     for structure in best_by_formula.values():
-        if structure.energy_per_atom is None:
+        e_hull = e_hull_by_id.get(structure.id)
+        if e_hull is None:
             continue
-        comp = Composition(structure.formula)
-        energy = structure.energy_per_atom * comp.num_atoms
-        entry = ComputedEntry(comp, energy)
-        entries.append(entry)
-        entry_structure_pairs.append((entry, structure))
-
-    if len(entries) < 2:
-        return result
-
-    try:
-        pd = PhaseDiagram(entries)
-    except Exception:
-        return result
-
-    for entry, structure in entry_structure_pairs:
-        e_hull = pd.get_e_above_hull(entry)
         is_on_hull = e_hull < 1e-6
         is_near_hull = near_hull_cutoff > 0 and e_hull <= near_hull_cutoff
 

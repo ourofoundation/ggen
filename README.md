@@ -351,6 +351,27 @@ GGen computes phase diagrams automatically using [pymatgen](https://pymatgen.org
 
 A promising synthesis candidate should be both thermodynamically stable (or nearly so) and dynamically stable. GGen lets you filter for exactly this.
 
+### The Structure Database and Energy Surfaces
+
+The SQLite database (`ggen/database.py`, schema version 2) holds GGen's output alongside reference structures from Materials Project and Alexandria. Every energy belongs to one **energy surface** (`ggen/surfaces.py`): `pbe` for the published DFT energies, or an MLIP such as `orb-v3-conservative-inf-mpa`. A `StructureDatabase` reads and writes one surface, chosen when it is opened, and a hull is only ever built from one surface's energies.
+
+- `structures` holds identity only; `geometries` holds compressed CIFs per slot (`source` as published, or relaxed on a surface); `calculations` holds per-surface raw energies, MP2020 corrections, hull distances and phonon results.
+- MP2020 corrections (`ggen/corrections.py`) are applied to every surface, MLIP energies included, so GGA and GGA+U phases share a hull. Raw energies are stored; Materials Project's own corrections are kept, Alexandria's are recomputed (its published corrected energies follow a different scheme).
+- `ggen/matching.py` answers "is this structure already known?" with StructureMatcher against every reference of the same reduced formula.
+
+```bash
+# Version 1 database -> version 2
+python scripts/migrate_v2.py ggen.db ggen.v2.db
+# Reference data with PBE energies (re-running refreshes in place)
+python scripts/import.py --database ggen.v2.db --provider mp
+python scripts/import.py --database ggen.v2.db --provider alexandria --alexandria-local-dir alexandria/
+# Hull distances on a surface, then MLIP energies for phases near the PBE hull
+python scripts/hulls.py --database ggen.v2.db --surface pbe
+python scripts/relax.py --database ggen.v2.db --unrelaxed --hull-surface pbe --e-above-hull 0.1
+```
+
+On Modal the file lives on the `ggen-data` Volume and only the ggen app's `GGenWriter` writes it; workers send it shards of what they changed (`ggen/shared.py`).
+
 ## Features
 
 - **Crystal Generation**: Generate structures from chemical formulas via PyXtal with automatic space group selection

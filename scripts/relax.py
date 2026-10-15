@@ -65,77 +65,55 @@ def get_entries_for_relaxation(
     unstable_only: bool = False,
     all_structures: bool = False,
     source: Optional[str] = None,
+    hull_surface: Optional[str] = None,
 ) -> List[StoredStructure]:
     """
-    Get database entries that should be re-relaxed.
+    Get database entries that should be re-relaxed on the database's surface.
 
     Args:
-        db: Database connection
+        db: Database (its surface is the one relaxed on)
         chemical_system: Optional specific system (e.g., "Fe-Mn-Co"). If None, all systems.
         e_above_hull_cutoff: Maximum energy above hull in eV/atom
         max_structures: Optional limit on number of structures
         unstable_only: If True, only get structures marked as dynamically unstable
         all_structures: If True, get all structures (ignores e_above_hull_cutoff)
         source: Optional source filter (e.g., 'mp', 'ggen')
+        hull_surface: Surface whose stored hull distances select entries
+            (default: the database's own surface)
 
     Returns:
         List of StoredStructure objects to re-relax
     """
-    conn = db.conn
-
-    # Build WHERE clauses
-    where_clauses = ["s.cif_content IS NOT NULL"]
+    where = ["s.is_valid = 1"]
     params: List = []
+    join = ""
 
     if chemical_system:
-        chemsys = db.normalize_chemsys(chemical_system)
-        where_clauses.append("h.chemsys = ?")
-        params.append(chemsys)
-
+        clause, subsystems = db._subsystem_clause(chemical_system)
+        where.append(clause)
+        params.extend(subsystems)
     if unstable_only:
-        where_clauses.append("s.is_dynamically_stable = 0")
-
+        where.append("c.is_dynamically_stable = 0")
     if source:
-        where_clauses.append("s.source = ?")
+        where.append("s.source = ?")
         params.append(source)
-
     if not all_structures:
-        where_clauses.append("h.e_above_hull <= ?")
+        if hull_surface and hull_surface != db.surface:
+            join = "JOIN calculations h ON h.structure_id = s.id AND h.surface = ?"
+            params.insert(0, hull_surface)
+            where.append("h.e_above_hull <= ?")
+        else:
+            where.append("c.e_above_hull <= ?")
         params.append(e_above_hull_cutoff)
 
-    where_sql = " AND ".join(where_clauses)
-
-    if chemical_system:
-        query = f"""
-            SELECT s.*, h.e_above_hull, h.is_on_hull
-            FROM structures s
-            JOIN hull_entries h ON s.id = h.structure_id
-            WHERE {where_sql}
-            ORDER BY h.e_above_hull ASC, s.energy_per_atom ASC
-        """
-    else:
-        query = f"""
-            SELECT DISTINCT s.*, MIN(h.e_above_hull) as e_above_hull, MAX(h.is_on_hull) as is_on_hull
-            FROM structures s
-            JOIN hull_entries h ON s.id = h.structure_id
-            WHERE {where_sql}
-            GROUP BY s.id
-            ORDER BY e_above_hull ASC, s.energy_per_atom ASC
-        """
-
-    if max_structures:
-        query += f" LIMIT {max_structures}"
-
-    rows = conn.execute(query, params).fetchall()
-
-    structures = []
-    for row in rows:
-        s = db._row_to_structure(row)
-        s.e_above_hull = row["e_above_hull"]
-        s.is_on_hull = bool(row["is_on_hull"])
-        structures.append(s)
-
-    return structures
+    order = "h.e_above_hull" if join else "c.e_above_hull"
+    return db.query_structures(
+        " AND ".join(where),
+        params,
+        join=join,
+        order_by=f"{order}, c.energy_per_atom",
+        limit=max_structures,
+    )
 
 
 def get_unrelaxed_entries(
@@ -143,59 +121,55 @@ def get_unrelaxed_entries(
     source: Optional[str] = None,
     chemical_system: Optional[str] = None,
     max_structures: Optional[int] = None,
+    e_above_hull_cutoff: Optional[float] = None,
+    hull_surface: Optional[str] = None,
 ) -> List[StoredStructure]:
     """
-    Get structures that have geometry (CIF) but no ORB energy yet.
+    Get structures with a geometry but no energy on the database's surface yet.
 
-    These are typically freshly imported structures (e.g., from Materials Project)
-    that need their first ORB relaxation.
+    These are typically imported structures (Materials Project, Alexandria)
+    that need their first relaxation on this surface. With ``hull_surface``
+    and ``e_above_hull_cutoff``, only those near the hull on that surface
+    (for example within 100 meV/atom of the PBE hull) are returned.
 
     Args:
-        db: Database connection
+        db: Database (its surface is the one relaxed on)
         source: Optional source filter (e.g., 'mp')
         chemical_system: Optional chemical system filter
         max_structures: Optional limit on number of structures
+        e_above_hull_cutoff: Optional hull-distance cutoff on ``hull_surface``
+        hull_surface: Surface whose stored hull distances select entries
 
     Returns:
         List of StoredStructure objects to relax
     """
-    conn = db.conn
-
-    where_clauses = [
-        "s.cif_content IS NOT NULL",
-        "s.energy_per_atom IS NULL",
+    where = [
         "s.is_valid = 1",
+        "c.energy_per_atom IS NULL",
+        "EXISTS (SELECT 1 FROM geometries g WHERE g.structure_id = s.id)",
     ]
     params: List = []
+    join = ""
 
+    if e_above_hull_cutoff is not None and hull_surface:
+        join = "JOIN calculations h ON h.structure_id = s.id AND h.surface = ?"
+        params.append(hull_surface)
+        where.append("h.e_above_hull <= ?")
+        params.append(e_above_hull_cutoff)
     if source:
-        where_clauses.append("s.source = ?")
+        where.append("s.source = ?")
         params.append(source)
-
     if chemical_system:
-        chemsys = db.normalize_chemsys(chemical_system)
-        where_clauses.append("s.chemsys = ?")
-        params.append(chemsys)
+        where.append("s.chemsys = ?")
+        params.append(db.normalize_chemsys(chemical_system))
 
-    where_sql = " AND ".join(where_clauses)
-
-    query = f"""
-        SELECT s.* FROM structures s
-        WHERE {where_sql}
-        ORDER BY s.formula ASC
-    """
-
-    if max_structures:
-        query += f" LIMIT {max_structures}"
-
-    rows = conn.execute(query, params).fetchall()
-
-    structures = []
-    for row in rows:
-        s = db._row_to_structure(row)
-        structures.append(s)
-
-    return structures
+    return db.query_structures(
+        " AND ".join(where),
+        params,
+        join=join,
+        order_by="s.formula",
+        limit=max_structures,
+    )
 
 
 def relax_batch_torchsim(
@@ -413,42 +387,22 @@ def process_result(
         logger.info(f"  {C.YELLOW}⚠ Failed: {result['error']}{C.RESET}")
         return False, 0.0, True
 
-    # For first-time relaxations (imported structures), always save the energy
+    # First relaxation on this surface: the published geometry stays in its
+    # own slot, and the relaxed one lands in this surface's.
     if is_first_relaxation:
-        # Preserve the original (pre-relaxation) CIF and space group in metadata
-        # so we can compare the MLIP-relaxed structure against the original
-        metadata = dict(entry.generation_metadata) if entry.generation_metadata else {}
-        if entry.cif_content and "mp_original_cif" not in metadata:
-            metadata["mp_original_cif"] = entry.cif_content
-            metadata["mp_original_space_group_number"] = entry.space_group_number
-            metadata["mp_original_space_group_symbol"] = entry.space_group_symbol
-
         db._update_structure(
             structure_id=entry.id,
             energy_per_atom=result["final_energy_per_atom"],
             total_energy=result["final_total_energy"],
             cif_content=result["cif_content"],
-            generation_metadata=metadata,
             clear_phonon_data=clear_phonons,
         )
-        # Also update space group if changed
-        sg_num = result.get("space_group_number")
-        sg_sym = result.get("space_group_symbol")
-        if sg_num or sg_sym:
-            updates = []
-            values = []
-            if sg_num:
-                updates.append("space_group_number = ?")
-                values.append(sg_num)
-            if sg_sym:
-                updates.append("space_group_symbol = ?")
-                values.append(sg_sym)
-            values.append(entry.id)
-            db.conn.execute(
-                f"UPDATE structures SET {', '.join(updates)} WHERE id = ?",
-                values,
+        if result.get("space_group_number") or result.get("space_group_symbol"):
+            db.update_structure_space_group(
+                entry.id,
+                space_group_number=result.get("space_group_number"),
+                space_group_symbol=result.get("space_group_symbol"),
             )
-            db.conn.commit()
 
         logger.info(
             f"  {C.GREEN}✓ Relaxed{C.RESET} "
@@ -556,6 +510,14 @@ def main():
         help="Only process structures with no ORB energy (e.g., freshly imported from MP)",
     )
     parser.add_argument(
+        "--hull-surface",
+        type=str,
+        default=None,
+        help="Select entries by their stored hull distance on this surface "
+        "(e.g. 'pbe' with --unrelaxed --e-above-hull 0.1). Default: the "
+        "surface being relaxed on, or no hull filter with --unrelaxed.",
+    )
+    parser.add_argument(
         "--database",
         type=str,
         default="ggen.db",
@@ -601,6 +563,10 @@ def main():
         filter_desc.append(f"source={args.source}")
     if is_unrelaxed_mode:
         filter_desc.append("unrelaxed (no ORB energy)")
+        if args.hull_surface:
+            filter_desc.append(
+                f"E_hull({args.hull_surface}) ≤ {args.e_above_hull * 1000:.0f} meV"
+            )
     else:
         if args.unstable_only:
             filter_desc.append("dynamically unstable")
@@ -616,6 +582,8 @@ def main():
             source=args.source,
             chemical_system=args.system,
             max_structures=args.max_structures,
+            e_above_hull_cutoff=args.e_above_hull if args.hull_surface else None,
+            hull_surface=args.hull_surface,
         )
     else:
         entries = get_entries_for_relaxation(
@@ -626,6 +594,7 @@ def main():
             unstable_only=args.unstable_only,
             all_structures=args.all,
             source=args.source,
+            hull_surface=args.hull_surface,
         )
 
     if not entries:
@@ -789,39 +758,19 @@ def main():
 
                 # For first-time relaxations, always save
                 if is_unrelaxed_mode:
-                    # Preserve original CIF and space group in metadata
-                    metadata = dict(entry.generation_metadata) if entry.generation_metadata else {}
-                    if entry.cif_content and "mp_original_cif" not in metadata:
-                        metadata["mp_original_cif"] = entry.cif_content
-                        metadata["mp_original_space_group_number"] = entry.space_group_number
-                        metadata["mp_original_space_group_symbol"] = entry.space_group_symbol
-
                     db._update_structure(
                         structure_id=entry.id,
                         energy_per_atom=result["final_energy_per_atom"],
                         total_energy=result["final_total_energy"],
                         cif_content=result["cif_content"],
-                        generation_metadata=metadata,
                         clear_phonon_data=not args.keep_phonons,
                     )
-                    # Update space group
-                    sg_num = result.get("space_group_number")
-                    sg_sym = result.get("space_group_symbol")
-                    if sg_num or sg_sym:
-                        updates = []
-                        values = []
-                        if sg_num:
-                            updates.append("space_group_number = ?")
-                            values.append(sg_num)
-                        if sg_sym:
-                            updates.append("space_group_symbol = ?")
-                            values.append(sg_sym)
-                        values.append(entry.id)
-                        db.conn.execute(
-                            f"UPDATE structures SET {', '.join(updates)} WHERE id = ?",
-                            values,
+                    if result.get("space_group_number") or result.get("space_group_symbol"):
+                        db.update_structure_space_group(
+                            entry.id,
+                            space_group_number=result.get("space_group_number"),
+                            space_group_symbol=result.get("space_group_symbol"),
                         )
-                        db.conn.commit()
 
                     logger.info(
                         f"  {formula} {C.GREEN}✓ Relaxed{C.RESET} "

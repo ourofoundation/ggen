@@ -257,14 +257,19 @@ class SystemExplorer:
         >>> cubic = explorer.get_structures_by_crystal_system("Co-Fe-Mn", "cubic")
     """
 
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(
+        self,
+        db_path: Optional[str] = None,
+        db: Optional[StructureDatabase] = None,
+    ):
         """
         Initialize the system explorer.
 
         Args:
             db_path: Path to the ggen database. Defaults to ./ggen.db
+            db: An open database to use instead (e.g. a read-only snapshot)
         """
-        self.db = StructureDatabase(db_path)
+        self.db = db if db is not None else StructureDatabase(db_path)
 
     def list_systems(self) -> List[str]:
         """List all chemical systems in the database."""

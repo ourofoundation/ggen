@@ -336,7 +336,7 @@ class SystemScout:
                 )
                 if len(entry.elements) > 1
             ]
-            known_polymorphs = self.database.get_known_polymorphs(chemsys)
+            novelty_index = self.database.novelty_index()
 
             targets = set(crystal_systems or [])
             target_formulas: set[str] = set()
@@ -347,7 +347,7 @@ class SystemScout:
                     score.on_hull_count += 1
                 score.near_hull_count += 1
 
-                novelty = self.database.classify_novelty(entry, known_polymorphs)
+                novelty = novelty_index.classify(entry)
                 if novelty == "new composition":
                     score.new_composition_count += 1
                 elif novelty == "new polymorph":
