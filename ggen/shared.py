@@ -43,7 +43,7 @@ WRITER_CLASS = "GGenWriter"
 WRITER_APP_ENV = "GGEN_WRITER_APP"
 
 
-def ingest_remote(shard: bytes, recompute_hulls: bool = True) -> dict:
+def ingest_remote(shard: bytes, recompute_hulls: bool = False) -> dict:
     """Queue a shard on the deployed writer without waiting for the merge.
 
     The writer takes one call at a time and may be busy with a long
@@ -174,8 +174,14 @@ class SharedDatabase:
                 Path(f"{self.path}{suffix}").unlink(missing_ok=True)
             self.volume.commit()
 
-    def merge_shard(self, shard: bytes, recompute_hulls: bool = True) -> dict:
-        """Merge a shard and commit the Volume. Only the writer calls this."""
+    def merge_shard(self, shard: bytes, recompute_hulls: bool = False) -> dict:
+        """Merge a shard and commit the Volume. Only the writer calls this.
+
+        Stored hull distances are not refreshed by default: routes compute
+        hulls fresh, and recomputing every touched system against the file on
+        the Volume is slow. The writer's ``hulls`` maintenance task refreshes
+        them in bulk.
+        """
         started = time.time()
         with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
             Path(tmp.name).write_bytes(shard)
