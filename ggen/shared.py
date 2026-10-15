@@ -151,9 +151,10 @@ class SharedDatabase:
     def exclusive_local_copy(self) -> Iterator[Path]:
         """The whole file on local disk, written back and committed on success.
 
-        For bulk maintenance (imports, hull refreshes) inside the writer: SQLite
-        is much faster on local disk, and since the writer is the only writer,
-        nothing changes the file in the meantime.
+        Every write by the writer goes through this: SQLite is much faster on
+        local disk, the Volume only ever sees a complete file (swapped in by
+        rename), and since the writer is the only writer nothing changes the
+        file in the meantime.
         """
         import shutil
 
@@ -177,22 +178,24 @@ class SharedDatabase:
     def merge_shard(self, shard: bytes, recompute_hulls: bool = False) -> dict:
         """Merge a shard and commit the Volume. Only the writer calls this.
 
+        The merge runs on a local copy that replaces the file in one rename,
+        because a Volume can commit in the background at any moment and must
+        never capture the SQLite file half-written.
+
         Stored hull distances are not refreshed by default: routes compute
-        hulls fresh, and recomputing every touched system against the file on
-        the Volume is slow. The writer's ``hulls`` maintenance task refreshes
+        hulls fresh, and the writer's ``hulls`` maintenance task refreshes
         them in bulk.
         """
         started = time.time()
-        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
-            Path(tmp.name).write_bytes(shard)
-            self.volume.reload()
-            db = StructureDatabase(self.path)
-            try:
-                new, merged = db.merge_from(tmp.name, recompute_hulls=recompute_hulls)
-                db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            finally:
-                db.close()
-        self.volume.commit()
+        with tempfile.TemporaryDirectory(prefix="ggen-shard-") as tmp:
+            shard_path = Path(tmp) / "shard.db"
+            shard_path.write_bytes(shard)
+            with self.exclusive_local_copy() as local:
+                db = StructureDatabase(local)
+                try:
+                    new, merged = db.merge_from(shard_path, recompute_hulls=recompute_hulls)
+                finally:
+                    db.close()
         return {
             "new_structures": new,
             "merged_into_existing": merged,
