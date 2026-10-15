@@ -28,18 +28,25 @@ LICENSES = {
     "alexandria": "CC-BY-4.0",
 }
 
+# Per-record licenses we do not import: Ouro's routes are paid, and this
+# data is licensed for non-commercial use only.
+NON_COMMERCIAL_LICENSES = {"BY-NC"}
+
 
 @dataclass
 class SourceRecord:
     source: str
     source_id: str
-    structure: Structure
+    structure: Optional[Structure]
     # Raw PBE (or PBE+U) energy per atom on ``structure``'s cell.
     energy_per_atom: Optional[float]
     # The source's own MP2020 correction, when it applies MP2020 exactly as
     # we would (Materials Project). Otherwise computed on import.
     correction_per_atom: Optional[float] = None
     parameters: Optional[Dict[str, Any]] = None
+    # The source's license for this record when it varies per record
+    # (Materials Project tags GNoME-derived data "BY-NC").
+    license: Optional[str] = None
     space_group_number: Optional[int] = None
     space_group_symbol: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -48,16 +55,24 @@ class SourceRecord:
 # -------------------- Materials Project --------------------
 
 
-def _mp_chemsys_batches(mpr, batch_size: int, elements: Optional[Sequence[str]]):
-    """All chemical systems with materials, in batches (thermo has no element filter)."""
-    kwargs: Dict[str, Any] = {"fields": ["material_id", "chemsys"]}
+def _mp_summary(mpr, elements: Optional[Sequence[str]]):
+    """All materials' chemical systems, and the ids MP licenses non-commercially."""
+    kwargs: Dict[str, Any] = {"fields": ["material_id", "chemsys", "builder_meta"]}
     if elements:
         kwargs["elements"] = list(elements)
     docs = mpr.materials.summary.search(**kwargs)
     systems = sorted({doc.chemsys for doc in docs})
-    logger.info(f"Materials Project: {len(docs):,} materials in {len(systems):,} systems")
-    for start in range(0, len(systems), batch_size):
-        yield systems[start : start + batch_size]
+    non_commercial = []
+    for doc in docs:
+        license = getattr(getattr(doc, "builder_meta", None), "license", None)
+        license = str(getattr(license, "value", license)) if license else None
+        if license in NON_COMMERCIAL_LICENSES:
+            non_commercial.append((str(doc.material_id), license))
+    logger.info(
+        f"Materials Project: {len(docs):,} materials in {len(systems):,} systems, "
+        f"{len(non_commercial):,} licensed non-commercially"
+    )
+    return systems, non_commercial
 
 
 def materials_project(
@@ -74,19 +89,34 @@ def materials_project(
     from mp_api.client import MPRester
 
     with MPRester(api_key) as mpr:
-        for systems in _mp_chemsys_batches(mpr, batch_size, elements):
+        all_systems, non_commercial = _mp_summary(mpr, elements)
+        # Records without a structure, so the importer retires earlier copies.
+        for material_id, license in non_commercial:
+            yield SourceRecord(
+                source="mp",
+                source_id=material_id,
+                structure=None,
+                energy_per_atom=None,
+                license=license,
+            )
+        for start in range(0, len(all_systems), batch_size):
+            systems = all_systems[start : start + batch_size]
             docs = mpr.materials.thermo.search(
                 thermo_types=["GGA_GGA+U"],
                 chemsys=systems,
                 fields=[
                     "material_id",
+                    "builder_meta",
                     "entries",
                     "symmetry",
                     "energy_per_atom",
                     "energy_above_hull",
                 ],
             )
+            excluded = {material_id for material_id, _ in non_commercial}
             for doc in docs:
+                if str(doc.material_id) in excluded:
+                    continue
                 # The entry this thermo document's energy comes from.
                 entries = [e for e in (doc.entries or {}).values() if e is not None]
                 if not entries or doc.energy_per_atom is None:
@@ -95,9 +125,11 @@ def materials_project(
                 if entry.structure is None:
                     continue
                 symmetry = doc.symmetry
+                license = getattr(getattr(doc, "builder_meta", None), "license", None)
                 yield SourceRecord(
                     source="mp",
                     source_id=str(doc.material_id),
+                    license=str(getattr(license, "value", license)) if license else None,
                     structure=entry.structure,
                     energy_per_atom=entry.uncorrected_energy_per_atom,
                     correction_per_atom=entry.correction_per_atom,

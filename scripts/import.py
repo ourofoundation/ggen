@@ -48,7 +48,14 @@ from typing import Any, Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from ggen import Colors, StructureDatabase
-from ggen.sources import LICENSES, SourceRecord, alexandria, chunk_records, materials_project
+from ggen.sources import (
+    LICENSES,
+    NON_COMMERCIAL_LICENSES,
+    SourceRecord,
+    alexandria,
+    chunk_records,
+    materials_project,
+)
 from ggen.surfaces import PBE, SOURCE_GEOMETRY
 
 warnings.filterwarnings("ignore", category=UserWarning, module="pymatgen")
@@ -70,6 +77,9 @@ def _space_group_symbol(number: int) -> Optional[str]:
 def prepare(record: SourceRecord) -> Optional[Dict[str, Any]]:
     """Everything a record needs written, computed off the main process."""
     from ggen.corrections import mp2020_correction
+
+    if record.license in NON_COMMERCIAL_LICENSES:
+        return {"source_id": record.source_id, "excluded_license": record.license}
 
     structure = record.structure
     composition = structure.composition
@@ -120,9 +130,18 @@ def prepare_batch(records: List[SourceRecord]) -> List[Dict[str, Any]]:
 
 
 def write(db: StructureDatabase, source: str, existing: Dict[str, str], rows) -> Dict[str, int]:
-    counts = {"new": 0, "updated": 0}
+    counts = {"new": 0, "updated": 0, "excluded": 0}
     for row in rows:
         sid = existing.get(row["source_id"])
+        if "excluded_license" in row:
+            # Not imported; a row from an earlier import is retired.
+            if sid is not None:
+                db.conn.execute(
+                    "UPDATE structures SET is_valid = 0, error_message = ?, updated_at = ? WHERE id = ?",
+                    (f"license {row['excluded_license']}", time.strftime("%Y-%m-%dT%H:%M:%S"), sid),
+                )
+            counts["excluded"] += 1
+            continue
         if sid is None:
             sid = db.add_structure(
                 formula=row["formula"],
@@ -215,7 +234,7 @@ def main():
         db.close()
         return
 
-    totals = {"new": 0, "updated": 0}
+    totals = {"new": 0, "updated": 0, "excluded": 0}
     started = time.time()
     with Pool(args.workers) as pool:
         pending = deque()
@@ -245,7 +264,8 @@ def main():
     db.close()
     logger.info("")
     logger.info(
-        f"{C.GREEN}Done:{C.RESET} {totals['new']:,} new, {totals['updated']:,} refreshed "
+        f"{C.GREEN}Done:{C.RESET} {totals['new']:,} new, {totals['updated']:,} refreshed, "
+        f"{totals['excluded']:,} left out for their license "
         f"in {time.time() - started:.0f}s"
     )
     logger.info(f"{C.CYAN}Next:{C.RESET} python scripts/hulls.py --database {args.database} --surface pbe")
