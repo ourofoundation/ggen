@@ -35,12 +35,15 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import os
 import sys
 import time
+import uuid
 import warnings
 from collections import deque
+from functools import lru_cache
 from multiprocessing import Pool
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -48,11 +51,14 @@ from typing import Any, Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from ggen import Colors, StructureDatabase
+from ggen.database import compress_cif
 from ggen.sources import (
     LICENSES,
     NON_COMMERCIAL_LICENSES,
     SourceRecord,
     alexandria,
+    alexandria_chunk,
+    alexandria_chunks,
     chunk_records,
     materials_project,
 )
@@ -65,7 +71,9 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 
+@lru_cache(maxsize=None)
 def _space_group_symbol(number: int) -> Optional[str]:
+    # Building a SpaceGroup costs ~30 ms, most of an import's time uncached.
     from pymatgen.symmetry.groups import SpaceGroup
 
     try:
@@ -74,8 +82,11 @@ def _space_group_symbol(number: int) -> Optional[str]:
         return None
 
 
-def prepare(record: SourceRecord) -> Optional[Dict[str, Any]]:
-    """Everything a record needs written, computed off the main process."""
+_NOW = time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def prepare(record: SourceRecord, source: str) -> Optional[Dict[str, Any]]:
+    """A record as ready-to-insert values, computed off the main process."""
     from ggen.corrections import mp2020_correction
 
     if record.license in NON_COMMERCIAL_LICENSES:
@@ -108,81 +119,120 @@ def prepare(record: SourceRecord) -> Optional[Dict[str, Any]]:
         result = mp2020_correction(structure, record.energy_per_atom, record.parameters)
         correction, run_type, hubbards = result.per_atom, result.run_type, result.hubbards
 
+    stoichiometry = {
+        el.symbol: int(round(n)) for el, n in composition.element_composition.items()
+    }
+    elements = sorted(stoichiometry)
+    formula = composition.reduced_formula
     return {
         "source_id": record.source_id,
-        "formula": composition.reduced_formula,
-        "stoichiometry": {
-            el.symbol: int(round(n)) for el, n in composition.element_composition.items()
-        },
+        "formula": formula,
+        "reduced_formula": formula,
+        "elements": json.dumps(elements),
+        "chemsys": "-".join(elements),
+        "stoichiometry": json.dumps(stoichiometry),
         "num_atoms": len(structure),
         "space_group_number": sg_number,
         "space_group_symbol": sg_symbol,
-        "cif": cif,
+        "structure_hash": StructureDatabase.compute_structure_hash(
+            formula, 0.0, sg_number, source, record.source_id
+        ),
+        "metadata": json.dumps({**record.metadata, "license": LICENSES.get(record.source)}),
+        "cif": compress_cif(cif),
         "energy_per_atom": record.energy_per_atom,
         "correction_per_atom": correction,
-        "parameters": {"run_type": run_type, "hubbards": hubbards or {}},
-        "metadata": {**record.metadata, "license": LICENSES.get(record.source)},
+        "run_type": run_type,
+        "hubbards": json.dumps(hubbards or {}),
     }
 
 
-def prepare_batch(records: List[SourceRecord]) -> List[Dict[str, Any]]:
-    return [p for p in (prepare(r) for r in records) if p is not None]
+def prepare_batch(records: List[SourceRecord], source: str) -> List[Dict[str, Any]]:
+    return [p for p in (prepare(r, source) for r in records) if p is not None]
+
+
+def prepare_alexandria_chunk(path: str, elements: Optional[List[str]]) -> List[Dict[str, Any]]:
+    """One Alexandria chunk, read, parsed and prepared in a worker."""
+    return prepare_batch(list(alexandria_chunk(Path(path), elements)), "alexandria")
 
 
 def write(db: StructureDatabase, source: str, existing: Dict[str, str], rows) -> Dict[str, int]:
-    counts = {"new": 0, "updated": 0, "excluded": 0}
+    """Insert prepared rows in bulk: new structures, refreshed ones, retired ones."""
+    conn = db.conn
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    retired, new, refreshed = [], [], []
     for row in rows:
         sid = existing.get(row["source_id"])
         if "excluded_license" in row:
-            # Not imported; a row from an earlier import is retired.
             if sid is not None:
-                db.conn.execute(
-                    "UPDATE structures SET is_valid = 0, error_message = ?, updated_at = ? WHERE id = ?",
-                    (f"license {row['excluded_license']}", time.strftime("%Y-%m-%dT%H:%M:%S"), sid),
-                )
-            counts["excluded"] += 1
+                retired.append((f"license {row['excluded_license']}", now, sid))
             continue
         if sid is None:
-            sid = db.add_structure(
-                formula=row["formula"],
-                stoichiometry=row["stoichiometry"],
-                energy_per_atom=None,
-                total_energy=None,
-                num_atoms=row["num_atoms"],
-                space_group_number=row["space_group_number"],
-                space_group_symbol=row["space_group_symbol"],
-                cif_content=row["cif"],
-                generation_metadata=row["metadata"],
-                source=source,
-                source_id=row["source_id"],
-                geometry_kind=SOURCE_GEOMETRY,
-                check_existing=False,
-                defer_commit=True,
-            )
+            sid = str(uuid.uuid4())
             existing[row["source_id"]] = sid
-            counts["new"] += 1
+            new.append((sid, row))
         else:
-            db.put_geometry(sid, SOURCE_GEOMETRY, row["cif"], defer_commit=True)
-            db.update_structure_space_group(
-                sid,
-                space_group_number=row["space_group_number"],
-                space_group_symbol=row["space_group_symbol"],
-                defer_commit=True,
+            refreshed.append((sid, row))
+
+    conn.executemany(
+        "UPDATE structures SET is_valid = 0, error_message = ?, updated_at = ? WHERE id = ?",
+        retired,
+    )
+    conn.executemany(
+        """
+        INSERT INTO structures (
+            id, source, source_id, formula, reduced_formula, elements, chemsys,
+            stoichiometry, num_atoms, space_group_number, space_group_symbol,
+            structure_hash, is_valid, error_message, metadata, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?)
+        """,
+        (
+            (
+                sid, source, r["source_id"], r["formula"], r["reduced_formula"],
+                r["elements"], r["chemsys"], r["stoichiometry"], r["num_atoms"],
+                r["space_group_number"], r["space_group_symbol"], r["structure_hash"],
+                r["metadata"], now, now,
             )
-            counts["updated"] += 1
-        if row["energy_per_atom"] is not None:
-            db.set_calculation(
-                sid,
-                row["energy_per_atom"],
-                surface=PBE.id,
-                total_energy=row["energy_per_atom"] * row["num_atoms"],
-                correction_per_atom=row["correction_per_atom"],
-                compute_correction=False,
-                parameters=row["parameters"],
-                defer_commit=True,
+            for sid, r in new
+        ),
+    )
+    conn.executemany(
+        """
+        UPDATE structures SET space_group_number = COALESCE(?, space_group_number),
+            space_group_symbol = COALESCE(?, space_group_symbol), updated_at = ?
+        WHERE id = ?
+        """,
+        ((r["space_group_number"], r["space_group_symbol"], now, sid) for sid, r in refreshed),
+    )
+    conn.executemany(
+        "INSERT OR REPLACE INTO geometries (structure_id, kind, cif) VALUES (?, ?, ?)",
+        ((sid, SOURCE_GEOMETRY, r["cif"]) for sid, r in new + refreshed),
+    )
+    conn.executemany(
+        """
+        INSERT INTO calculations (
+            structure_id, surface, energy_per_atom, total_energy, correction_per_atom,
+            run_type, hubbards, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (structure_id, surface) DO UPDATE SET
+            energy_per_atom = excluded.energy_per_atom,
+            total_energy = excluded.total_energy,
+            correction_per_atom = excluded.correction_per_atom,
+            run_type = excluded.run_type,
+            hubbards = excluded.hubbards,
+            e_above_hull = NULL, is_on_hull = NULL, hull_computed_at = NULL,
+            updated_at = excluded.updated_at
+        """,
+        (
+            (
+                sid, PBE.id, r["energy_per_atom"], r["energy_per_atom"] * r["num_atoms"],
+                r["correction_per_atom"], r["run_type"], r["hubbards"], now, now,
             )
-    db._commit()
-    return counts
+            for sid, r in new + refreshed
+            if r["energy_per_atom"] is not None
+        ),
+    )
+    conn.commit()
+    return {"new": len(new), "updated": len(refreshed), "excluded": len(retired)}
 
 
 def main():
@@ -249,10 +299,20 @@ def main():
                 f"at {done / (time.time() - started):,.0f}/s"
             )
 
-        for batch in chunk_records(records, args.batch):
-            pending.append(pool.apply_async(prepare_batch, (batch,)))
-            if len(pending) >= args.workers * 2:
-                drain_one()
+        if source == "alexandria":
+            # Whole chunk files per worker: reading and parsing them is most
+            # of the work, so it must not happen in the main process.
+            for path in alexandria_chunks(Path(args.alexandria_local_dir), args.alexandria_local_pattern):
+                pending.append(
+                    pool.apply_async(prepare_alexandria_chunk, (str(path), args.elements))
+                )
+                if len(pending) >= args.workers:
+                    drain_one()
+        else:
+            for batch in chunk_records(records, args.batch):
+                pending.append(pool.apply_async(prepare_batch, (batch, source)))
+                if len(pending) >= args.workers * 2:
+                    drain_one()
         while pending:
             drain_one()
 

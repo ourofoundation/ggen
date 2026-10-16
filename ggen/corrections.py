@@ -57,6 +57,14 @@ def hubbard_parameters(composition: Composition) -> Dict[str, Any]:
     return {"run_type": "GGA", "is_hubbard": False, "hubbards": {}}
 
 
+@lru_cache(maxsize=1)
+def _corrected_elements() -> frozenset:
+    """Elements MP2020 can adjust for; oxide types all mean oxygen."""
+    keys = set(_compatibility().comp_correction)
+    oxide_types = {"oxide", "peroxide", "superoxide", "ozonide"}
+    return frozenset((keys - oxide_types) | ({"O"} if keys & oxide_types else set()))
+
+
 @dataclass
 class Correction:
     """MP2020 result for one entry. ``per_atom`` is None if MP2020 rejects it."""
@@ -83,6 +91,12 @@ def mp2020_correction(
     beside a conventional CIF), which is why everything here is per atom.
     """
     params = dict(parameters) if parameters else hubbard_parameters(structure.composition)
+    # Without any element MP2020 adjusts (and so without +U, which needs O or
+    # F) there is nothing to correct; skip pymatgen's oxidation-state work,
+    # most of an import's time.
+    elements = {el.symbol for el in structure.composition.elements}
+    if not elements & _corrected_elements() and params.get("run_type") != "GGA+U":
+        return Correction(per_atom=0.0, run_type=params.get("run_type", "GGA"), hubbards={})
     entry = ComputedStructureEntry(
         structure, energy_per_atom * len(structure), parameters=params
     )

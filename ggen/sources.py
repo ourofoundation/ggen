@@ -169,9 +169,18 @@ def _alexandria_record(entry: Dict[str, Any]) -> Optional[SourceRecord]:
     if not material_id or not structure_dict:
         return None
     try:
-        structure = Structure.from_dict(structure_dict)
+        # Built from the arrays directly: Structure.from_dict costs ~6 ms.
+        sites = structure_dict["sites"]
+        structure = Structure(
+            structure_dict["lattice"]["matrix"],
+            [site["species"][0]["element"] for site in sites],
+            [site["abc"] for site in sites],
+        )
     except Exception:
-        return None
+        try:
+            structure = Structure.from_dict(structure_dict)
+        except Exception:
+            return None
     energy_total = data.get("energy_total")
     sg_number = data.get("spg")
     return SourceRecord(
@@ -192,30 +201,41 @@ def _alexandria_record(entry: Dict[str, Any]) -> Optional[SourceRecord]:
     )
 
 
+def alexandria_chunks(directory: Path, pattern: str = "alexandria_*.json.bz2") -> List[Path]:
+    chunks = sorted(Path(directory).glob(pattern))
+    if not chunks:
+        raise FileNotFoundError(f"No files matching {pattern!r} in {directory}")
+    return chunks
+
+
+def alexandria_chunk(
+    path: Path, elements: Optional[Sequence[str]] = None
+) -> Iterator[SourceRecord]:
+    """Records in one downloaded Alexandria chunk file."""
+    wanted = set(elements or [])
+    with bz2.open(path, "rt") as handle:
+        payload = json.load(handle)
+    for entry in payload.get("entries", []):
+        if wanted:
+            entry_elements = set((entry.get("data") or {}).get("elements") or [])
+            if not wanted <= entry_elements:
+                continue
+        record = _alexandria_record(entry)
+        if record is not None:
+            yield record
+
+
 def alexandria(
     directory: Path,
     pattern: str = "alexandria_*.json.bz2",
     elements: Optional[Sequence[str]] = None,
 ) -> Iterator[SourceRecord]:
     """Alexandria PBE entries from the downloaded ``.json.bz2`` chunk files."""
-    chunks = sorted(Path(directory).glob(pattern))
-    if not chunks:
-        raise FileNotFoundError(f"No files matching {pattern!r} in {directory}")
-    wanted = set(elements or [])
+    chunks = alexandria_chunks(directory, pattern)
     logger.info(f"Alexandria: {len(chunks)} chunk files in {directory}")
     for chunk in chunks:
         logger.info(f"  {chunk.name}")
-        with bz2.open(chunk, "rt") as handle:
-            payload = json.load(handle)
-        for entry in payload.get("entries", []):
-            if wanted:
-                entry_elements = set((entry.get("data") or {}).get("elements") or [])
-                if not wanted <= entry_elements:
-                    continue
-            record = _alexandria_record(entry)
-            if record is not None:
-                yield record
-        del payload
+        yield from alexandria_chunk(chunk, elements)
         gc.collect()
 
 
