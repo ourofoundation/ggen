@@ -1319,7 +1319,8 @@ class StructureDatabase:
         try:
             pd = PhaseDiagram(pd_entries)
         except Exception as e:
-            logger.error(f"Failed to build phase diagram for {chemsys}: {e}")
+            # Usually a missing elemental reference on this surface.
+            logger.warning(f"No phase diagram for {chemsys}: {e}")
             return None, {}, filter_counts
 
         e_above_hull_map: Dict[str, float] = {}
