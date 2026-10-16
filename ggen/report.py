@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from pymatgen.analysis.phase_diagram import PhaseDiagram
 
 from .colors import Colors
-from .database import StructureDatabase, StoredStructure
+from crystaldb.database import StructureDatabase, StoredStructure
 
 
 def get_crystal_system(sg_number: int) -> str:

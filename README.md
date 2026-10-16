@@ -10,7 +10,10 @@ The goal: **find materials that could actually exist in nature or be synthesized
 
 ## Installation
 
+GGen stores structures in a [crystal-db](https://github.com/ourofoundation/crystal-db) database; install it first:
+
 ```bash
+pip install "crystaldb @ git+https://github.com/ourofoundation/crystal-db.git"
 git clone https://github.com/ourofoundation/ggen.git
 cd ggen
 pip install -e .
@@ -353,24 +356,19 @@ A promising synthesis candidate should be both thermodynamically stable (or near
 
 ### The Structure Database and Energy Surfaces
 
-The SQLite database (`ggen/database.py`, schema version 2) holds GGen's output alongside reference structures from Materials Project and Alexandria. Every energy belongs to one **energy surface** (`ggen/surfaces.py`): `pbe` for the published DFT energies, or an MLIP such as `orb-v3-conservative-inf-mpa`. A `StructureDatabase` reads and writes one surface, chosen when it is opened, and a hull is only ever built from one surface's energies.
+GGen stores everything in a [crystal-db](https://github.com/ourofoundation/crystal-db) database: one SQLite file holding GGen's output alongside reference structures from Materials Project and Alexandria.
+- **Surfaces:** every energy belongs to one energy surface. That's `pbe` for the published DFT energies, or an MLIP such as `orb-v3-conservative-inf-mpa`. A hull is only ever built from one surface's energies.
+- **Corrections:** MP2020 is applied on every surface, so GGA and GGA+U phases share a hull.
+- **Novelty:** matching against the published references answers "is this structure already known?".
 
-- `structures` holds identity only; `geometries` holds compressed CIFs per slot (`source` as published, or relaxed on a surface); `calculations` holds per-surface raw energies, MP2020 corrections, hull distances and phonon results.
-- MP2020 corrections (`ggen/corrections.py`) are applied to every surface, MLIP energies included, so GGA and GGA+U phases share a hull. Raw energies are stored; Materials Project's own corrections are kept, Alexandria's are recomputed (its published corrected energies follow a different scheme).
-- `ggen/matching.py` answers "is this structure already known?" with StructureMatcher against every reference of the same reduced formula.
+Reference data and hull distances come from crystal-db's scripts (`import.py`, `published_hulls.py`, `hulls.py`), run from a checkout of that repository.
 
 ```bash
-# Version 1 database -> version 2
-python scripts/migrate_v2.py ggen.db ggen.v2.db
-# Reference data with PBE energies (re-running refreshes in place)
-python scripts/import.py --database ggen.v2.db --provider mp
-python scripts/import.py --database ggen.v2.db --provider alexandria --alexandria-local-dir alexandria/
-# Hull distances on a surface, then MLIP energies for phases near the PBE hull
-python scripts/hulls.py --database ggen.v2.db --surface pbe
-python scripts/relax.py --database ggen.v2.db --unrelaxed --hull-surface pbe --e-above-hull 0.1
+python crystal-db/scripts/import.py --database ggen.db --provider mp
+python crystal-db/scripts/hulls.py --database ggen.db --surface pbe
+# MLIP energies for phases near the PBE hull
+python scripts/relax.py --database ggen.db --unrelaxed --hull-surface pbe --e-above-hull 0.1
 ```
-
-On Modal the file lives on the `ggen-data` Volume and only the ggen app's `GGenWriter` writes it; workers send it shards of what they changed (`ggen/shared.py`).
 
 ## Features
 
@@ -571,8 +569,8 @@ Built on [PyXtal](https://github.com/qzhu2017/PyXtal), [pymatgen](https://github
 
 
 
-# 1. Import external structures (MP by default)
-python scripts/import.py --database ggen.db --provider mp
+# 1. Import external structures (MP by default), with crystal-db's importer
+python crystal-db/scripts/import.py --database ggen.db --provider mp
 
 # 2. Relax with ORB (consistent energy domain)
 python scripts/relax.py --source mp --unrelaxed --batch-size 32

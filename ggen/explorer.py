@@ -37,7 +37,7 @@ from .ggen import GGen
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .database import StructureDatabase
+    from crystaldb.database import StructureDatabase
 
 logger = logging.getLogger(__name__)
 

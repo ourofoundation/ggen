@@ -33,7 +33,7 @@ from typing import List, Optional, Tuple
 SupercellDims = Tuple[int, int, int]
 
 from ggen import Colors, StructureDatabase
-from ggen.database import StoredStructure
+from crystaldb.database import StoredStructure
 from ggen.phonons import calculate_phonons
 
 # Suppress warnings

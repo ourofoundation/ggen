@@ -35,7 +35,7 @@ from pyxtal.symmetry import Group
 from tqdm import tqdm
 
 from ggen.calculator import get_orb_calculator
-from ggen.database import StructureDatabase, StoredStructure
+from crystaldb.database import StructureDatabase, StoredStructure
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)

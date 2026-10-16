@@ -13,7 +13,7 @@ serverless web tier) don't pay the cost of the GPU stack just to do
 """
 
 from .colors import Colors
-from .database import ExplorationRun, StoredStructure, StructureDatabase
+from crystaldb.database import ExplorationRun, StoredStructure, StructureDatabase
 from .elements import get_element_group, list_groups, resolve_candidates
 from .operations import MutationError, Operations
 from .report import SpaceGroupStats, StabilityStats, SystemExplorer, SystemReport

@@ -39,6 +39,8 @@ classifiers = [
 ]
 requires-python = ">=3.8"
 dependencies = [
+    # Install from https://github.com/ourofoundation/crystal-db until it is on PyPI.
+    "crystaldb>=0.1",
     "numpy>=1.20.0",
     "scipy>=1.7.0",
     "pymatgen>=2023.0.0",
@@ -53,7 +55,6 @@ dependencies = [
     "phonopy>=2.20.0",
     "matplotlib>=3.0",
     "seekpath>=2.0",
-    "mp-api>=0.45.8",
 ]
 
 [project.optional-dependencies]

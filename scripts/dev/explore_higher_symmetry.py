@@ -29,7 +29,7 @@ from tqdm import tqdm
 
 from ggen import GGen
 from ggen.calculator import get_orb_calculator
-from ggen.database import StructureDatabase
+from crystaldb.database import StructureDatabase
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)

@@ -44,7 +44,7 @@ from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 
 from ggen import Colors, StructureDatabase
 from ggen.calculator import build_orb_torchsim_model
-from ggen.database import StoredStructure
+from crystaldb.database import StoredStructure
 from ggen.ggen import _atoms_to_torchsim_state_with_charge_spin
 
 # Suppress warnings

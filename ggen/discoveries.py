@@ -17,7 +17,7 @@ from typing import Dict, List, Optional
 
 from pymatgen.core import Composition
 
-from .database import StoredStructure, StructureDatabase
+from crystaldb.database import StoredStructure, StructureDatabase
 
 
 @dataclass

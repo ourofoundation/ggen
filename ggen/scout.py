@@ -19,7 +19,7 @@ import torch
 
 from .calculator import RSS_LIMIT_MB, reset_dynamo_cache, rss_mb
 from .colors import Colors
-from .database import StructureDatabase
+from crystaldb.database import StructureDatabase
 from .explorer import ChemistryExplorer, ExplorationResult
 from .report import get_crystal_system
 from .utils import normalize_dashes
