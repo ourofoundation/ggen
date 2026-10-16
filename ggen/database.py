@@ -1656,25 +1656,27 @@ class StructureDatabase:
         # Terminal elements are on the hull by construction, so the hull counts
         # only cover compounds, one per reduced formula. Each hull is per
         # system, hence the summation.
+        # Hulls are computed fresh, like get_hull_entries: stored distances
+        # miss structures added since the system's last hull refresh.
         on_hull = near_hull = 0
         for chemsys in chemsys_list:
-            subs = self.get_all_subsystems(chemsys.split("-"))
-            row = self.conn.execute(
-                f"""
-                SELECT SUM(best < ?) AS on_hull, SUM(best <= ?) AS near_hull FROM (
-                    SELECT MIN(c.e_above_hull) AS best
-                    FROM structures s
-                    JOIN calculations c ON c.structure_id = s.id AND c.surface = ?
-                    WHERE s.is_valid = 1 AND s.chemsys LIKE '%-%'
-                      AND s.chemsys IN ({','.join('?' * len(subs))})
-                      AND c.e_above_hull IS NOT NULL
-                    GROUP BY s.reduced_formula
-                )
-                """,
-                [ON_HULL_TOLERANCE, e_above_hull_cutoff, self.surface, *subs],
-            ).fetchone()
-            on_hull += row["on_hull"] or 0
-            near_hull += row["near_hull"] or 0
+            _, e_hull, _ = self.compute_hull(chemsys, update_database=False)
+            ids = list(e_hull)
+            best: Dict[str, float] = {}
+            for start in range(0, len(ids), 500):
+                part = ids[start : start + 500]
+                for row in self.conn.execute(
+                    f"""
+                    SELECT id, reduced_formula FROM structures
+                    WHERE id IN ({','.join('?' * len(part))}) AND chemsys LIKE '%-%'
+                    """,
+                    part,
+                ):
+                    e = e_hull[row["id"]]
+                    if e < best.get(row["reduced_formula"], float("inf")):
+                        best[row["reduced_formula"]] = e
+            on_hull += sum(1 for e in best.values() if e < ON_HULL_TOLERANCE)
+            near_hull += sum(1 for e in best.values() if e <= e_above_hull_cutoff)
 
         system_placeholders = ",".join("?" * len(chemsys_list))
         runs = self.conn.execute(
