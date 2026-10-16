@@ -196,6 +196,8 @@ def _alexandria_record(entry: Dict[str, Any]) -> Optional[SourceRecord]:
             "alexandria_band_gap": data.get("band_gap_ind", data.get("band_gap_dir")),
             # PBE total magnetic moment of the cell (μB)
             "alexandria_total_mag": data.get("total_mag"),
+            # Distance to Alexandria's own hull (its corrections), eV/atom
+            "alexandria_e_above_hull": data.get("e_above_hull"),
             "alexandria_last_modified": data.get("last_modified"),
         },
     )
