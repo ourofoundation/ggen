@@ -265,6 +265,10 @@ class CandidateResult:
     is_dynamically_stable: Optional[bool] = None
     phonon_result: Optional[Any] = None  # PhononResult from phonons module
 
+    # The formula's other relaxed trials (``crystaldb.intake.Generated``),
+    # stored with this candidate once it is saved, each distinct crystal once.
+    trials: List[Any] = field(default_factory=list, repr=False)
+
     def get_structure(self) -> Optional[Structure]:
         """Get the structure, loading from CIF if not in memory."""
         if self.structure is not None:
@@ -288,6 +292,31 @@ class CandidateResult:
     def clear_structure(self) -> None:
         """Clear structure from memory (can be reloaded from CIF)."""
         self.structure = None
+
+
+def _trial_items(trials: Optional[List[Dict[str, Any]]]) -> List[Any]:
+    """A selection's other relaxed trials as items for
+    ``crystaldb.intake.add_unique``; each trial's structure is released."""
+    from crystaldb.intake import Generated
+
+    items = []
+    for trial in trials or []:
+        structure = trial.get("structure")
+        if structure is None:
+            continue
+        items.append(
+            Generated(
+                structure,
+                float(trial["energy_per_atom"]),
+                {
+                    "is_additional_trial": True,
+                    "original_space_group": trial.get("original_space_group"),
+                    "optimization_steps": trial.get("optimization_steps", 0),
+                },
+            )
+        )
+        trial["structure"] = None
+    return items
 
 
 def _failed_candidate(
@@ -792,46 +821,41 @@ class ChemistryExplorer:
         )
         conn.commit()
 
-        # Also save to unified database if available. Structures loaded from it
-        # are already stored there.
-        already_stored = candidate.generation_metadata.get("loaded_from_unified_db")
-        if self.database is not None and candidate.is_valid and not already_stored:
-            try:
-                # Get CIF content
-                cif_content = None
+        # Also save to the unified database if available, each distinct
+        # crystal once (``crystaldb.intake.add_unique``): the winner and the
+        # formula's other relaxed trials are collapsed together, and any that
+        # equal a stored structure are linked to this run instead. A winner
+        # loaded from the database is stored there already.
+        if self.database is not None:
+            from crystaldb.intake import Generated, add_unique
+
+            items = list(candidate.trials)
+            winner = None
+            already_stored = candidate.generation_metadata.get("loaded_from_unified_db")
+            if candidate.is_valid and not already_stored:
                 structure = candidate.get_structure()
                 if structure is not None:
-                    try:
-                        cif_content = structure.to(fmt="cif")
-                    except Exception:
-                        pass
-                elif candidate.cif_path and candidate.cif_path.exists():
-                    cif_content = candidate.cif_path.read_text()
-
-                self.database.add_structure(
-                    formula=candidate.formula,
-                    stoichiometry=candidate.stoichiometry,
-                    energy_per_atom=float(candidate.energy_per_atom),
-                    total_energy=float(candidate.total_energy),
-                    num_atoms=int(candidate.num_atoms),
-                    space_group_number=int(candidate.space_group_number),
-                    space_group_symbol=candidate.space_group_symbol,
-                    cif_content=cif_content,
-                    structure=structure,
-                    is_valid=candidate.is_valid,
-                    error_message=candidate.error_message,
-                    generation_metadata=metadata,
-                    run_id=self._unified_run_id,
-                    is_dynamically_stable=is_dynamically_stable,
-                    num_imaginary_modes=num_imaginary_modes,
-                    min_phonon_frequency=min_phonon_frequency,
-                    max_phonon_frequency=max_phonon_frequency,
-                    phonon_supercell=phonon_supercell,
-                )
+                    winner = Generated(structure, float(candidate.energy_per_atom), metadata)
+                    items.insert(0, winner)
+            try:
+                for item, _, intake in add_unique(
+                    self.database, items, source="ggen", run_id=self._unified_run_id
+                ):
+                    if item is winner and is_dynamically_stable is not None:
+                        self.database._set_phonons(
+                            intake.structure_id,
+                            self.database.surface,
+                            is_dynamically_stable=is_dynamically_stable,
+                            num_imaginary_modes=num_imaginary_modes,
+                            min_phonon_frequency=min_phonon_frequency,
+                            max_phonon_frequency=max_phonon_frequency,
+                            phonon_supercell=phonon_supercell,
+                        )
             except Exception as e:
                 logger.warning(
                     f"Failed to save {candidate.formula} to unified database: {e}"
                 )
+            candidate.trials = []
 
         return cursor.lastrowid
 
@@ -1140,55 +1164,10 @@ class ChemistryExplorer:
         num_atoms = len(structure)
         energy_per_atom = energy / num_atoms
 
-        # Save additional relaxed trials (polymorphs) to unified database
-        # These are valuable structures that were fully relaxed but weren't the best
-        additional_trials = result.get("all_relaxed_trials", [])
-        if additional_trials and self.database is not None:
-            for trial in additional_trials:
-                try:
-                    trial_struct = trial["structure"]
-                    trial_cif = trial_struct.to(fmt="cif")
-                    self.database.add_structure(
-                        formula=formula,
-                        stoichiometry=stoichiometry,
-                        energy_per_atom=float(trial["energy_per_atom"]),
-                        total_energy=float(trial["energy"]),
-                        num_atoms=int(trial["num_atoms"]),
-                        space_group_number=int(trial["space_group_number"]),
-                        space_group_symbol=trial["space_group_symbol"],
-                        cif_content=trial_cif,
-                        structure=None,  # Don't store structure object to save memory
-                        is_valid=True,
-                        generation_metadata={
-                            "is_additional_trial": True,
-                            "original_space_group": trial.get(
-                                "original_space_group"
-                            ),
-                            "optimization_steps": trial.get(
-                                "optimization_steps", 0
-                            ),
-                        },
-                        run_id=self._unified_run_id,
-                    )
-                    # Clear structure from trial dict to free memory
-                    trial["structure"] = None
-                except Exception as e:
-                    logger.debug(
-                        f"Failed to save additional trial for {formula}: {e}"
-                    )
-
-            if additional_trials:
-                logger.debug(
-                    f"Saved {len(additional_trials)} additional polymorphs for {formula}"
-                )
-
-        # Track count before clearing
-        num_trials_saved = len(additional_trials)
-
-        # Clear all_relaxed_trials from result to free memory
-        # (we've already saved them to the database and set structures to None)
+        # The other relaxed trials are stored with the winner when it is
+        # saved (``_save_candidate``), each distinct crystal once.
+        trials = _trial_items(result.get("all_relaxed_trials"))
         result["all_relaxed_trials"] = None
-        del additional_trials
 
         return CandidateResult(
             formula=formula,
@@ -1203,8 +1182,9 @@ class ChemistryExplorer:
                 "generation_stats": result.get("generation_stats", {}),
                 "score_breakdown": result.get("score_breakdown", {}),
                 "optimization_steps": result.get("optimization_steps", 0),
-                "num_additional_trials_saved": num_trials_saved,
+                "num_additional_trials": len(trials),
             },
+            trials=trials,
         )
 
     def _save_structure_cif(
@@ -1282,6 +1262,8 @@ class ChemistryExplorer:
                     f"(prev={prev_candidate.energy_per_atom:.4f} vs "
                     f"new={candidate.energy_per_atom:.4f} eV/atom)"
                 )
+                # This run's relaxations are still stored with it.
+                prev_candidate.trials = candidate.trials
                 candidate = prev_candidate
                 candidate.generation_metadata["reused_from_previous"] = True
 
@@ -1628,50 +1610,7 @@ class ChemistryExplorer:
                         error_message=result_dict["error_message"],
                     )
 
-                    # Save additional relaxed trials (polymorphs) to unified database
-                    additional_trials = result_dict.get("all_relaxed_trials", [])
-                    if additional_trials and self.database is not None:
-                        stoich = result_dict["stoichiometry"]
-                        for trial in additional_trials:
-                            try:
-                                trial_struct = trial["structure"]
-                                trial_cif = trial_struct.to(fmt="cif")
-                                self.database.add_structure(
-                                    formula=result_dict["formula"],
-                                    stoichiometry=stoich,
-                                    energy_per_atom=float(trial["energy_per_atom"]),
-                                    total_energy=float(trial["energy"]),
-                                    num_atoms=int(trial["num_atoms"]),
-                                    space_group_number=int(trial["space_group_number"]),
-                                    space_group_symbol=trial["space_group_symbol"],
-                                    cif_content=trial_cif,
-                                    structure=None,  # Don't store structure object to save memory
-                                    is_valid=True,
-                                    generation_metadata={
-                                        "is_additional_trial": True,
-                                        "original_space_group": trial.get(
-                                            "original_space_group"
-                                        ),
-                                        "optimization_steps": trial.get(
-                                            "optimization_steps", 0
-                                        ),
-                                    },
-                                    run_id=self._unified_run_id,
-                                )
-                                # Clear structure from trial dict to free memory
-                                trial["structure"] = None
-                            except Exception as e:
-                                logger.debug(
-                                    f"Failed to save additional trial for {formula}: {e}"
-                                )
-
-                        if additional_trials:
-                            logger.debug(
-                                f"Saved {len(additional_trials)} additional polymorphs for {formula}"
-                            )
-
-                    # Clear the trials list from result dict to free memory
-                    result_dict["all_relaxed_trials"] = None
+                    candidate.trials = _trial_items(result_dict.get("all_relaxed_trials"))
 
                     # If we have a previous structure and this one failed or is worse, use the previous
                     if formula in previous_structures:
@@ -1684,6 +1623,7 @@ class ChemistryExplorer:
                             logger.debug(
                                 f"Using better structure from previous run for {formula}"
                             )
+                            prev_candidate.trials = candidate.trials
                             candidate = prev_candidate
                             candidate.generation_metadata["reused_from_previous"] = True
 
