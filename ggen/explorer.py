@@ -115,56 +115,28 @@ def _generate_structure_worker(args: Dict[str, Any]) -> Dict[str, Any]:
         if structure is None:
             raise ValueError("No structure generated")
 
-        energy = result["best_crystal_energy"]
-        num_atoms = len(structure)
-        energy_per_atom = energy / num_atoms
-
-        # Extract data before cleanup
-        all_relaxed_trials = result.get("all_relaxed_trials", [])
-        final_space_group = result["final_space_group"]
-        final_space_group_symbol = result["final_space_group_symbol"]
-        generation_stats = result.get("generation_stats", {})
-        score_breakdown = result.get("score_breakdown", {})
-        optimization_steps = result.get("optimization_steps", 0)
+        # The part of the selection ``_candidate_from_selection`` reads,
+        # extracted before cleanup so the worker can free the rest.
+        selection = {
+            "structure": structure,
+            "best_crystal_energy": result["best_crystal_energy"],
+            "final_space_group": result["final_space_group"],
+            "final_space_group_symbol": result["final_space_group_symbol"],
+            "generation_stats": result.get("generation_stats", {}),
+            "score_breakdown": result.get("score_breakdown", {}),
+            "optimization_steps": result.get("optimization_steps", 0),
+            # Additional relaxed trials (polymorphs) for database storage
+            "all_relaxed_trials": result.get("all_relaxed_trials", []),
+        }
 
         # Clean up to free memory in this worker process
         ggen.cleanup()
         del result
 
-        return {
-            "formula": formula,
-            "stoichiometry": stoichiometry,
-            "energy_per_atom": energy_per_atom,
-            "total_energy": energy,
-            "num_atoms": num_atoms,
-            "space_group_number": final_space_group,
-            "space_group_symbol": final_space_group_symbol,
-            "structure": structure,
-            "generation_metadata": {
-                "generation_stats": generation_stats,
-                "score_breakdown": score_breakdown,
-                "optimization_steps": optimization_steps,
-            },
-            "is_valid": True,
-            "error_message": None,
-            # Additional relaxed trials (polymorphs) for database storage
-            "all_relaxed_trials": all_relaxed_trials,
-        }
+        return {"formula": formula, "stoichiometry": stoichiometry, "selection": selection}
 
     except Exception as e:
-        return {
-            "formula": formula,
-            "stoichiometry": stoichiometry,
-            "energy_per_atom": float("nan"),
-            "total_energy": float("nan"),
-            "num_atoms": 0,
-            "space_group_number": 0,
-            "space_group_symbol": "",
-            "structure": None,
-            "generation_metadata": {},
-            "is_valid": False,
-            "error_message": str(e),
-        }
+        return {"formula": formula, "stoichiometry": stoichiometry, "error": str(e)}
 
 
 _WORKER_GENERATORS: Dict[Optional[int], Any] = {}
@@ -1247,6 +1219,7 @@ class ChemistryExplorer:
 
         Returns the candidate that was recorded (the new one, or the previously
         known one if that is lower in energy) and whether it counts as a success.
+        Either way every relaxed cell this run produced is stored.
         """
         succeeded = False
         # If we have a previous structure and this one failed or is worse, use the previous
@@ -1262,8 +1235,22 @@ class ChemistryExplorer:
                     f"(prev={prev_candidate.energy_per_atom:.4f} vs "
                     f"new={candidate.energy_per_atom:.4f} eV/atom)"
                 )
-                # This run's relaxations are still stored with it.
-                prev_candidate.trials = candidate.trials
+                # This run's relaxations, the losing winner included, are
+                # still stored with it.
+                prev_candidate.trials = _trial_items(
+                    [
+                        {
+                            "structure": candidate.structure,
+                            "energy_per_atom": candidate.energy_per_atom,
+                            "original_space_group": candidate.space_group_number,
+                            "optimization_steps": candidate.generation_metadata.get(
+                                "optimization_steps", 0
+                            ),
+                        }
+                    ]
+                    if candidate.is_valid
+                    else []
+                ) + candidate.trials
                 candidate = prev_candidate
                 candidate.generation_metadata["reused_from_previous"] = True
 
@@ -1594,85 +1581,35 @@ class ChemistryExplorer:
 
                 try:
                     result_dict = future.result()
-
-                    # Convert dict to CandidateResult
-                    candidate = CandidateResult(
-                        formula=result_dict["formula"],
-                        stoichiometry=result_dict["stoichiometry"],
-                        energy_per_atom=result_dict["energy_per_atom"],
-                        total_energy=result_dict["total_energy"],
-                        num_atoms=result_dict["num_atoms"],
-                        space_group_number=result_dict["space_group_number"],
-                        space_group_symbol=result_dict["space_group_symbol"],
-                        structure=result_dict["structure"],
-                        generation_metadata=result_dict["generation_metadata"],
-                        is_valid=result_dict["is_valid"],
-                        error_message=result_dict["error_message"],
+                    if "error" in result_dict:
+                        raise ValueError(result_dict["error"])
+                    candidate = self._candidate_from_selection(
+                        args["stoichiometry"], formula, result_dict["selection"]
                     )
-
-                    candidate.trials = _trial_items(result_dict.get("all_relaxed_trials"))
-
-                    # If we have a previous structure and this one failed or is worse, use the previous
-                    if formula in previous_structures:
-                        prev_candidate = previous_structures[formula]
-                        if not candidate.is_valid or (
-                            prev_candidate.is_valid
-                            and prev_candidate.energy_per_atom
-                            < candidate.energy_per_atom
-                        ):
-                            logger.debug(
-                                f"Using better structure from previous run for {formula}"
-                            )
-                            prev_candidate.trials = candidate.trials
-                            candidate = prev_candidate
-                            candidate.generation_metadata["reused_from_previous"] = True
-
-                    if candidate.is_valid and candidate.structure is not None:
-                        # Save CIF
-                        cif_path = self._save_structure_cif(candidate, structures_dir)
-                        candidate.cif_path = cif_path
-                        num_successful += 1
-
-                        # Calculate phonon stability if enabled
-                        if compute_phonons:
-                            self._calculate_phonon_stability(
-                                candidate,
-                                supercell=phonon_supercell,
-                                show_progress=False,  # Don't show individual progress in parallel mode
-                            )
-
-                        # Clear structure from memory if not needed
-                        if not keep_structures_in_memory:
-                            candidate.clear_structure()
-                    else:
-                        num_failed += 1
-
-                    # Save to database
-                    self._save_candidate(conn, candidate)
-                    candidates.append(candidate)
-
-                    # Drop task-local Python objects without flushing the CUDA
-                    # allocator or compile caches between stoichiometries.
-                    gc.collect()
-
                 except Exception as e:
                     logger.warning(f"Worker failed for {formula}: {e}")
-                    # Create a failed candidate
-                    candidate = CandidateResult(
-                        formula=formula,
-                        stoichiometry=args["stoichiometry"],
-                        energy_per_atom=float("nan"),
-                        total_energy=float("nan"),
-                        num_atoms=0,
-                        space_group_number=0,
-                        space_group_symbol="",
-                        structure=None,
-                        is_valid=False,
-                        error_message=str(e),
-                    )
-                    self._save_candidate(conn, candidate)
-                    candidates.append(candidate)
+                    candidate = _failed_candidate(formula, args["stoichiometry"], e)
+
+                candidate, succeeded = self._record_candidate(
+                    candidate,
+                    formula,
+                    previous_structures,
+                    structures_dir,
+                    conn,
+                    compute_phonons,
+                    phonon_supercell,
+                    False,  # No per-structure phonon progress in parallel mode
+                    keep_structures_in_memory,
+                )
+                if succeeded:
+                    num_successful += 1
+                else:
                     num_failed += 1
+                candidates.append(candidate)
+
+                # Drop task-local Python objects without flushing the CUDA
+                # allocator or compile caches between stoichiometries.
+                gc.collect()
 
             pbar.close()
 
