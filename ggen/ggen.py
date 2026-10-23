@@ -15,7 +15,20 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from collections import deque
+from typing import (
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 import requests
@@ -36,7 +49,12 @@ from pyxtal import pyxtal
 from pyxtal.symmetry import Group
 from scipy.spatial.distance import cosine
 
-from .calculator import build_orb_torchsim_model, get_orb_calculator, rss_mb
+from .calculator import (
+    build_orb_relax_torchsim_model,
+    build_orb_torchsim_model,
+    get_orb_calculator,
+    rss_mb,
+)
 from .colors import Colors
 from .operations import Operations
 from .utils import compute_fmax, parse_chemical_formula
@@ -447,25 +465,72 @@ class Candidate:
         return AseAtomsAdaptor().get_structure(self.atoms)
 
 
-class _InFlightBatcher(ts.InFlightAutoBatcher):
-    """In-flight autobatcher whose per-system iteration cap cannot be overwritten.
+class _GpuBatch:
+    """What a streaming relaxation holds on the GPU.
 
-    ``ts.optimize`` resets ``max_iterations`` from its *global* ``max_steps``,
-    and once that global count is exceeded it takes one step per swap instead
-    of ``steps_between_swaps``. When a pool larger than one GPU batch streams
-    through, that starves late systems of steps. Pinning the cap here lets the
-    caller pass an effectively unlimited global ``max_steps`` while every
-    system still gets exactly its own step budget.
+    One concatenated optimizer state and, per system in it, the structure's
+    stream index and the iterations (swap intervals) it has taken so far.
     """
 
-    @property
-    def max_iterations(self):
-        return self._pinned_max_iterations
+    def __init__(self) -> None:
+        self.state: Any = None
+        self.indices: List[int] = []
+        self.iterations: List[int] = []
 
-    @max_iterations.setter
-    def max_iterations(self, value):
-        if not hasattr(self, "_pinned_max_iterations"):
-            self._pinned_max_iterations = value
+    @property
+    def atoms(self) -> int:
+        return 0 if self.state is None else int(self.state.n_atoms)
+
+    def add(self, singles: List[Tuple[int, Any]]) -> None:
+        """Append single-system states, tagged with their stream indices."""
+        if not singles:
+            return
+        states = [single for _, single in singles]
+        if self.state is not None:
+            states.insert(0, self.state)
+        self.state = ts.concatenate_states(states)
+        self.indices.extend(index for index, _ in singles)
+        self.iterations.extend(0 for _ in singles)
+
+    def pop(self, mask: Any) -> List[Tuple[int, int, Any]]:
+        """Take the systems ``mask`` selects out of the batch.
+
+        Returns (stream index, iterations taken, single-system state) for each,
+        in batch order.
+        """
+        positions = torch.where(mask)[0].tolist()
+        if not positions:
+            return []
+        popped = self.state.pop(positions)
+        taken = [
+            (self.indices[position], self.iterations[position], single)
+            for position, single in zip(positions, popped)
+        ]
+        for position in reversed(positions):
+            del self.indices[position]
+            del self.iterations[position]
+        if not self.indices:
+            self.state = None
+        return taken
+
+
+# Streaming relaxation stops shrinking its GPU atom budget here and gives up instead
+_MIN_RELAX_BATCH_ATOMS = 250
+
+# The only state extras the models read (ORB's adapter takes charge and spin
+# from them). Every other extra is a model output torch-sim stashed on the
+# state, which it files by leading dimension: in a batch of one-atom cells
+# n_atoms == n_systems, so a per-system output lands under the per-atom
+# extras and stays there, stale, once the batch takes on other shapes, until
+# the next swap fails indexing it. Dropping them after every forward pass
+# keeps the state to what the relaxation needs.
+_KEPT_STATE_EXTRAS = frozenset({"charge", "spin"})
+
+
+def _drop_model_extras(state) -> None:
+    for extras in (state.atom_extras, state.system_extras):
+        for key in [key for key in extras if key not in _KEPT_STATE_EXTRAS]:
+            del extras[key]
 
 
 # ===================== GGen =====================
@@ -501,6 +566,10 @@ class GGen:
         self._current_structure: Optional[Structure] = None
         self._current_pyxtal: Optional[pyxtal] = None
         self._torchsim_model = None
+        self._relax_torchsim_model = None
+        # Atom budget a CUDA out-of-memory error shrank relaxation to, kept
+        # for the rest of this instance's life
+        self._relax_batch_atoms_cap: Optional[int] = None
 
         # Trajectory tracking using pymatgen structures
         self.enable_trajectory = enable_trajectory
@@ -552,6 +621,24 @@ class GGen:
                     pass
             self._torchsim_model = model
         return self._torchsim_model
+
+    def _get_relax_torchsim_model(self):
+        """The TorchSim model relaxations step on.
+
+        ``ORB_RELAX_MODEL`` when one is configured (shared through the
+        calculator like the scoring wrapper), else the scoring model itself.
+        """
+        if self._relax_torchsim_model is None:
+            self._relax_torchsim_model = (
+                build_orb_relax_torchsim_model(self.calculator)
+                or self._get_torchsim_model()
+            )
+        return self._relax_torchsim_model
+
+    @property
+    def relaxes_off_surface(self) -> bool:
+        """Whether relaxations step on a model other than the one energies come from."""
+        return self._get_relax_torchsim_model() is not self._get_torchsim_model()
 
     def _derive_rng(self, *key: Any) -> np.random.Generator:
         """Return an RNG for one sampling decision, keyed by ``key``.
@@ -1406,6 +1493,243 @@ class GGen:
 
         return getattr(ts.Optimizer, normalized)
 
+    def relax_stream(
+        self,
+        groups: Iterable[Sequence[Any]],
+        max_steps: int = 400,
+        fmax: float = 0.02,
+        optimization_optimizer: str = "fire",
+        batch_atoms: Optional[int] = None,
+        on_surface: bool = False,
+        stop: Callable[[], bool] = lambda: False,
+    ) -> Iterator[Tuple[int, List[Tuple[Structure, float, int, float]]]]:
+        """Relax groups of ASE structures through one GPU batch that never drains.
+
+        ``groups`` is pulled lazily, one group (say, a formula's candidates) at
+        a time, whenever the batch has room for more atoms. A generator may
+        yield None to say nothing is ready yet: the batch carries on with what
+        it has and asks again at the next swap, so the GPU starts on the first
+        group and is topped up as the CPU proposes more. Converged structures
+        are swapped out for waiting ones every few steps, so the batch stays
+        near ``batch_atoms`` atoms until the groups run out. Each group is
+        yielded as ``(group_index, results)`` as soon as all of its structures
+        are done, in completion order, with one ``(structure, energy, steps,
+        fmax)`` per input structure; a group counts from the first group
+        pulled, None answers excluded.
+
+        Steps run on the relaxer (``ORB_RELAX_MODEL``, typically a direct-force
+        model) and the final geometries are re-scored on the calculator's
+        model, so energies and ``fmax`` are always on the energy surface the
+        rest of ggen and the structure database use. ``on_surface`` relaxes on
+        the calculator's model itself: the polish each formula's winner gets.
+
+        A CUDA out-of-memory error halves the atom budget, puts the in-flight
+        structures back in the queue, and carries on; the smaller budget is
+        kept for later streams. ``stop`` is polled between swaps: once it
+        returns True no further group is pulled and whatever is on the GPU is
+        reported as it stands at the next swap (``fmax`` says how far from
+        converged it is).
+
+        Raises:
+            ValueError: A structure has more atoms than the budget.
+            Whatever torch-sim raises otherwise; callers decide how to fall back.
+        """
+        from torch_sim.optimizers import OPTIM_REGISTRY
+
+        scorer = self._get_torchsim_model()
+        model = scorer if on_surface else self._get_relax_torchsim_model()
+        rescore = model is not scorer
+        device, dtype = model.device, model.dtype
+        init_fn, step_fn = OPTIM_REGISTRY[
+            self._resolve_torchsim_optimizer(optimization_optimizer)
+        ]
+        converged_fn = ts.generate_force_convergence_fn(force_tol=fmax)
+        steps_between_swaps = 5
+        max_iterations = max(1, max_steps // steps_between_swaps)
+        budget = int(batch_atoms or 0)
+        if budget <= 0:
+            raise ValueError("batch_atoms must be a positive atom budget")
+        if self._relax_batch_atoms_cap:
+            budget = min(budget, self._relax_batch_atoms_cap)
+
+        # Bookkeeping by stream index: which group a structure belongs to and
+        # its place in it (a structure re-queued after an out-of-memory error
+        # gets a new index but keeps its place).
+        owners: List[int] = []
+        places: List[int] = []
+        expected: Dict[int, int] = {}
+        finished: Dict[int, List[Tuple[int, int, int, Any]]] = {}
+        empty: List[int] = []
+        queue: Deque[Tuple[int, Any]] = deque()  # initialized, waiting for room
+        batch = _GpuBatch()
+        source = iter(groups)
+        exhausted = False
+
+        def enqueue(group: int, atoms_list: Sequence[Any]) -> None:
+            """Initialize a group's structures (one forward pass per chunk) and queue them."""
+            expected[group] = len(atoms_list)
+            if not atoms_list:
+                empty.append(group)
+                return
+            largest = max(len(atoms) for atoms in atoms_list)
+            if largest > budget:
+                raise ValueError(
+                    f"A {largest}-atom structure exceeds the {budget}-atom GPU budget"
+                )
+            place = 0
+            chunk: List[Any] = []
+            for atoms in [*atoms_list, None]:
+                if chunk and (
+                    atoms is None or sum(map(len, chunk)) + len(atoms) > budget
+                ):
+                    state = _atoms_to_torchsim_state_with_charge_spin(
+                        chunk, device, dtype
+                    )
+                    initial = init_fn(
+                        state=state, model=model, cell_filter=ts.CellFilter.frechet
+                    )
+                    _drop_model_extras(initial)
+                    for single in initial.split():
+                        queue.append((len(owners), single))
+                        owners.append(group)
+                        places.append(place)
+                        place += 1
+                    chunk = []
+                if atoms is not None:
+                    chunk.append(atoms)
+
+        def refill() -> None:
+            """Top the batch up to the budget from the queue, then from the source.
+
+            The source is asked for more only while there is room. It may
+            answer None, meaning nothing is ready yet: the batch then goes on
+            with what it has, or, when it is empty, asks again.
+            """
+            nonlocal exhausted
+            adding: List[Tuple[int, Any]] = []
+            atoms = batch.atoms
+            while True:
+                if queue and atoms + queue[0][1].n_atoms <= budget:
+                    item = queue.popleft()
+                    atoms += item[1].n_atoms
+                    adding.append(item)
+                elif queue or exhausted or stop():
+                    break
+                else:
+                    try:
+                        group_atoms = next(source)
+                    except StopIteration:
+                        exhausted = True
+                        break
+                    if group_atoms is None:
+                        if batch.indices or adding:
+                            break
+                        continue
+                    enqueue(len(expected), group_atoms)
+            batch.add(adding)
+
+        def results_for(group: int) -> List[Tuple[Structure, float, int, float]]:
+            done = sorted(finished.pop(group), key=lambda item: item[1])
+            results: List[Tuple[Structure, float, int, float]] = []
+            position = 0
+            while position < len(done):
+                # Score in chunks the budget allows, as the scorer may need the
+                # autograd graph of a conservative model
+                chunk: List[Any] = []
+                while position < len(done) and (
+                    not chunk
+                    or sum(single.n_atoms for single in chunk)
+                    + done[position][3].n_atoms
+                    <= budget
+                ):
+                    chunk.append(done[position][3])
+                    position += 1
+                scored = ts.concatenate_states(chunk)
+                if rescore:
+                    output = scorer(scored)
+                    energy = output.get("energy")
+                    if energy is None:
+                        # ORB's conservative head reports its energy as "free_energy"
+                        energy = output["free_energy"]
+                    forces = output["forces"]
+                else:
+                    energy, forces = scored.energy, scored.forces
+                per_system_fmax = torch.zeros(
+                    scored.n_systems, device=scored.device, dtype=forces.dtype
+                ).scatter_reduce(
+                    0, scored.system_idx, forces.norm(dim=1), reduce="amax"
+                )
+                energies = energy.detach().cpu().numpy()
+                fmaxes = per_system_fmax.detach().cpu().numpy()
+                for i, atoms in enumerate(scored.to_atoms()):
+                    iterations = done[len(results)][2]
+                    results.append(
+                        (
+                            _atoms_to_structure_wrapped(atoms),
+                            float(energies[i]),
+                            int(iterations * steps_between_swaps),
+                            float(fmaxes[i]),
+                        )
+                    )
+            return results
+
+        logger.debug(
+            "Relaxing on %s with a %d-atom batch (%s re-scored on %s)",
+            getattr(model, "orb_model_name", type(model).__name__),
+            budget,
+            "geometries" if rescore else "not",
+            getattr(self.calculator, "orb_model_name", "the calculator"),
+        )
+        while True:
+            refill()
+            while empty:
+                yield empty.pop(0), []
+            if batch.state is None:
+                if exhausted or stop():
+                    break
+                continue  # nothing ready yet; the source paces the retries
+            try:
+                for _ in range(steps_between_swaps):
+                    batch.state = step_fn(state=batch.state, model=model)
+                    _drop_model_extras(batch.state)
+            except Exception as e:
+                out_of_memory = isinstance(
+                    e, torch.cuda.OutOfMemoryError
+                ) or "out of memory" in str(e).lower()
+                if not out_of_memory or budget <= _MIN_RELAX_BATCH_ATOMS:
+                    raise
+                gc.collect()
+                torch.cuda.empty_cache()
+                budget = max(_MIN_RELAX_BATCH_ATOMS, budget // 2)
+                self._relax_batch_atoms_cap = budget
+                logger.warning(
+                    "Relaxation ran out of GPU memory; continuing with a "
+                    "%d-atom batch",
+                    budget,
+                )
+                # Back to the front of the queue, under new indices, keeping
+                # each structure's place in its group
+                taken = batch.pop(torch.ones(len(batch.indices), dtype=torch.bool))
+                for index, _, single in reversed(taken):
+                    owners.append(owners[index])
+                    places.append(places[index])
+                    queue.appendleft((len(owners) - 1, single))
+                continue
+            for position in range(len(batch.iterations)):
+                batch.iterations[position] += 1
+            converged = converged_fn(batch.state, None).cpu()
+            converged |= torch.tensor(
+                [iterations >= max_iterations for iterations in batch.iterations]
+            )
+            if stop():
+                converged[:] = True
+            for index, iterations, single in batch.pop(converged):
+                finished.setdefault(owners[index], []).append(
+                    (index, places[index], iterations, single)
+                )
+            for group in [g for g in finished if len(finished[g]) == expected[g]]:
+                yield group, results_for(group)
+
     def relax_atoms(
         self,
         atoms_list: List[Any],
@@ -1413,102 +1737,26 @@ class GGen:
         fmax: float = 0.02,
         optimization_optimizer: str = "fire",
         batch_atoms: Optional[int] = None,
-        show_progress: bool = False,
+        on_surface: bool = False,
     ) -> List[Tuple[Structure, float, int, float]]:
-        """Relax ASE structures on the GPU with torch-sim, in input order.
+        """Relax ASE structures on the GPU, in input order.
 
-        The structures need not share a formula: this is the shared relaxation
-        stage for any mix of candidates.
-
-        Args:
-            atoms_list: ASE Atoms to relax.
-            max_steps: Maximum optimization steps per structure.
-            fmax: Force convergence criterion (eV/Å).
-            optimization_optimizer: torch-sim optimizer name.
-            batch_atoms: Atoms held on the GPU at once. When the pool is larger,
-                structures stream through: each converged (or step-capped) one
-                is swapped for a waiting one, keeping the GPU full. None puts
-                the whole pool in one batch.
-            show_progress: Whether to show a progress bar.
-
-        Returns:
-            One (relaxed_structure, final_energy, steps, final_fmax) per input.
-            ``final_fmax`` is torch-sim's last-step ``system_wise_max_force``,
-            which matches the convergence criterion without another forward
-            pass. ``steps`` is the cap, as torch-sim does not report
-            per-structure step counts.
-
-        Raises:
-            Whatever torch-sim raises; callers decide how to fall back.
+        One group through :meth:`relax_stream`; see there for what the
+        results mean. ``batch_atoms`` is the atom budget held on the GPU at
+        once (None puts the whole list in one batch).
         """
         if not atoms_list:
             return []
-
-        # Reuse the calculator's ORB runtime config so batched relaxation follows
-        # the same adapter and edge-construction path as direct ASE evaluation.
-        # The wrapper is cached on the GGen instance; rebuilding it per call adds
-        # overhead and can retain extra Torch/TorchSim state.
-        ts_model = self._get_torchsim_model()
-        ts_device = getattr(
-            ts_model,
-            "device",
-            torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-        )
-        ts_dtype = getattr(ts_model, "dtype", torch.get_default_dtype())
-        ts_state = _atoms_to_torchsim_state_with_charge_spin(
-            atoms_list, ts_device, ts_dtype
-        )
-
-        # autobatcher=False puts every system in one batch and skips torch-sim's
-        # slow OOM-probe memory estimation; converged systems are still dropped
-        # from the active batch. With batch_atoms the same hot-swapping refills
-        # the batch from the waiting pool, capped by atom count.
-        steps_between_swaps = 5
-        autobatcher: Any = False
-        optimize_max_steps = max_steps
-        total_atoms = sum(len(atoms) for atoms in atoms_list)
-        if batch_atoms and total_atoms > batch_atoms:
-            largest = max(len(atoms) for atoms in atoms_list)
-            autobatcher = _InFlightBatcher(
-                model=ts_model,
-                memory_scales_with="n_atoms",
-                max_memory_scaler=float(max(batch_atoms, largest)),
-                max_iterations=max(1, max_steps // steps_between_swaps),
-            )
-            # The per-structure cap lives on the autobatcher
-            optimize_max_steps = 10**9
-
-        logger.debug(
-            "Relaxing %d structures (%d atoms, batch_atoms=%s) with torch-sim on %s",
-            len(atoms_list),
-            total_atoms,
-            batch_atoms,
-            ts_state.device,
-        )
-        final_state = ts.optimize(
-            system=ts_state,
-            model=ts_model,
-            optimizer=self._resolve_torchsim_optimizer(optimization_optimizer),
-            max_steps=optimize_max_steps,
-            steps_between_swaps=steps_between_swaps,
-            autobatcher=autobatcher,
-            init_kwargs={"cell_filter": ts.CellFilter.frechet},
-            convergence_fn=ts.generate_force_convergence_fn(force_tol=fmax),
-            pbar={"leave": False} if show_progress else False,
-        )
-
-        final_atoms_list = final_state.to_atoms()
-        energies = final_state.energy.detach().cpu().numpy()
-        fmaxes = ts.system_wise_max_force(final_state).detach().cpu().numpy()
-        return [
-            (
-                _atoms_to_structure_wrapped(atoms),
-                float(energies[i]),
-                max_steps,
-                float(fmaxes[i]),
-            )
-            for i, atoms in enumerate(final_atoms_list)
-        ]
+        for _, results in self.relax_stream(
+            [atoms_list],
+            max_steps=max_steps,
+            fmax=fmax,
+            optimization_optimizer=optimization_optimizer,
+            batch_atoms=batch_atoms or sum(len(atoms) for atoms in atoms_list),
+            on_surface=on_surface,
+        ):
+            return results
+        return []
 
     def _relax_candidates_batched(
         self,
@@ -1547,7 +1795,6 @@ class GGen:
                 max_steps=max_steps,
                 fmax=fmax,
                 optimization_optimizer=optimization_optimizer,
-                show_progress=show_progress,
             )
             for i, (_, _, _, final_fmax) in enumerate(results):
                 if final_fmax > fmax:
@@ -2332,11 +2579,12 @@ class GGen:
                 (one per candidate, in order, None where relaxation failed), e.g.
                 from a pooled :meth:`relax_atoms` call spanning many formulas.
                 When given, no energy evaluation or relaxation runs here.
-            defer_symmetry_rerelax: If True, a symmetry-refined winner is not
-                re-relaxed here. The refined structure is returned under
-                ``pending_rerelax`` so the caller can relax many of them together
-                and then call :meth:`apply_rerelaxed`; until then the response
-                describes the unrefined winner.
+            defer_symmetry_rerelax: If True, the winner is not polished here.
+                The structure to polish (symmetry-refined when a higher symmetry
+                was found) is returned under ``pending_rerelax`` so the caller
+                can relax many winners together on the energy surface and then
+                call :meth:`apply_rerelaxed`; until then the response describes
+                the unpolished winner.
 
         Returns:
             Dictionary with structure metadata, CIF content, and generation statistics.
@@ -2421,7 +2669,7 @@ class GGen:
                 flush=True,
             )
         else:
-            logger.info(
+            logger.debug(
                 "Generation: %d attempts → %d valid → %d passed filter → %d evaluated",
                 generation_stats["total_attempts"],
                 generation_stats["valid_pyxtal"],
@@ -2437,7 +2685,7 @@ class GGen:
         candidate_sgs = [c[3] for c in all_candidates]
 
         if optimize_geometry:
-            logger.info(
+            logger.debug(
                 "Relaxing %d candidate%s with torch-sim (%s, max_steps=%d)",
                 len(candidate_crystals),
                 "" if len(candidate_crystals) == 1 else "s",
@@ -2495,7 +2743,7 @@ class GGen:
                 range(len(initial_energies)), key=lambda i: initial_energies[i]
             )
 
-            logger.info(
+            logger.debug(
                 "Best relaxed candidate: SG %d, energy=%.4f eV (%.4f eV/atom)",
                 best_sg,
                 final_energy,
@@ -2583,7 +2831,11 @@ class GGen:
         symmetry_refinement_started = time.perf_counter()
         pending_rerelax: Optional[Structure] = None
 
-        # Post-relaxation symmetry refinement
+        # Post-relaxation symmetry refinement, then a polish of the winner on
+        # the energy surface: refinement moves atoms to ideal positions, and a
+        # relaxation on the relaxer model ends near, not at, the surface's
+        # minimum. Only the winner is polished; the other trials keep their
+        # surface single-point energies.
         if optimize_geometry and refine_symmetry and not preserve_symmetry:
             if mem_trace:
                 logger.info(
@@ -2591,58 +2843,42 @@ class GGen:
                     formula,
                     rss_mb(),
                 )
-            logger.info("Attempting post-relaxation symmetry refinement...")
             refined_struct, refined_sg, refined_symbol = (
                 self._refine_to_higher_symmetry(structure)
             )
-            if refined_sg > 1 and defer_symmetry_rerelax:
-                pending_rerelax = refined_struct
-            elif refined_sg > 1:
-                original_atoms = len(structure)
-                refined_atoms = len(refined_struct)
-
-                # Symmetry refinement moves atoms to ideal positions, which may
-                # introduce strain. Do a quick re-relaxation to ensure we're at
-                # a true local minimum with correct energy.
-                logger.info(
-                    "Re-relaxing after symmetry refinement (%d -> %d atoms)...",
-                    original_atoms,
-                    refined_atoms,
-                )
-                self.set_structure(refined_struct, add_to_trajectory=False)
-                refined_struct, final_energy, rerelax_steps = self.optimize_geometry(
-                    max_steps=min(100, optimization_max_steps),  # Quick re-relax
-                    fmax=optimization_fmax,
-                    relax_cell=True,
-                    trajectory_interval=trajectory_interval,
-                    show_progress=show_progress,
-                    progress_desc=f"Re-relaxing {formula}",
-                )
-                optimization_steps += rerelax_steps
-
-                # Recompute fmax on the re-relaxed structure (structure changed)
-                try:
-                    rerelax_atoms = _atoms_from_structure(refined_struct)
-                    rerelax_atoms.calc = self.calculator
-                    rerelax_filtered = FrechetCellFilter(rerelax_atoms)
-                    best_fmax = compute_fmax(rerelax_filtered.get_forces())
-                except Exception:
-                    pass  # Keep original best_fmax if this fails
-
-                logger.info(
-                    "Post-refinement relaxation: %d steps, energy=%.4f eV",
-                    rerelax_steps,
-                    final_energy,
-                )
-
-                structure = refined_struct
-                logger.info(
-                    "Symmetry refinement successful: %s (#%d)",
+            if refined_sg > 1:
+                logger.debug(
+                    "Symmetry refinement: %s (#%d), %d -> %d atoms",
                     refined_symbol,
                     refined_sg,
+                    len(structure),
+                    len(refined_struct),
                 )
             else:
-                logger.info("No higher symmetry detected after relaxation")
+                logger.debug("No higher symmetry detected after relaxation")
+            to_polish = (
+                refined_struct
+                if refined_sg > 1
+                else structure if self.relaxes_off_surface else None
+            )
+            if to_polish is not None and defer_symmetry_rerelax:
+                pending_rerelax = to_polish
+            elif to_polish is not None:
+                polished = self.relax_atoms(
+                    [_atoms_from_structure(to_polish)],
+                    max_steps=min(100, optimization_max_steps),
+                    fmax=optimization_fmax,
+                    optimization_optimizer=optimization_optimizer,
+                    on_surface=True,
+                )
+                if polished and np.isfinite(polished[0][1]):
+                    structure, final_energy, polish_steps, best_fmax = polished[0]
+                    optimization_steps += polish_steps
+                    logger.debug(
+                        "Polished on the energy surface: %d steps, energy=%.4f eV",
+                        polish_steps,
+                        final_energy,
+                    )
             if mem_trace:
                 logger.info(
                     "[mem] after symmetry refinement %s: RSS=%.0f MiB",

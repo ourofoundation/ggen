@@ -29,6 +29,13 @@ if not logger.handlers:
 # to force eager mode when diagnosing memory/perf regressions.
 TORCH_COMPILE = os.environ.get("GGEN_TORCH_COMPILE", "1") != "0"
 ORB_MODEL = os.environ.get("GGEN_ORB_MODEL", "orb_v3_conservative_inf_mpa")
+# The model that drives relaxations. ORB's direct models predict forces with a
+# head instead of differentiating the energy, which drops the backward pass
+# (about half of a conservative model's step) at the cost of forces that are
+# not exactly the gradient of an energy. Every energy ggen reports still comes
+# from ORB_MODEL: relaxed geometries are re-scored on it, and each winner is
+# polished on it (see GGen.relax_stream). Set to "" to relax on ORB_MODEL.
+ORB_RELAX_MODEL = os.environ.get("GGEN_ORB_RELAX_MODEL", "orb_v3_direct_inf_mpa")
 ORB_PRECISION = os.environ.get("GGEN_ORB_PRECISION", "float32-high")
 ORB_EDGE_METHOD = os.environ.get("GGEN_ORB_EDGE_METHOD", "knn_alchemi")
 TORCHSIM_LOG_LEVEL = os.environ.get("GGEN_TORCHSIM_LOG_LEVEL", "WARNING").upper()
@@ -133,6 +140,47 @@ def build_orb_torchsim_model(calculator):
         compute_forces=True,
         device=device,
     )
+
+
+def build_orb_relax_torchsim_model(calculator):
+    """The TorchSim model relaxations run on, for a calculator built here.
+
+    Loads ``ORB_RELAX_MODEL`` on the calculator's device and caches it on the
+    calculator, so every ``GGen`` sharing one calculator shares one relaxer.
+    Returns None when relaxations should use the calculator's own model.
+    """
+    relax_model = ORB_RELAX_MODEL
+    if not relax_model or relax_model == getattr(calculator, "orb_model_name", None):
+        return None
+    model = getattr(calculator, "_ggen_relax_torchsim_model", None)
+    if model is None:
+        from orb_models.forcefield.inference.orb_torchsim import OrbTorchSimModel
+
+        device = getattr(calculator, "device", None) or _detect_device()
+        logger.info(
+            "Loading ORB relaxer %s (%s, device=%s)",
+            relax_model,
+            "compile" if TORCH_COMPILE else "eager",
+            device,
+        )
+        loaded = getattr(pretrained, relax_model)(
+            device=device, compile=TORCH_COMPILE, precision=ORB_PRECISION
+        )
+        orbff, atoms_adapter = loaded if isinstance(loaded, tuple) else (loaded, None)
+        if atoms_adapter is None:
+            raise RuntimeError(f"{relax_model} did not return an atoms adapter")
+        model = OrbTorchSimModel(
+            orbff,
+            atoms_adapter,
+            edge_method=getattr(calculator, "edge_method", ORB_EDGE_METHOD),
+            device=device,
+        )
+        model.orb_model_name = relax_model
+        try:
+            calculator._ggen_relax_torchsim_model = model
+        except AttributeError:
+            pass
+    return model
 
 
 def get_orb_calculator(

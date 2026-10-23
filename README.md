@@ -28,6 +28,15 @@ pip install -e ".[gpu-cu12]"
 
 `ggen` defaults to ORB's recommended `knn_alchemi` graph construction path. You can override it at runtime with `GGEN_ORB_EDGE_METHOD`, for example `knn_cuml_rbc` or `knn_cuml_brute`.
 
+Energies come from `GGEN_ORB_MODEL` (default `orb_v3_conservative_inf_mpa`, the
+energy surface the structure database is built on). Relaxations step on
+`GGEN_ORB_RELAX_MODEL` (default `orb_v3_direct_inf_mpa`): ORB's direct models
+predict forces with a head instead of differentiating the energy, which skips
+the backward pass and roughly halves the cost of a relaxation step. Every relaxed
+geometry is then re-scored on `GGEN_ORB_MODEL`, and each formula's winner is
+polished on it, so reported energies and hull distances stay on one surface.
+Set `GGEN_ORB_RELAX_MODEL=` (empty) to relax on `GGEN_ORB_MODEL` itself.
+
 ## CLI Usage
 
 GGen is designed for command-line exploration of chemical systems. The typical workflow:
