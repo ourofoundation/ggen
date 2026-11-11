@@ -132,6 +132,21 @@ def _get_pyxtal_groups_by_number() -> Dict[int, Group]:
     return _PYXTAL_GROUPS_BY_NUMBER
 
 
+# Lattice points in the conventional cell of each centring type
+_CENTRING_MULTIPLE = {"P": 1, "A": 2, "B": 2, "C": 2, "I": 2, "F": 4, "R": 3}
+
+
+def _centring_multiple(group: Group) -> int:
+    """How many primitive cells the group's conventional cell holds.
+
+    PyXtal fills the conventional cell, so a centred group must be given this
+    multiple of a formula's counts for the primitive cell to hold the formula.
+    Y2Co16Mn's R3m ground state has 19 atoms in its primitive cell and 57 in
+    the conventional one; asked for 19, no R group can host it.
+    """
+    return _CENTRING_MULTIPLE.get(str(group.symbol)[0], 1)
+
+
 def _scale_counts_to_compatible(
     group: Group, counts: List[int], max_total: int = 200
 ) -> Optional[List[int]]:
@@ -147,7 +162,10 @@ def _scale_counts_to_compatible(
     base_total = sum(counts)
     if base_total <= 0:
         return None
-    for z in range(1, max_total // base_total + 1):
+    # Whole primitive cells of the formula: a centred group is tried only at
+    # multiples of its centring, so the primitive cell holds whole formula units
+    step = _centring_multiple(group)
+    for z in range(step, max(step, max_total // base_total) + 1, step):
         scaled = [c * z for c in counts]
         try:
             ok, _ = group.check_compatible(scaled)
@@ -192,6 +210,10 @@ def _get_compatible_space_groups_cached(
 ) -> Tuple[Dict[str, Any], ...]:
     """Get space groups compatible with a given stoichiometry (cached).
 
+    The counts are those of the primitive cell: a centred group is checked,
+    and later filled, at ``cell_multiple`` times the counts, which is what its
+    conventional cell holds.
+
     Compatibility depends only on atom counts, not elements, so we cache by counts.
     This provides significant speedup when exploring multiple formulas with the
     same stoichiometry pattern.
@@ -208,7 +230,10 @@ def _get_compatible_space_groups_cached(
     groups_by_number = _get_pyxtal_groups_by_number()
     for sg_number, group in groups_by_number.items():  # International space groups 1–230
         try:
-            is_compatible, _ = group.check_compatible(counts)
+            cell_multiple = _centring_multiple(group)
+            is_compatible, _ = group.check_compatible(
+                [c * cell_multiple for c in counts]
+            )
             if is_compatible:
                 wyckoff_positions = group.Wyckoff_positions
                 compatible_groups.append(
@@ -220,6 +245,7 @@ def _get_compatible_space_groups_cached(
                         "polar": group.polar,
                         "inversion": group.inversion,
                         "lattice_type": getattr(group, "lattice_type", None),
+                        "cell_multiple": cell_multiple,
                     }
                 )
         except Exception:
@@ -432,6 +458,25 @@ def get_structure_fingerprint(structure: Structure) -> np.ndarray:
     return features
 
 
+def _primitive_cell(atoms):
+    """The primitive cell of a crystal PyXtal built in a centred space group.
+
+    PyXtal builds the conventional cell, which in an I, C, A, F or R group
+    repeats the primitive cell 2, 2, 2, 4 or 3 times. Relaxing the copies
+    costs about 2.5 times the GPU work for no reliable gain: on 308 paired
+    trials (November 2026) the two cells often relaxed to different minima,
+    the primitive one lower in 100 and higher in 84.
+    The atoms are returned unchanged if no smaller cell is found.
+    """
+    structure = AseAtomsAdaptor().get_structure(atoms)
+    # A fresh PyXtal cell is exact, so a tight tolerance finds the centring
+    # without merging atoms that only happen to sit near a translation.
+    primitive = structure.get_primitive_structure(tolerance=1e-3)
+    if len(primitive) >= len(structure):
+        return atoms
+    return AseAtomsAdaptor().get_atoms(primitive)
+
+
 @dataclass
 class Candidate:
     """A proposed crystal awaiting relaxation.
@@ -451,8 +496,11 @@ class Candidate:
 
     @classmethod
     def from_pyxtal(cls, crystal: pyxtal) -> "Candidate":
+        atoms = crystal.to_ase()
+        if str(crystal.group.symbol)[0] != "P":
+            atoms = _primitive_cell(atoms)
         return cls(
-            atoms=crystal.to_ase(),
+            atoms=atoms,
             space_group_number=int(crystal.group.number),
             space_group_symbol=str(crystal.group.symbol),
             num_wyckoff_sites=len(crystal.atom_sites),
@@ -1628,7 +1676,11 @@ class GGen:
                     enqueue(len(expected), group_atoms)
             batch.add(adding)
 
+        # Atoms scored at once; halved when the scorer runs out of GPU memory
+        score_budget = budget
+
         def results_for(group: int) -> List[Tuple[Structure, float, int, float]]:
+            nonlocal score_budget
             done = sorted(finished.pop(group), key=lambda item: item[1])
             results: List[Tuple[Structure, float, int, float]] = []
             position = 0
@@ -1636,17 +1688,42 @@ class GGen:
                 # Score in chunks the budget allows, as the scorer may need the
                 # autograd graph of a conservative model
                 chunk: List[Any] = []
+                start = position
                 while position < len(done) and (
                     not chunk
                     or sum(single.n_atoms for single in chunk)
                     + done[position][3].n_atoms
-                    <= budget
+                    <= min(budget, score_budget)
                 ):
                     chunk.append(done[position][3])
                     position += 1
                 scored = ts.concatenate_states(chunk)
                 if rescore:
-                    output = scorer(scored)
+                    try:
+                        output = scorer(scored)
+                    except Exception as e:
+                        # The scorer shares the GPU with the relaxing batch and
+                        # can need several times the relaxer's memory per atom.
+                        # Score fewer structures at a time rather than lose
+                        # every relaxation already done.
+                        out_of_memory = isinstance(
+                            e, torch.cuda.OutOfMemoryError
+                        ) or "out of memory" in str(e).lower()
+                        if not out_of_memory or len(chunk) == 1:
+                            raise
+                        del scored
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        score_budget = max(
+                            1, sum(single.n_atoms for single in chunk) // 2
+                        )
+                        logger.warning(
+                            "Scoring ran out of GPU memory; continuing with "
+                            "%d atoms at a time",
+                            score_budget,
+                        )
+                        position = start
+                        continue
                     energy = output.get("energy")
                     if energy is None:
                         # ORB's conservative head reports its energy as "free_energy"
@@ -2046,7 +2123,7 @@ class GGen:
         optimize_geometry: bool = False,
         # Enhanced generation parameters
         multi_spacegroup: bool = True,
-        top_k_spacegroups: int = 5,
+        top_k_spacegroups: Optional[int] = None,
         symmetry_weight: float = 0.01,
         symmetry_bias: float = 0.0,
         crystal_systems: Optional[List[str]] = None,
@@ -2087,7 +2164,9 @@ class GGen:
             num_trials: Number of random structures to generate per space group.
             optimize_geometry: Whether to relax the structure after generation.
             multi_spacegroup: If True and space_group is None, tries multiple space groups.
-            top_k_spacegroups: Number of top space groups to try when multi_spacegroup=True.
+            top_k_spacegroups: Most space groups to spread the trials over when
+                multi_spacegroup=True. Default None: one group per trial, as far
+                as the compatible groups go.
             symmetry_weight: Weight for symmetry in combined scoring (higher = prefer symmetry).
             symmetry_bias: Controls preference for higher-symmetry crystal systems when
                 auto-selecting space groups. 0.0 = uniform distribution across orthorhombic
@@ -2180,7 +2259,7 @@ class GGen:
         space_group: Optional[int] = None,
         num_trials: int = 10,
         multi_spacegroup: bool = True,
-        top_k_spacegroups: int = 5,
+        top_k_spacegroups: Optional[int] = None,
         symmetry_bias: float = 0.0,
         crystal_systems: Optional[List[str]] = None,
         min_distance_filter: float = 1.0,
@@ -2201,7 +2280,9 @@ class GGen:
             space_group: Specific space group number to use. If None, auto-selects.
             num_trials: Number of random structures to generate per space group.
             multi_spacegroup: If True and space_group is None, tries multiple space groups.
-            top_k_spacegroups: Number of top space groups to try when multi_spacegroup=True.
+            top_k_spacegroups: Most space groups to spread the trials over when
+                multi_spacegroup=True. Default None: one group per trial, as far
+                as the compatible groups go.
             symmetry_bias: Controls preference for higher-symmetry crystal systems.
             crystal_systems: Optional list of crystal systems to restrict generation to.
             min_distance_filter: Minimum interatomic distance for pre-filtering (Å).
@@ -2224,7 +2305,7 @@ class GGen:
 
         if num_trials < 1:
             raise ValueError("num_trials must be >= 1")
-        num_trials = int(min(num_trials, 100))
+        num_trials = int(num_trials)
 
         elements, counts = parse_chemical_formula(formula)
         logger.info(
@@ -2316,9 +2397,13 @@ class GGen:
             logger.info("Using user-specified space group: %d", sg_num)
         elif multi_spacegroup:
             # Try multiple space groups with configurable symmetry preference
+            # One group per trial unless told otherwise: which group a trial
+            # starts in decides whether it can reach the ground state far more
+            # than a second trial in the same group does (see
+            # docs/search_convergence.md).
             target_space_groups = self._select_top_space_groups(
                 compatible,
-                top_k=top_k_spacegroups,
+                top_k=min(num_trials, top_k_spacegroups or num_trials),
                 symmetry_bias=symmetry_bias,
                 rng=self._derive_rng(formula, "space_groups"),
             )
@@ -2352,14 +2437,30 @@ class GGen:
             "by_spacegroup": {},
         }
 
-        trials_per_sg = max(1, num_trials // len(target_space_groups))
-        total_trials = trials_per_sg * len(target_space_groups)
+        # What PyXtal is asked to place: the counts as given for a group the
+        # caller named (already scaled to fit it), otherwise enough for the
+        # group's conventional cell, so every candidate's primitive cell holds
+        # the formula.
+        cell_multiples = {g["number"]: g["cell_multiple"] for g in compatible}
+        counts_by_group = {
+            sg_number: (
+                counts
+                if space_group is not None
+                else [c * cell_multiples[sg_number] for c in counts]
+            )
+            for sg_number in target_space_groups
+        }
 
-        # Build trial list: [(sg_number, trial_idx), ...]
+        # Build trial list: [(sg_number, trial_idx), ...]. Exactly num_trials
+        # trials, dealt round the groups so none gets a second trial before
+        # every group has had its first.
+        num_groups = len(target_space_groups)
         trial_tasks = [
             (sg_number, trial_idx)
-            for sg_number in target_space_groups
-            for trial_idx in range(trials_per_sg)
+            for position, sg_number in enumerate(target_space_groups)
+            for trial_idx in range(
+                num_trials // num_groups + (position < num_trials % num_groups)
+            )
         ]
 
         # Create tqdm iterator for trials
@@ -2402,13 +2503,18 @@ class GGen:
                     # The cached Group saves rebuilding its Wyckoff tables per trial
                     group=_get_pyxtal_groups_by_number()[sg_number],
                     species=elements,
-                    numIons=counts,
+                    numIons=counts_by_group[sg_number],
                     random_state=self._derive_rng(formula, sg_number, trial_idx),
                     tm=_default_tolerance_matrix(),
                 )
             except TypeError:
                 # Older pyxtal versions may not accept random_state
-                c.from_random(dim=3, group=sg_number, species=elements, numIons=counts)
+                c.from_random(
+                    dim=3,
+                    group=sg_number,
+                    species=elements,
+                    numIons=counts_by_group[sg_number],
+                )
 
             if not c.valid:
                 logger.debug(
@@ -3047,7 +3153,7 @@ class GGen:
         max_iterations: int,
         num_trials: int,
         convergence_threshold: float,
-        top_k_spacegroups: int,
+        top_k_spacegroups: Optional[int],
         symmetry_weight: float,
         symmetry_bias: float,
         crystal_systems: Optional[List[str]],
@@ -3094,8 +3200,8 @@ class GGen:
                 # First iteration: try top K space groups
                 target_sg = None  # Will use multi_spacegroup mode
                 logger.info(
-                    "First iteration: exploring top %d space groups",
-                    top_k_spacegroups,
+                    "First iteration: exploring up to %d space groups",
+                    top_k_spacegroups or num_trials,
                 )
             else:
                 # Later iterations: use detected space group from previous iteration

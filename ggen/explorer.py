@@ -101,7 +101,6 @@ def _generate_structure_worker(args: Dict[str, Any]) -> Dict[str, Any]:
             num_trials=num_trials,
             optimize_geometry=optimize,
             multi_spacegroup=space_group is None,  # Disable multi if specific SG given
-            top_k_spacegroups=5,
             symmetry_bias=symmetry_bias,
             crystal_systems=crystal_systems,
             refine_symmetry=not preserve_symmetry,
@@ -551,11 +550,11 @@ class ChemistryExplorer:
                     stoichiometries.append(stoich)
 
         # Remove duplicates but keep scaled versions that unlock different space groups.
-        # Space groups have different minimum Wyckoff multiplicities (1, 2, 4, 8, etc.).
+        # Space groups have different minimum Wyckoff multiplicities (1, 2, 3, 4, 6, 8, etc.).
         # To access high-symmetry space groups, we need stoichiometries with counts
         # that are multiples of these multiplicities.
         #
-        # For each unique composition ratio, keep versions at Z = 1, 2, 4, 8
+        # For each unique composition ratio, keep versions at Z = 1, 2, 3, 4, 6, 8
         # (the key multiplicity tiers) if they fit within max_atoms.
         unique_by_reduced: Dict[str, List[Dict[str, int]]] = {}
 
@@ -569,9 +568,12 @@ class ChemistryExplorer:
         # Key Z multipliers that unlock different space group tiers:
         # Z=1: SGs with min Wyckoff mult 1 (triclinic, most monoclinic)
         # Z=2: SGs with min mult 2 (many tetragonal, P4_2/mnm, etc.)
+        # Z=3: hexagonal and trigonal cells built on 3-fold sites (Fe2P and
+        #      ZrNiAl types in P-62m, quartz), and Z=1 in the R-centred groups
         # Z=4: SGs with min mult 4 (Fm-3m, etc.)
+        # Z=6: the 6-fold sites of the same hexagonal and trigonal groups
         # Z=8: SGs with min mult 8 (Fd-3m, etc.)
-        key_multipliers = [1, 2, 4, 8]
+        key_multipliers = [1, 2, 3, 4, 6, 8]
 
         result = []
         for reduced, variants in unique_by_reduced.items():
@@ -1063,7 +1065,6 @@ class ChemistryExplorer:
             num_trials=num_trials,
             multi_spacegroup=space_group
             is None,  # Disable multi if specific SG given
-            top_k_spacegroups=5,
             symmetry_bias=symmetry_bias,
             crystal_systems=crystal_systems,
         )
@@ -1331,7 +1332,6 @@ class ChemistryExplorer:
                         num_trials=num_trials,
                         optimize_geometry=optimize,
                         multi_spacegroup=True,
-                        top_k_spacegroups=5,
                         symmetry_bias=symmetry_bias,
                         crystal_systems=None,  # Allow all crystal systems
                         refine_symmetry=not preserve_symmetry,
@@ -1889,7 +1889,6 @@ class ChemistryExplorer:
                 "space_group": space_group,
                 "num_trials": num_trials,
                 "multi_spacegroup": space_group is None,
-                "top_k_spacegroups": 5,
                 "symmetry_bias": symmetry_bias,
                 "crystal_systems": crystal_systems,
             },
@@ -1958,7 +1957,6 @@ class ChemistryExplorer:
             generation_kwargs={
                 "num_trials": num_trials,
                 "multi_spacegroup": True,
-                "top_k_spacegroups": 5,
                 "symmetry_bias": symmetry_bias,
                 # Elements must be free to find their natural structure
                 "crystal_systems": None,
