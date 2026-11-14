@@ -1591,7 +1591,11 @@ class GGen:
         init_fn, step_fn = OPTIM_REGISTRY[
             self._resolve_torchsim_optimizer(optimization_optimizer)
         ]
-        converged_fn = ts.generate_force_convergence_fn(force_tol=fmax)
+        # The cell counts too: on atomic forces alone a relaxation stops with
+        # the cell still strained (crystaldb.relaxation's RECIPE "+cell").
+        converged_fn = ts.generate_force_convergence_fn(
+            force_tol=fmax, include_cell_forces=True
+        )
         steps_between_swaps = 5
         max_iterations = max(1, max_steps // steps_between_swaps)
         budget = int(batch_atoms or 0)
@@ -1736,6 +1740,13 @@ class GGen:
                 ).scatter_reduce(
                     0, scored.system_idx, forces.norm(dim=1), reduce="amax"
                 )
+                cell_forces = getattr(scored, "cell_forces", None)
+                if cell_forces is not None:
+                    # The relaxer's cell forces: whether the cell converged.
+                    per_system_fmax = torch.maximum(
+                        per_system_fmax,
+                        cell_forces.norm(dim=2).max(dim=1).values.to(per_system_fmax.dtype),
+                    )
                 energies = energy.detach().cpu().numpy()
                 fmaxes = per_system_fmax.detach().cpu().numpy()
                 for i, atoms in enumerate(scored.to_atoms()):

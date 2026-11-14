@@ -239,7 +239,7 @@ def relax_batch_torchsim(
             max_steps=max_steps,
             autobatcher=False,
             init_kwargs={"cell_filter": ts.CellFilter.frechet},
-            convergence_fn=ts.generate_force_convergence_fn(force_tol=fmax),
+            convergence_fn=ts.generate_force_convergence_fn(force_tol=fmax, include_cell_forces=True),
             pbar=True,
         )
 
